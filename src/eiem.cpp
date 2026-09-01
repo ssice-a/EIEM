@@ -13,11 +13,15 @@
 #include "bone_anim_player.h"
 #include "bone_map.h"
 #include "il2cpp_api.h"
+#include "il2cpp_dump.h"
 #include "muscle_player.h"
 #include "camera_player.h"
 
 
 #include "globals.h"
+#include "il2cpp_trace.h"
+#include "scene_dump.h"
+#include "model_dump.h"
 #include "eiem_config.h"
 #include "update_check.h"
 
@@ -50,6 +54,7 @@ static bool UnboxBool(void *boxed) {
 
 static AP_HotkeyInfo s_apHotkeys[] = {
     { "\xe5\x91\xbc\xe5\x87\xba/\xe9\x9a\x90\xe8\x97\x8f GUI \xe9\x9d\xa2\xe6\x9d\xbf", "gui_toggle_key", VK_INSERT },
+    { "Reload EIEM mods", "mod_reload_key", VK_F10 },
 };
 
 static AP_PluginInfo s_apPluginInfo = {
@@ -80,7 +85,10 @@ APPLEPIE_PLUGIN_EXPORT bool AP_PluginDisable() {
 
 APPLEPIE_PLUGIN_EXPORT bool AP_ReloadConfig() {
   LoadEiemConfig();
+  EiemReloadMods();
+  EiemQueueModReconcile("ApplePie config reload");
   s_apHotkeys[0].currentVK = g_guiToggleVK;
+  s_apHotkeys[1].currentVK = g_modReloadVK;
   Log("[AP] Config reloaded: gui_toggle_key=%d (%s)", g_guiToggleVK,
       EiemVKToString(g_guiToggleVK));
   return true;
@@ -88,6 +96,7 @@ APPLEPIE_PLUGIN_EXPORT bool AP_ReloadConfig() {
 
 APPLEPIE_PLUGIN_EXPORT int AP_GetHotkeys(AP_HotkeyInfo* outArray, int maxCount) {
   s_apHotkeys[0].currentVK = g_guiToggleVK;
+  s_apHotkeys[1].currentVK = g_modReloadVK;
   int count = sizeof(s_apHotkeys) / sizeof(s_apHotkeys[0]);
   if (count > maxCount) count = maxCount;
   for (int i = 0; i < count; i++) outArray[i] = s_apHotkeys[i];

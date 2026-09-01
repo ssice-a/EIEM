@@ -363,7 +363,7 @@ static void __cdecl Hooked_GetInternalAvatarPose(void *nativePtr, void *array,
     orig_GetInternalAvatarPose(nativePtr, array, count);
   }
 
-  if (!g_trojanActive || !g_mmdHasMuscles)
+  if (g_shutdownRequested || !g_trojanActive || !g_mmdHasMuscles)
     return;
   if (g_trojanReentrant)
     return;
@@ -816,6 +816,12 @@ static FindFloorNative_t s_findFloorNativeFn = nullptr;
 
 static void __fastcall Hooked_MovementComponent_Tick(void *self, float deltaTime, void *methodInfo) {
   typedef void (__fastcall *fn)(void *, float, void *);
+
+  if (g_shutdownRequested) {
+    if (s_origMoveTick)
+      ((fn)s_origMoveTick)(self, deltaTime, methodInfo);
+    return;
+  }
   
   if (!s_cachedMovementComp && g_cachedAnimator) {
     __try {
@@ -850,6 +856,12 @@ static void *s_origOnUpdate = nullptr;
 static void __fastcall Hooked_OnUpdate(void *self, void *methodInfo) {
   typedef void (__fastcall *fn)(void *, void *);
 
+  if (g_shutdownRequested) {
+    if (s_origOnUpdate)
+      ((fn)s_origOnUpdate)(self, methodInfo);
+    return;
+  }
+
   __try {
     if (g_mmdIKActive) {
       if (self == g_activeLfSolver && g_activeLfSolver) {
@@ -874,6 +886,12 @@ static void __fastcall Hooked_OnUpdate(void *self, void *methodInfo) {
 
 static void __fastcall Hooked_IK_UpdateSolver(void *self, void *methodInfo) {
   typedef void (__fastcall *fn)(void *, void *);
+
+  if (g_shutdownRequested) {
+    if (s_origUpdateSolver)
+      ((fn)s_origUpdateSolver)(self, methodInfo);
+    return;
+  }
   __try {
     if (g_mmdIKActive && self) {
       void *solvers = *(void **)((char *)self + OFF_BIPEDIK_SOLVERS);
@@ -2286,14 +2304,47 @@ static void AudioStartFresh() {
       startMs, g_audioOffset, g_audioIsClock ? 1 : 0);
 }
 
-
 static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                                    LPARAM lParam) {
-  if (msg == WM_CLOSE || msg == WM_DESTROY) {
-    Log("[WNDPROC] Game window closing (msg=0x%X), signaling threads to exit",
-        msg);
+  // Capture the original procedure before signalling worker threads. The
+  // hotkey thread restores the subclass asynchronously during shutdown.
+  WNDPROC originalWndProc = g_origWndProc;
+
+  if (msg == WM_CLOSE || msg == WM_DESTROY || msg == WM_NCDESTROY ||
+      msg == WM_ENDSESSION) {
+    if (!g_shutdownRequested)
+      Log("[WNDPROC] Game window closing (msg=0x%X), signaling threads to exit",
+          msg);
+    g_shutdownRequested = true;
     g_guiRunning = false;
     g_trojanActive = false;
+
+    // Wake the GUI message loop. It will observe g_guiRunning=false and tear
+    // down its own D3D resources on its owning thread.
+    if (g_guiHwnd)
+      PostMessageW(g_guiHwnd, WM_CLOSE, 0, 0);
+
+    // Do not disable MinHook during host shutdown. MinHook suspends peer
+    // threads while patching and can deadlock the game's own close sequence.
+    // The DLL remains loaded until process exit, so forwarding-only hooks are
+    // safe and require no explicit teardown here.
+
+    // Restore the game's procedure before forwarding the close message. This
+    // removes the cross-thread restore race and prevents later destroy
+    // messages from entering EIEM during host teardown.
+    if (originalWndProc &&
+        GetWindowLongPtrW(hwnd, GWLP_WNDPROC) ==
+            (LONG_PTR)MmdWndProc) {
+      SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)originalWndProc);
+      g_origWndProc = nullptr;
+    }
+
+    LRESULT result = originalWndProc
+                         ? CallWindowProcW(originalWndProc, hwnd, msg, wParam,
+                                           lParam)
+                         : DefWindowProcW(hwnd, msg, wParam, lParam);
+    InterlockedExchange(&g_shutdownWndProcDone, 1);
+    return result;
   }
 
   if (msg == WM_MMD_APPLY_POSE) {
@@ -2310,6 +2361,36 @@ static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
       ApplyMmdPoseOnMainThread();
     }
     g_mmdPendingApply = false;
+    return 0;
+  }
+  if (msg == WM_EIEM_DUMP_CURRENT) {
+    EiemDumpObservedMeshes(false);
+    return 0;
+  }
+  if (msg == WM_EIEM_DUMP_FULL) {
+    EiemDumpObservedMeshes(true);
+    return 0;
+  }
+  if (msg == WM_EIEM_DUMP_REFRESH) {
+    EiemRestoreDisabledRenderers();
+    TraceRefreshMeshObservations();
+    EiemSetDumpStatus("Mesh list refreshed for current scene");
+    return 0;
+  }
+  if (msg == WM_EIEM_MOD_RECONCILE) {
+    EiemRunModReconcile();
+    return 0;
+  }
+  if (msg == WM_EIEM_DUMP_DISABLED) {
+    EiemApplyDisabledRenderers();
+    return 0;
+  }
+  if (msg == WM_EIEM_MODEL_CURRENT) {
+    EiemExportModels(false);
+    return 0;
+  }
+  if (msg == WM_EIEM_MODEL_FULL) {
+    EiemExportModels(true);
     return 0;
   }
   if (msg >= (WM_USER + 100) && msg <= (WM_USER + 109)) {
@@ -2506,7 +2587,9 @@ static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
       return 0;
     }
   }
-  LRESULT r = CallWindowProcW(g_origWndProc, hwnd, msg, wParam, lParam);
+  LRESULT r = originalWndProc
+                  ? CallWindowProcW(originalWndProc, hwnd, msg, wParam, lParam)
+                  : DefWindowProcW(hwnd, msg, wParam, lParam);
 
   if (g_guiVisible) {
     if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN ||

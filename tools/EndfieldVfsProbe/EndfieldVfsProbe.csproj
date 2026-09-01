@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="SkiaSharp" Version="3.119.4" />
+    <PackageReference Include="Kyaru.Texture2DDecoder" Version="0.17.1" />
+    <PackageReference Include="Kyaru.Texture2DDecoder.Windows" Version="0.2.0" />
+    <Reference Include="AnimeStudio" HintPath="..\AnimeStudio\AnimeStudio\bin\Release\net9.0\win-x64\AnimeStudio.dll" />
+    <Reference Include="AnimeStudio.Utility" HintPath="..\AnimeStudio\AnimeStudio.Utility\bin\Release\net9.0\AnimeStudio.Utility.dll" />
+    <Reference Include="AnimeStudio.FBXWrapper" HintPath="..\AnimeStudio\AnimeStudio.FBXWrapper\bin\Release\net9.0\AnimeStudio.FBXWrapper.dll" />
+    <Reference Include="AnimeStudio.PInvoke" HintPath="..\AnimeStudio\AnimeStudio.PInvoke\bin\Release\net9.0\AnimeStudio.PInvoke.dll" />
+    <Compile Include="..\AnimeStudio\AnimeStudio.GUI\EndfieldVfsArchive.cs" Link="EndfieldVfsArchive.cs" />
+    <Compile Include="..\AnimeStudio\AnimeStudio.GUI\EndfieldVfsAssetIndexBuilder.cs" Link="EndfieldVfsAssetIndexBuilder.cs" />
+    <Compile Include="..\AnimeStudio\AnimeStudio.GUI\EndfieldBundleDependencyIndex.cs" Link="EndfieldBundleDependencyIndex.cs" />
+    <Compile Include="..\AnimeStudio\AnimeStudio.GUI\EndfieldIndexStore.cs" Link="EndfieldIndexStore.cs" />
+    <Compile Include="..\AnimeStudio\AnimeStudio.GUI\VirtualAssetPathIndex.cs" Link="VirtualAssetPathIndex.cs" />
+    <Compile Include="..\AnimeStudio\AnimeStudio.GUI\EndfieldPrefabDocument.cs" Link="EndfieldPrefabDocument.cs" />
+    <None Include="..\AnimeStudio\AnimeStudio.Libraries\AnimeStudio.FBXNative.dll" Link="AnimeStudio.FBXNative.dll" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

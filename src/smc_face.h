@@ -11,6 +11,8 @@ static void __fastcall Hooked_ApplyBoneTrans(void *__this, bool param1,
                                              void *methodInfo) {
   if (g_origApplyBoneTrans)
     g_origApplyBoneTrans(__this, param1, param2, jobHandle, methodInfo);
+  if (g_shutdownRequested)
+    return;
   g_applyBoneDone = true;
 
   if (!g_faceTestActive || !g_faceBonesCaptured || !g_nativeSetPos ||
@@ -518,6 +520,11 @@ static void *g_confirmedSMC = nullptr;
 
 static void __fastcall Hooked_MorphToBoneJob(void *__this, void *param1,
                                              void *param2, void *methodInfo) {
+  if (g_shutdownRequested) {
+    if (g_origMorphToBoneJob)
+      g_origMorphToBoneJob(__this, param1, param2, methodInfo);
+    return;
+  }
   s_jobCallCount++;
 
   if (!g_confirmedSMC && param1) {
@@ -649,6 +656,11 @@ static void CleanupPoseHandler();
 static void __fastcall Hooked_SMCUpdate(void *__this, float deltaTime,
                                         void *methodInfo) {
   static int s_frame = 0;
+  if (g_shutdownRequested) {
+    if (g_origSMCUpdate)
+      g_origSMCUpdate(__this, deltaTime, methodInfo);
+    return;
+  }
   if (!g_skeletalMorphCore) {
     if (g_confirmedSMC && __this == g_confirmedSMC) {
       g_skeletalMorphCore = __this;

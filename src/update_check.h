@@ -236,9 +236,12 @@ static void CheckForUpdates() {
 }
 
 static DWORD WINAPI UpdateCheckThread(LPVOID) {
-  for (int i = 0; i < 40 && !g_cursorShowAction; i++)
+  for (int i = 0; i < 40 && !g_cursorShowAction && !g_shutdownRequested; i++)
     Sleep(500);  
-  Sleep(10000);  
-  CheckForUpdates();
+  for (int i = 0; i < 100 && !g_shutdownRequested; i++)
+    Sleep(100);
+  if (!g_shutdownRequested)
+    CheckForUpdates();
+  Log("[UPDATE] Update thread exited");
   return 0;
 }

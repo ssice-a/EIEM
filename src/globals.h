@@ -8,22 +8,32 @@
 #define EIEM_STRINGIFY(x) EIEM_STRINGIFY2(x)
 #define EIEM_VERSION EIEM_STRINGIFY(EIEM_VERSION_MAJOR) "." EIEM_STRINGIFY(EIEM_VERSION_MINOR) "." EIEM_STRINGIFY(EIEM_VERSION_PATCH)
 
+// Sent to the game's window procedure so Mod reconciliation always executes
+// on Unity's main thread. Keep this outside the game's WM_USER range.
+#define WM_EIEM_MOD_RECONCILE (WM_APP + 0x316)
+
 static HANDLE g_logHandle = INVALID_HANDLE_VALUE;
 static CRITICAL_SECTION g_logLock;
 
 void Log(const char *fmt, ...) {
   if (g_logHandle == INVALID_HANDLE_VALUE)
     return;
-  EnterCriticalSection(&g_logLock);
   char buf[4096];
   va_list args;
   va_start(args, fmt);
   int len = vsnprintf(buf, sizeof(buf) - 2, fmt, args);
   va_end(args);
   if (len < 0)
-    len = 0;
+    len = (int)strnlen(buf, sizeof(buf) - 2);
+  if (len > (int)sizeof(buf) - 2)
+    len = (int)sizeof(buf) - 2;
   buf[len] = '\n';
   len++;
+  // Logging is diagnostic and must never stall gameplay or the hotkey pump.
+  // If another hook owns the writer lock, drop this record instead of waiting
+  // indefinitely on a damaged/stuck callback.
+  if (!TryEnterCriticalSection(&g_logLock))
+    return;
   DWORD written;
   WriteFile(g_logHandle, buf, len, &written, NULL);
   LeaveCriticalSection(&g_logLock);
@@ -39,10 +49,13 @@ static void *g_transform_get_localRotation = nullptr;
 static void *g_transform_set_localRotation = nullptr;
 static void *g_transform_get_localPosition = nullptr;
 static void *g_transform_set_localPosition = nullptr;
+static void *g_transform_get_localScale = nullptr;
+static void *g_transform_set_localScale = nullptr;
 static void *g_transform_get_childCount = nullptr;
 static void *g_transform_GetChild = nullptr;
 static void *g_transform_Find = nullptr;
 static void *g_transform_get_parent = nullptr;
+static void *g_transform_set_parent = nullptr;
 static void *g_transform_get_position = nullptr; 
 
 static void *g_animator_GetBoneTransform = nullptr;
@@ -200,14 +213,22 @@ static void *g_slotOrigGet = nullptr;
 static void *g_slotSetFn = nullptr;   
 
 static void *g_gameObject_get_transform = nullptr;
+static void *g_gameObject_ctor = nullptr;
+static void *g_gameObject_ctorDefault = nullptr;
+static void *g_gameObject_set_name = nullptr;
+static void *g_gameObject_AddComponent = nullptr;
 static void *g_component_get_gameObject = nullptr;
 static void *g_component_get_transform = nullptr;
 static void *g_gameObject_GetComponent = nullptr;
 static void *g_object_get_name = nullptr;
+static void *g_object_destroy = nullptr;
+static void *g_object_find_objects_of_type = nullptr;
+static void *g_resources_find_objects_of_type_all = nullptr;
 
 static HWND g_gameHwnd = nullptr;
 
 static int g_guiToggleVK = VK_INSERT;
+static int g_modReloadVK = VK_F10;
 static bool g_pluginActive = true;
 
 #define OFF_BIPEDIK_FIX_TRANSFORMS    0x18
@@ -279,6 +300,20 @@ static bool g_audioPendingStart = false;
 static volatile bool g_guiVisible = false;
 static HWND g_guiHwnd = nullptr;
 static volatile bool g_guiRunning = false;
+// Set when the host game begins shutdown. Hooks keep calling their original
+// methods, but worker threads stop touching Unity state as soon as possible.
+static volatile bool g_shutdownRequested = false;
+// Set after the original game window procedure returns from its close
+// message. The asynchronous cleanup worker waits for this boundary before
+// touching MinHook, keeping the game UI thread out of MinHook's thread-freeze
+// path.
+static volatile LONG g_shutdownWndProcDone = 0;
+// Worker handles are retained for diagnostics and orderly shutdown. The
+// plugin must never wait for these handles from the game's window procedure.
+static HANDLE g_hotkeyThread = nullptr;
+static HANDLE g_animationThread = nullptr;
+static HANDLE g_guiThread = nullptr;
+static HANDLE g_updateThread = nullptr;
 
 static volatile bool g_updateAvailable = false;   
 static volatile bool g_updateDismissed = false;    
@@ -297,13 +332,63 @@ static void* g_cursorHideAction = nullptr;
 static void* g_actionInvokeMethod = nullptr; 
 
 static void *g_skinnedMeshRendererClass = nullptr;
+static void *g_meshFilterClass = nullptr;
 static void *g_smr_get_sharedMesh = nullptr;
+static void *g_meshFilter_get_sharedMesh = nullptr;
+static void *g_smr_set_sharedMesh = nullptr;
+static void *g_meshFilter_set_sharedMesh = nullptr;
+static void *g_mesh_get_vertices = nullptr;
+static void *g_mesh_get_normals = nullptr;
+static void *g_mesh_get_tangents = nullptr;
+static void *g_mesh_get_uv = nullptr;
+static void *g_mesh_get_colors = nullptr;
+static void *g_mesh_get_triangles = nullptr;
+static void *g_mesh_GetTriangles = nullptr;
+static void *g_mesh_get_vertexCount = nullptr;
+static void *g_mesh_GetIndexCount = nullptr;
+static void *g_mesh_get_subMeshCount = nullptr;
+static void *g_mesh_recalculateBounds = nullptr;
+static void *g_mesh_get_boneWeights = nullptr;
+static void *g_mesh_get_bindposes = nullptr;
+static void *g_mesh_acquireReadOnlyMeshData = nullptr;
+static void *g_meshDataArray_get_Item = nullptr;
+static void *g_meshDataArray_Dispose = nullptr;
+static void *g_meshData_get_vertexCount = nullptr;
+static void *g_meshData_get_subMeshCount = nullptr;
+static void *g_meshData_GetIndexCount = nullptr;
+static void *g_meshData_CopyAttributeIntoPtr = nullptr;
+static void *g_meshData_CopyIndicesIntoPtr = nullptr;
+static void *g_renderer_get_sharedMaterials = nullptr;
+static void *g_materialClass = nullptr;
+static void *g_material_get_shader = nullptr;
+static void *g_material_GetTexturePropertyNames = nullptr;
+static void *g_material_GetTexture = nullptr;
+static void *g_material_GetColor = nullptr;
+static void *g_material_GetVector = nullptr;
+static void *g_material_GetFloat = nullptr;
+static void *g_material_GetInt = nullptr;
+static void *g_shader_get_name = nullptr;
+static void *g_textureClass = nullptr;
+static void *g_texture_get_width = nullptr;
+static void *g_texture_get_height = nullptr;
 static void *g_mesh_get_blendShapeCount = nullptr;
 static void *g_mesh_GetBlendShapeName = nullptr;
 static void *g_smr_GetBlendShapeWeight = nullptr;
 static void *g_smr_SetBlendShapeWeight = nullptr;
 static void *g_smr_get_bones =
     nullptr; 
+static void *g_smr_set_bones = nullptr;
+static void *g_smr_get_rootBone = nullptr;
+static void *g_smr_set_rootBone = nullptr;
+
+// Renderer state API used by the Dump tab. It lets a row disable the actual
+// scene Renderer on Unity's main thread without touching materials/assets.
+static void *g_renderer_get_enabled = nullptr;
+static void *g_renderer_set_enabled = nullptr;
+static void *g_rendererClass = nullptr;
+static void *g_lodGroupClass = nullptr;
+static void *g_lodGroup_get_lods = nullptr;
+static void *g_lodGroup_set_lods = nullptr;
 
 static void *g_cameraClass = nullptr;
 static void *g_camera_get_main = nullptr;

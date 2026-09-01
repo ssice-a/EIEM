@@ -56,6 +56,14 @@ struct MInfo {
 };
 
 struct Vector3 { float x, y, z; };
+struct Vector2 { float x, y; };
+struct Vector4 { float x, y, z, w; };
+struct Color { float r, g, b, a; };
+struct BoneWeight {
+  float weight0, weight1, weight2, weight3;
+  int boneIndex0, boneIndex1, boneIndex2, boneIndex3;
+};
+struct Matrix4x4 { float m[16]; };
 struct Quaternion { float x, y, z, w; };
 
 static int ReadStr(void *s, char *b, int sz) {

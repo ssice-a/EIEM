@@ -129,6 +129,32 @@ static bool IsWindowAlive(HWND hwnd) {
   return true;
 }
 
+// Animation playback can call into audio, calibration and Unity-facing code.
+// Keep it isolated from the input message pump so a stalled animation update
+// can never disable the GUI toggle handling.
+static DWORD WINAPI AnimationWorkerThread(LPVOID) {
+  Log("[OK] Animation worker thread started");
+  void *domain = il2cpp_domain_get ? il2cpp_domain_get() : nullptr;
+  if (domain && il2cpp_thread_attach)
+    il2cpp_thread_attach(domain);
+
+  while (g_guiRunning && !g_shutdownRequested) {
+    __try {
+      AnimationTick();
+      MuscleAnimationTick();
+      if (g_camTestMode && g_cameraActive)
+        ApplyCameraFrame(0.0f);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+      Log("[ANIMATION] Worker update failed with exception=0x%08lX",
+          GetExceptionCode());
+      Sleep(100);
+    }
+    Sleep((g_musclePlayer && g_musclePlayer->playing) || g_camTestMode ? 0 : 50);
+  }
+  Log("[INFO] Animation worker thread exiting");
+  return 0;
+}
+
 static DWORD WINAPI HotkeyThread(LPVOID) {
   Log("[OK] Hotkey thread started");
 
@@ -137,10 +163,11 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
     il2cpp_thread_attach(domain);
 
   HWND hwnd = nullptr;
-  while (!hwnd) {
+  while (!hwnd && !g_shutdownRequested) {
     hwnd = FindGameWindow();
     if (!hwnd) Sleep(200);
   }
+  if (g_shutdownRequested) return 0;
   g_gameHwnd = hwnd;
   Log("[OK] Game window found: %p (pid=%lu)", hwnd, GetCurrentProcessId());
 
@@ -153,31 +180,95 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
   }
 
   LoadEiemConfig();
+  EiemReloadMods();
 
-  while (g_guiRunning && IsWindowAlive(hwnd)) {
+  // Prefer thread hotkeys over GetAsyncKeyState. Endfield's input stack can
+  // consume keyboard state in a way that leaves asynchronous polling blind,
+  // while RegisterHotKey delivers an explicit WM_HOTKEY to this thread.
+  constexpr int kGuiHotkeyId = 0xE1E0;
+  constexpr int kModReloadHotkeyId = 0xE1E1;
+  MSG hotkeyMsg = {};
+  PeekMessageW(&hotkeyMsg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+  const bool guiHotkeyRegistered =
+      RegisterHotKey(nullptr, kGuiHotkeyId, MOD_NOREPEAT, g_guiToggleVK) != FALSE;
+  const bool modReloadHotkeyRegistered =
+      RegisterHotKey(nullptr, kModReloadHotkeyId, MOD_NOREPEAT, g_modReloadVK) != FALSE;
+  const DWORD guiRegisterError =
+      guiHotkeyRegistered ? ERROR_SUCCESS : GetLastError();
+  Log("[HOTKEY] registered: GUI=%d err=%lu vk=%d (%s), ModReload=%d vk=%d (%s)",
+      guiHotkeyRegistered ? 1 : 0, guiRegisterError, g_guiToggleVK,
+      EiemVKToString(g_guiToggleVK), modReloadHotkeyRegistered ? 1 : 0,
+      g_modReloadVK, EiemVKToString(g_modReloadVK));
+
+  DWORD lastHotkeyDiag = GetTickCount();
+  while (g_guiRunning && !g_shutdownRequested && IsWindowAlive(hwnd)) {
+    bool guiHotkeyMessage = false;
+    bool modReloadHotkeyMessage = false;
+    while (PeekMessageW(&hotkeyMsg, nullptr, WM_HOTKEY, WM_HOTKEY,
+                        PM_REMOVE)) {
+      if ((int)hotkeyMsg.wParam == kGuiHotkeyId)
+        guiHotkeyMessage = true;
+      else if ((int)hotkeyMsg.wParam == kModReloadHotkeyId)
+        modReloadHotkeyMessage = true;
+    }
+
     static bool togglePressed = false;
-    if (g_pluginActive && (GetAsyncKeyState(g_guiToggleVK) & 0x8000)) {
+    const bool guiPollingPressed =
+        !guiHotkeyRegistered &&
+        ((GetAsyncKeyState(g_guiToggleVK) & 0x8001) != 0);
+    if (g_pluginActive && (guiHotkeyMessage || guiPollingPressed)) {
       if (!togglePressed) {
         togglePressed = true;
         ToggleGui();
+        Log("[HOTKEY] GUI toggle received via %s",
+            guiHotkeyMessage ? "WM_HOTKEY" : "GetAsyncKeyState fallback");
       }
     } else {
       togglePressed = false;
     }
 
-    AnimationTick();
-    MuscleAnimationTick();
-
-    if (g_camTestMode && g_cameraActive) {
-      ApplyCameraFrame(0.0f);
+    static bool reloadPressed = false;
+    const bool reloadPollingPressed =
+        !modReloadHotkeyRegistered &&
+        ((GetAsyncKeyState(g_modReloadVK) & 0x8001) != 0);
+    if (g_pluginActive && (modReloadHotkeyMessage || reloadPollingPressed)) {
+      if (!reloadPressed) {
+        reloadPressed = true;
+        EiemReloadMods();
+        EiemQueueModReconcile("mod reload hotkey");
+        Log("[HOTKEY] Mod reload received via %s",
+            modReloadHotkeyMessage ? "WM_HOTKEY" : "GetAsyncKeyState fallback");
+      }
+    } else {
+      reloadPressed = false;
     }
 
-    Sleep((g_musclePlayer && g_musclePlayer->playing) || g_camTestMode ? 0 : 50);
+    // Keep a low-rate heartbeat so a failed hotkey loop is distinguishable
+    // from a key that the game or desktop consumed.
+    DWORD now = GetTickCount();
+    if (now - lastHotkeyDiag >= 5000) {
+      Log("[HOTKEY] polling heartbeat: active=%d gui_vk=%d gui_visible=%d",
+          g_pluginActive ? 1 : 0, g_guiToggleVK, g_guiVisible ? 1 : 0);
+      lastHotkeyDiag = now;
+    }
+
+    Sleep(20);
   }
 
+  if (guiHotkeyRegistered)
+    UnregisterHotKey(nullptr, kGuiHotkeyId);
+  if (modReloadHotkeyRegistered)
+    UnregisterHotKey(nullptr, kModReloadHotkeyId);
+
+  // The game owns this window. Restore its original procedure before the
+  // plugin thread exits so late close/destroy messages bypass EIEM.
+  if (g_origWndProc && IsWindow(hwnd)) {
+    SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)g_origWndProc);
+    g_origWndProc = nullptr;
+  }
+  g_guiRunning = false;
   Log("[INFO] Game window closed, hotkey thread exiting");
-  ExitThread(0);
-  return 0; 
+  return 0;
 }
 
 static void DumpTransformHierarchy(void *transform, int depth, FILE *dumpFile) {
@@ -470,7 +561,13 @@ static void DiscoverSkeleton() {
 static DWORD WINAPI InitThread(LPVOID) {
   while (!GetModuleHandleW(L"GameAssembly.dll"))
     Sleep(500);
-  Sleep(3000); 
+
+  // GameAssembly can be present before Unity's GC and managed thread table
+  // are fully initialized. Keep the startup barrier before any IL2CPP call.
+  Sleep(3000);
+
+  if (g_shutdownRequested)
+    return 0;
 
   InitializeCriticalSection(&g_logLock);
   g_logHandle =
@@ -486,13 +583,35 @@ static DWORD WINAPI InitThread(LPVOID) {
 
   InitHardcodedMuscleMap();
 
-  void *domain = il2cpp_domain_get();
-  il2cpp_thread_attach(domain);
-  size_t ac;
-  void **asms = il2cpp_domain_get_assemblies(domain, &ac);
+  void *domain = nullptr;
+  void **asms = nullptr;
+  size_t ac = 0;
+  // Wait only for a usable assembly list. The resource pass must be hooked
+  // before the expensive metadata dump and other plugin initialization.
+  for (int attempt = 0; attempt < 250 && !g_shutdownRequested; ++attempt) {
+    domain = il2cpp_domain_get ? il2cpp_domain_get() : nullptr;
+    if (domain && il2cpp_thread_attach)
+      il2cpp_thread_attach(domain);
+    if (domain && il2cpp_domain_get_assemblies)
+      asms = il2cpp_domain_get_assemblies(domain, &ac);
+    if (asms && ac > 0)
+      break;
+    Sleep(20);
+  }
+  if (!asms || ac == 0) {
+    Log("[FATAL] IL2CPP assemblies were not ready");
+    return 1;
+  }
   Log("[OK] Domain attached, %zu assemblies", ac);
 
-  MH_Initialize();
+  if (MH_Initialize() != MH_OK) {
+    Log("[FATAL] MinHook initialization failed");
+    return 1;
+  }
+
+  Log("[RES-TRACE] Installing startup resource hooks before metadata dump");
+  InitIl2CppResourceTrace(asms, ac);
+  DumpIl2CppMetadata(asms, ac);
 
 
   g_transformClass = FindClass("UnityEngine", "Transform", asms, ac);
@@ -506,20 +625,28 @@ static DWORD WINAPI InitThread(LPVOID) {
         FindMethod(g_transformClass, "get_localPosition", 0);
     g_transform_set_localPosition =
         FindMethod(g_transformClass, "set_localPosition", 1);
+    g_transform_get_localScale =
+        FindMethod(g_transformClass, "get_localScale", 0);
+    g_transform_set_localScale =
+        FindMethod(g_transformClass, "set_localScale", 1);
     g_transform_get_childCount =
         FindMethod(g_transformClass, "get_childCount", 0);
     g_transform_GetChild = FindMethod(g_transformClass, "GetChild", 1);
     g_transform_Find = FindMethod(g_transformClass, "Find", 1);
     g_transform_get_parent = FindMethod(g_transformClass, "get_parent", 0);
+    g_transform_set_parent = FindMethod(g_transformClass, "SetParent", 2);
     g_transform_get_position = FindMethod(g_transformClass, "get_position", 0);
     Log("  get_localRotation: %p", g_transform_get_localRotation);
     Log("  set_localRotation: %p", g_transform_set_localRotation);
     Log("  get_localPosition: %p", g_transform_get_localPosition);
     Log("  set_localPosition: %p", g_transform_set_localPosition);
+    Log("  get_localScale: %p", g_transform_get_localScale);
+    Log("  set_localScale: %p", g_transform_set_localScale);
     Log("  get_childCount: %p", g_transform_get_childCount);
     Log("  GetChild: %p", g_transform_GetChild);
     Log("  Find: %p", g_transform_Find);
-    Log("  get_position: %p", g_transform_get_position);
+    Log("  get_position: %p, SetParent(Transform,bool): %p",
+        g_transform_get_position, g_transform_set_parent);
   } else {
     Log("[WARN] Transform class NOT found");
   }
@@ -527,7 +654,19 @@ static DWORD WINAPI InitThread(LPVOID) {
   void *objectClass = FindClass("UnityEngine", "Object", asms, ac);
   if (objectClass) {
     g_object_get_name = FindMethod(objectClass, "get_name", 0);
-    Log("[OK] Object.get_name: %p", g_object_get_name);
+    g_object_find_objects_of_type =
+        FindMethod(objectClass, "FindObjectsOfType", 1);
+    g_object_destroy = FindMethod(objectClass, "Destroy", 1);
+    Log("[OK] Object.get_name: %p, FindObjectsOfType: %p, Destroy: %p",
+        g_object_get_name, g_object_find_objects_of_type, g_object_destroy);
+  }
+
+  void *resourcesClass = FindClass("UnityEngine", "Resources", asms, ac);
+  if (resourcesClass) {
+    g_resources_find_objects_of_type_all =
+        FindMethod(resourcesClass, "FindObjectsOfTypeAll", 1);
+    Log("[DUMP] Resources.FindObjectsOfTypeAll: %p",
+        g_resources_find_objects_of_type_all);
   }
 
   g_animatorClass = FindClass("UnityEngine", "Animator", asms, ac);
@@ -770,7 +909,13 @@ static DWORD WINAPI InitThread(LPVOID) {
   if (g_gameObjectClass) {
     g_gameObject_get_transform =
         FindMethod(g_gameObjectClass, "get_transform", 0);
-    Log("[OK] GameObject.get_transform: %p", g_gameObject_get_transform);
+    g_gameObject_ctor = FindMethod(g_gameObjectClass, ".ctor", 1);
+    g_gameObject_ctorDefault = FindMethod(g_gameObjectClass, ".ctor", 0);
+    g_gameObject_set_name = FindMethod(g_gameObjectClass, "set_name", 1);
+    g_gameObject_AddComponent = FindMethod(g_gameObjectClass, "AddComponent", 1);
+    Log("[OK] GameObject: transform=%p ctor(string)=%p ctor()=%p set_name=%p AddComponent=%p",
+        g_gameObject_get_transform, g_gameObject_ctor, g_gameObject_ctorDefault,
+        g_gameObject_set_name, g_gameObject_AddComponent);
   }
 
   g_componentClass = FindClass("UnityEngine", "Component", asms, ac);
@@ -793,29 +938,146 @@ static DWORD WINAPI InitThread(LPVOID) {
   if (g_skinnedMeshRendererClass) {
     g_smr_get_sharedMesh =
         FindMethod(g_skinnedMeshRendererClass, "get_sharedMesh", 0);
+    g_smr_set_sharedMesh =
+        FindMethod(g_skinnedMeshRendererClass, "set_sharedMesh", 1);
     g_smr_GetBlendShapeWeight =
         FindMethod(g_skinnedMeshRendererClass, "GetBlendShapeWeight", 1);
     g_smr_SetBlendShapeWeight =
         FindMethod(g_skinnedMeshRendererClass, "SetBlendShapeWeight", 2);
     g_smr_get_bones = FindMethod(g_skinnedMeshRendererClass, "get_bones", 0);
-    Log("[OK] SkinnedMeshRenderer: sharedMesh=%p, GetWeight=%p, SetWeight=%p, "
-        "get_bones=%p",
-        g_smr_get_sharedMesh, g_smr_GetBlendShapeWeight,
-        g_smr_SetBlendShapeWeight, g_smr_get_bones);
+    g_smr_set_bones = FindMethod(g_skinnedMeshRendererClass, "set_bones", 1);
+    g_smr_get_rootBone = FindMethod(g_skinnedMeshRendererClass, "get_rootBone", 0);
+    g_smr_set_rootBone = FindMethod(g_skinnedMeshRendererClass, "set_rootBone", 1);
+    Log("[OK] SkinnedMeshRenderer: get/set sharedMesh=%p/%p, GetWeight=%p, SetWeight=%p, "
+        "get/set bones=%p/%p rootBone=%p/%p",
+        g_smr_get_sharedMesh, g_smr_set_sharedMesh, g_smr_GetBlendShapeWeight,
+        g_smr_SetBlendShapeWeight, g_smr_get_bones, g_smr_set_bones,
+        g_smr_get_rootBone, g_smr_set_rootBone);
   } else {
     Log("[WARN] SkinnedMeshRenderer class NOT found");
   }
 
+  void *meshFilterClass = FindClass("UnityEngine", "MeshFilter", asms, ac);
+  if (meshFilterClass) {
+    g_meshFilterClass = meshFilterClass;
+    g_meshFilter_get_sharedMesh =
+        FindMethod(meshFilterClass, "get_sharedMesh", 0);
+    g_meshFilter_set_sharedMesh =
+        FindMethod(meshFilterClass, "set_sharedMesh", 1);
+    Log("[OK] MeshFilter: get/set sharedMesh=%p/%p", g_meshFilter_get_sharedMesh,
+        g_meshFilter_set_sharedMesh);
+  }
+
+  void *rendererClass = FindClass("UnityEngine", "Renderer", asms, ac);
+  if (rendererClass) {
+    g_rendererClass = rendererClass;
+    g_renderer_get_enabled =
+        FindMethodInHierarchy(rendererClass, "get_enabled", 0);
+    g_renderer_set_enabled =
+        FindMethodInHierarchy(rendererClass, "set_enabled", 1);
+    g_renderer_get_sharedMaterials =
+        FindMethodInHierarchy(rendererClass, "get_sharedMaterials", 0);
+    Log("[DUMP] Renderer enabled get/set: %p / %p", g_renderer_get_enabled,
+        g_renderer_set_enabled);
+  }
+
+  // LOD membership is optional: older Unity builds or stripped metadata may
+  // not expose LODGroup. Partner Renderers still work without this block.
+  g_lodGroupClass = FindClass("UnityEngine", "LODGroup", asms, ac);
+  if (g_lodGroupClass) {
+    g_lodGroup_get_lods = FindMethod(g_lodGroupClass, "get_lods", 0);
+    g_lodGroup_set_lods = FindMethod(g_lodGroupClass, "set_lods", 1);
+    Log("[MOD] LODGroup get/set lods: %p / %p", g_lodGroup_get_lods,
+        g_lodGroup_set_lods);
+  } else {
+    Log("[MOD] LODGroup class not found; partner LOD membership disabled");
+  }
+
+  g_materialClass = FindClass("UnityEngine", "Material", asms, ac);
+  if (g_materialClass) {
+    g_material_get_shader = FindMethodInHierarchy(g_materialClass, "get_shader", 0);
+    g_material_GetTexturePropertyNames = FindMethod(g_materialClass, "GetTexturePropertyNames", 0);
+    static const char *const materialStringType[] = {"System.String"};
+    g_material_GetTexture = FindMethodWithParamTypes(
+        g_materialClass, "GetTexture", materialStringType, 1);
+    g_material_GetColor = FindMethodWithParamTypes(
+        g_materialClass, "GetColor", materialStringType, 1);
+    g_material_GetVector = FindMethodWithParamTypes(
+        g_materialClass, "GetVector", materialStringType, 1);
+    g_material_GetFloat = FindMethodWithParamTypes(
+        g_materialClass, "GetFloat", materialStringType, 1);
+    g_material_GetInt = FindMethodWithParamTypes(
+        g_materialClass, "GetInt", materialStringType, 1);
+    Log("[DUMP] Material APIs: shader=%p textureNames=%p texture=%p color=%p vector=%p float=%p int=%p",
+        g_material_get_shader, g_material_GetTexturePropertyNames,
+        g_material_GetTexture, g_material_GetColor, g_material_GetVector,
+        g_material_GetFloat, g_material_GetInt);
+  }
+  g_textureClass = FindClass("UnityEngine", "Texture", asms, ac);
+  if (g_textureClass) {
+    g_texture_get_width = FindMethod(g_textureClass, "get_width", 0);
+    g_texture_get_height = FindMethod(g_textureClass, "get_height", 0);
+  }
+
+  // Resolve the EIEM writer side only after the game has exposed all Unity
+  // value types. This does not allocate resources; it only records methods.
+  EiemResolveResourceBackend(asms, ac);
+
   void *meshClass = FindClass("UnityEngine", "Mesh", asms, ac);
   if (meshClass) {
+    g_mesh_get_vertices = FindMethod(meshClass, "get_vertices", 0);
+    g_mesh_get_normals = FindMethod(meshClass, "get_normals", 0);
+    g_mesh_get_tangents = FindMethod(meshClass, "get_tangents", 0);
+    g_mesh_get_uv = FindMethod(meshClass, "get_uv", 0);
+    g_mesh_get_colors = FindMethod(meshClass, "get_colors", 0);
+    g_mesh_get_triangles = FindMethod(meshClass, "get_triangles", 0);
+    g_mesh_GetTriangles = FindMethod(meshClass, "GetTriangles", 1);
+    g_mesh_get_vertexCount = FindMethod(meshClass, "get_vertexCount", 0);
+    g_mesh_GetIndexCount = FindMethod(meshClass, "GetIndexCount", 1);
+    g_mesh_get_subMeshCount = FindMethod(meshClass, "get_subMeshCount", 0);
+    g_mesh_get_boneWeights = FindMethod(meshClass, "GetBoneWeightsImpl", 0);
+    g_mesh_get_bindposes = FindMethod(meshClass, "get_bindposes", 0);
     g_mesh_get_blendShapeCount =
         FindMethod(meshClass, "get_blendShapeCount", 0);
     g_mesh_GetBlendShapeName = FindMethod(meshClass, "GetBlendShapeName", 1);
-    Log("[OK] Mesh: blendShapeCount=%p, GetBlendShapeName=%p",
-        g_mesh_get_blendShapeCount, g_mesh_GetBlendShapeName);
+    Log("[OK] Mesh export API: vertices=%p normals=%p tangents=%p uv=%p "
+        "colors=%p triangles=%p vertexCount=%p indexCount=%p subMeshes=%p bones=%p bindposes=%p",
+        g_mesh_get_vertices, g_mesh_get_normals, g_mesh_get_tangents,
+        g_mesh_get_uv, g_mesh_get_colors, g_mesh_get_triangles,
+        g_mesh_GetTriangles, g_mesh_get_vertexCount, g_mesh_GetIndexCount,
+        g_mesh_get_subMeshCount, g_mesh_get_boneWeights,
+        g_mesh_get_bindposes);
+
+    void *meshDataClass = FindClass("", "MeshData", asms, ac);
+    void *meshDataArrayClass = FindClass("", "MeshDataArray", asms, ac);
+    if (meshDataClass) {
+      g_meshData_get_vertexCount = FindMethod(meshDataClass, "get_vertexCount", 0);
+      g_meshData_get_subMeshCount = FindMethod(meshDataClass, "get_subMeshCount", 0);
+      g_meshData_GetIndexCount = FindMethod(meshDataClass, "GetIndexCount", 1);
+      g_meshData_CopyAttributeIntoPtr =
+          FindMethod(meshDataClass, "CopyAttributeIntoPtr", 5);
+      g_meshData_CopyIndicesIntoPtr =
+          FindMethod(meshDataClass, "CopyIndicesIntoPtr", 5);
+    }
+    if (meshDataArrayClass) {
+      g_meshDataArray_get_Item = FindMethod(meshDataArrayClass, "get_Item", 1);
+      g_meshDataArray_Dispose = FindMethod(meshDataArrayClass, "Dispose", 0);
+    }
+    g_mesh_acquireReadOnlyMeshData =
+        FindMethod(meshClass, "AcquireReadOnlyMeshData", 1);
+    Log("[DUMP] MeshData fallback: acquire=%p item=%p dispose=%p vertexCount=%p "
+        "subMeshCount=%p indexCount=%p attrCopy=%p indexCopy=%p",
+        g_mesh_acquireReadOnlyMeshData, g_meshDataArray_get_Item,
+        g_meshDataArray_Dispose, g_meshData_get_vertexCount,
+        g_meshData_get_subMeshCount, g_meshData_GetIndexCount,
+        g_meshData_CopyAttributeIntoPtr, g_meshData_CopyIndicesIntoPtr);
   } else {
     Log("[WARN] Mesh class NOT found");
   }
+
+  // All matching and resource APIs are now available. Queue the first scene
+  // pass rather than guessing from setter events that occurred during load.
+  EiemQueueModReconcile("initial mod load");
 
   g_cameraClass = FindClass("UnityEngine", "Camera", asms, ac);
   if (g_cameraClass) {
@@ -989,6 +1251,14 @@ static DWORD WINAPI InitThread(LPVOID) {
 
       struct SetMainCharHook {
         static void Hooked(void *self, void *entity, bool flag) {
+          // During host teardown the game may reset the active entity after
+          // WM_CLOSE. Forward that reset, but do not touch IL2CPP metadata or
+          // plugin caches while the runtime is shutting down.
+          if (g_shutdownRequested) {
+            if (orig_SetMainCharacter)
+              orig_SetMainCharacter(self, entity, flag);
+            return;
+          }
           if (self && !g_playerController) {
             g_playerController = self;
             Log("[HOOK] Captured PlayerController: %p", self);
@@ -1067,6 +1337,11 @@ static DWORD WINAPI InitThread(LPVOID) {
             }
           }
           orig_SetMainCharacter(self, entity, flag);
+
+          // Unity may have assigned serialized renderer fields directly while
+          // instantiating this character, bypassing set_sharedMesh. Reconcile
+          // once through the window procedure after the switch completes.
+          EiemQueueModReconcile("main character changed");
 
           s_ikDisabled = false;
           memset(s_bipedIK, 0, sizeof(s_bipedIK));
@@ -1193,16 +1468,21 @@ static DWORD WINAPI InitThread(LPVOID) {
 
 
   Log("\n=== Phase 2 Init Complete ===");
-  Log("Hooks installed. Press Numpad1 in-game to dump bone discovery.");
+  Log("Hooks installed. Use the GUI Dump tab for resource capture.");
 
   DumpCursorMethods();
 
-  CreateThread(NULL, 0, HotkeyThread, NULL, 0, NULL);
-
   g_guiRunning = true;
-  CreateThread(NULL, 0, GuiThread, NULL, 0, NULL);
+  // Set the run flag before creating the worker. Otherwise a fast-scheduled
+  // worker can observe the initial false value and exit before polling keys.
+  g_hotkeyThread = CreateThread(NULL, 0, HotkeyThread, NULL, 0, NULL);
 
-  CreateThread(NULL, 0, UpdateCheckThread, NULL, 0, NULL);
+  g_animationThread =
+      CreateThread(NULL, 0, AnimationWorkerThread, NULL, 0, NULL);
+
+  g_guiThread = CreateThread(NULL, 0, GuiThread, NULL, 0, NULL);
+
+  g_updateThread = CreateThread(NULL, 0, UpdateCheckThread, NULL, 0, NULL);
 
   return 0;
 }

@@ -4,10 +4,12 @@
 #include <dxgi1_2.h>
 #include <dwmapi.h>
 #include <dcomp.h>
+#include <shlobj.h>
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "dcomp.lib")
+#pragma comment(lib, "shell32.lib")
 
 #include "imgui.h"
 #include "imgui_impl_win32.h"
@@ -884,6 +886,109 @@ static void DrawMainPanel() {
   }
 
   ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.95f, 0.97f, 1.0f));
+  bool tabDump = ImGui::BeginTabItem(u8"Dump");
+  ImGui::PopStyleColor();
+  if (tabDump) {
+    ImGui::Spacing();
+    ImGui::TextColored(ImVec4(0.90f, 0.75f, 0.20f, 1.0f),
+                       u8"资源 Dump");
+    ImGui::Separator();
+    ImGui::TextDisabled(u8"列表来自当前场景的 Mesh 绑定");
+    ImGui::SetNextItemWidth(-1);
+    ImGui::InputText(u8"筛选 Mesh / 层级 / Renderer", g_dumpSearch,
+                     sizeof(g_dumpSearch));
+    ImGui::TextDisabled(u8"勾选行会禁用该 Mesh 的所有 Renderer 实例");
+    if (ImGui::Button(u8"勾选筛选结果", ImVec2(150, 0))) {
+      EiemSelectFilteredDumpMeshes(true);
+      EiemRequestDisabledRefresh();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(u8"取消筛选结果", ImVec2(150, 0))) {
+      EiemSelectFilteredDumpMeshes(false);
+      EiemRequestDisabledRefresh();
+    }
+
+    ImGui::SetNextItemWidth(-110);
+    ImGui::InputText(u8"输出目录", g_dumpOutputDir, sizeof(g_dumpOutputDir));
+    ImGui::SameLine();
+    if (ImGui::Button(u8"选择目录")) {
+      BROWSEINFOA browse = {};
+      browse.hwndOwner = g_guiHwnd;
+      browse.lpszTitle = "Select dump output directory";
+      browse.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+      PIDLIST_ABSOLUTE item = SHBrowseForFolderA(&browse);
+      if (item) {
+        char path[MAX_PATH] = {};
+        if (SHGetPathFromIDListA(item, path))
+          strncpy_s(g_dumpOutputDir, sizeof(g_dumpOutputDir), path, _TRUNCATE);
+        CoTaskMemFree(item);
+      }
+    }
+
+    ImGui::BeginChild("##dump_meshes", ImVec2(0, -150), true,
+                      ImGuiWindowFlags_AlwaysVerticalScrollbar |
+                          ImGuiWindowFlags_HorizontalScrollbar);
+    EiemMeshObservation *rows = s_dumpGuiSnapshot;
+    const size_t rowCount =
+        TraceCopyMeshObservations(rows, _countof(s_dumpGuiSnapshot));
+    if (rowCount == 0) {
+      ImGui::TextDisabled(u8"尚未观察到 Mesh。进入场景后列表会自动填充。");
+    } else {
+      size_t visibleCount = 0;
+      for (size_t i = 0; i < rowCount; ++i) {
+        if (!EiemObservationMatchesFilter(rows[i])) continue;
+        ++visibleCount;
+        char label[512] = {};
+        snprintf(label, sizeof(label), "%s | %s | %s [x%u]##mesh_%p",
+                 rows[i].rendererType,
+                 rows[i].hierarchyPath[0] ? rows[i].hierarchyPath : "<root>",
+                 rows[i].meshName[0] ? rows[i].meshName : "<unnamed>",
+                 rows[i].instanceCount,
+                 rows[i].mesh);
+        bool selected = EiemIsMeshSelected(rows[i].mesh);
+        if (ImGui::Checkbox(label, &selected)) {
+          EiemSetMeshSelected(rows[i].mesh, selected);
+          EiemRequestDisabledRefresh();
+        }
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("Renderer: %s\nHierarchy: %s\nMesh: %s",
+                            rows[i].rendererName, rows[i].hierarchyPath,
+                            rows[i].meshName);
+      }
+      ImGui::TextDisabled(u8"显示 %zu / %zu", visibleCount, rowCount);
+    }
+    ImGui::EndChild();
+
+    char dumpStatus[256] = {};
+    EiemGetDumpStatus(dumpStatus, sizeof(dumpStatus));
+    ImGui::TextDisabled("%s", dumpStatus);
+    if (ImGui::Button(u8"Dump 当前", ImVec2(140, 0)))
+      EiemRequestDump(false);
+    ImGui::SameLine();
+    if (ImGui::Button(u8"全量 Dump", ImVec2(140, 0)))
+      EiemRequestDump(true);
+    ImGui::SameLine();
+    if (ImGui::Button(u8"刷新列表", ImVec2(110, 0)))
+      EiemRequestDumpRefresh();
+    ImGui::SameLine();
+    if (ImGui::Button(u8"全选", ImVec2(70, 0))) {
+      EiemSelectAllDumpMeshes(true);
+      EiemRequestDisabledRefresh();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(u8"取消全选", ImVec2(90, 0))) {
+      EiemSelectAllDumpMeshes(false);
+      EiemRequestDisabledRefresh();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(u8"清除选择", ImVec2(110, 0))) {
+      EiemClearDumpSelection();
+      EiemRequestDisabledRefresh();
+    }
+    ImGui::EndTabItem();
+  }
+
+  ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.95f, 0.97f, 1.0f));
   bool tabOffset = ImGui::BeginTabItem(u8"\u504f\u79fb");
   ImGui::PopStyleColor();
   if (tabOffset) {
@@ -1339,8 +1444,10 @@ static DWORD WINAPI GuiThread(LPVOID) {
 
   RECT gr;
   GetWindowRect(g_gameHwnd, &gr);
-  int panelW = 380;
-  int panelH = 580;
+  const int gameW = gr.right - gr.left;
+  const int gameH = gr.bottom - gr.top;
+  int panelW = gameW > 760 ? 720 : (gameW > 480 ? gameW - 40 : gameW);
+  int panelH = gameH > 820 ? 780 : (gameH > 520 ? gameH - 40 : gameH);
   int posX = gr.right - panelW - 20;
   int posY = gr.top + 40;
 
@@ -1501,7 +1608,7 @@ static DWORD WINAPI GuiThread(LPVOID) {
 
   MSG msg;
   ZeroMemory(&msg, sizeof(msg));
-  while (g_guiRunning) {
+  while (g_guiRunning && !g_shutdownRequested) {
     while (PeekMessage(&msg, nullptr, 0U, 0U, PM_REMOVE)) {
       TranslateMessage(&msg);
       DispatchMessage(&msg);
@@ -1512,7 +1619,7 @@ static DWORD WINAPI GuiThread(LPVOID) {
     }
     if (!g_guiRunning) break;
 
-    if (!IsWindow(g_gameHwnd)) {
+    if (g_shutdownRequested || !IsWindow(g_gameHwnd)) {
       Log("[GUI] Game window gone, shutting down");
       g_guiRunning = false;
       break;

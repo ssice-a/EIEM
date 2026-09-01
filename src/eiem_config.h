@@ -104,6 +104,7 @@ static inline void LoadEiemConfig() {
       fprintf(f, "# ============================================================================\n\n");
       fprintf(f, "# GUI 呼出/隐藏快捷键 (默认: INSERT, 支持 F1-F12, INSERT, DELETE, HOME, END, A-Z, 0-9 等)\n");
       fprintf(f, "gui_toggle_key=INSERT\n");
+      fprintf(f, "mod_reload_key=F10\n");
       fclose(f);
     }
     return;
@@ -130,6 +131,11 @@ static inline void LoadEiemConfig() {
       int vk = EiemStringToVK(val);
       if (vk > 0) {
         g_guiToggleVK = vk;
+      }
+    } else if (_stricmp(key, "mod_reload_key") == 0) {
+      int vk = EiemStringToVK(val);
+      if (vk > 0) {
+        g_modReloadVK = vk;
       }
     }
   }
