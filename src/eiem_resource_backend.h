@@ -1,10 +1,13 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <limits>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // This is the native half of the EIEM package contract. It deliberately reads
@@ -67,11 +70,35 @@ struct EiemNativeMeshDocument {
   std::vector<BoneWeight> skin;
   std::vector<Matrix4x4> bindPoses;
   std::vector<uint32_t> boneHashes;
+  // EIEMESH v3 authoring metadata. Each entry identifies the shared skeleton
+  // node addressed by the corresponding compact Mesh bone index. Runtime
+  // replacement inherits the live renderer's Transform palette, so these
+  // paths are intentionally not used to create per-renderer skeletons.
+  std::vector<std::string> bonePaths;
   std::vector<EiemNativeBlendShapeVertex> blendShapeVertices;
   std::vector<EiemNativeBlendShapeFrame> blendShapeFrames;
   std::vector<EiemNativeBlendShapeChannel> blendShapeChannels;
   std::vector<float> blendShapeWeights;
 };
+
+// AnimeStudio's Unity asset reader and the native game both use Unity's
+// Y-up, left-handed mesh basis.  The earlier experimental package marker
+// called this Z-up and the runtime rotated vertices/bindposes on every load;
+// that mixed the mesh basis with the live bone palette and produced twisting.
+// Keep accepting the old marker as a compatibility alias, but do not mutate
+// the buffers at the Unity boundary: the package already stores native mesh
+// data and its bindposes in the exact basis consumed by SkinnedMeshRenderer.
+static bool EiemMeshUsesUnityYUp(const std::string &coordinateSpace) {
+  return _stricmp(coordinateSpace.c_str(), "unity-y-up-left-handed") == 0 ||
+         _stricmp(coordinateSpace.c_str(), "model-z-up-left-handed") == 0;
+}
+
+static void EiemConvertMeshDocumentToUnity(EiemNativeMeshDocument *document) {
+  if (!document || !EiemMeshUsesUnityYUp(document->coordinateSpace)) return;
+  // Native Unity basis: no coordinate conversion is required.  This function
+  // remains as the single format boundary so a future explicit coordinate
+  // marker can add a conversion without touching mesh construction.
+}
 
 class EiemNativeReader {
  public:
@@ -224,7 +251,7 @@ static bool EiemReadNativeMesh(const char *path, EiemNativeMeshDocument *out,
   int32_t version = 0;
   if (!reader.Good() || !reader.Bytes(magic, sizeof(magic)) ||
       memcmp(magic, "EIEMESH\0", sizeof(magic)) != 0 || !reader.Value(&version) ||
-      version != 1 || !reader.String(&out->coordinateSpace) ||
+      (version != 2 && version != 3) || !reader.String(&out->coordinateSpace) ||
       !reader.String(&out->source) || !reader.String(&out->name) ||
       !reader.Value(&out->vertexCount) || out->vertexCount < 0 ||
       out->vertexCount > 10000000 ||
@@ -265,8 +292,19 @@ static bool EiemReadNativeMesh(const char *path, EiemNativeMeshDocument *out,
   if (!reader.Count(&count, 10000000)) goto invalid;
   out->boneHashes.resize(count);
   if (count && !reader.Bytes(out->boneHashes.data(), (size_t)count * sizeof(uint32_t))) goto invalid;
+  if (version >= 3) {
+    if (!reader.Count(&count, 1000000)) goto invalid;
+    out->bonePaths.resize(count);
+    for (auto &path : out->bonePaths) {
+      if (!reader.String(&path)) goto invalid;
+    }
+    if (!out->bonePaths.empty() &&
+        out->bonePaths.size() != out->bindPoses.size())
+      goto invalid;
+  }
   if (!EiemReadBlendShapes(reader, out) || !reader.End()) goto invalid;
   if (out->vertices.size() != (size_t)out->vertexCount || out->subMeshes.empty()) goto invalid;
+  EiemConvertMeshDocumentToUnity(out);
   return true;
 
 invalid:
@@ -282,9 +320,12 @@ static void *s_eiemColorClass = nullptr;
 static void *s_eiemBoneWeightClass = nullptr;
 static void *s_eiemMatrix4x4Class = nullptr;
 static void *s_eiemInt32Class = nullptr;
+static void *s_eiemObjectClass = nullptr;
+static void *s_eiemObjectSetName = nullptr;
 static void *s_eiemMeshCtor = nullptr;
 static void *s_eiemMeshSetIndexFormat = nullptr;
 static void *s_eiemMeshSetVertices = nullptr;
+static void *s_eiemMeshGetVertices = nullptr;
 static void *s_eiemMeshSetNormals = nullptr;
 static void *s_eiemMeshSetTangents = nullptr;
 static void *s_eiemMeshSetColors = nullptr;
@@ -295,6 +336,9 @@ static void *s_eiemMeshSetSubMeshCount = nullptr;
 static void *s_eiemMeshSetTriangles = nullptr;
 static void *s_eiemMeshSetBoneWeights = nullptr;
 static void *s_eiemMeshSetBindPoses = nullptr;
+static void *s_eiemMeshUploadMeshData = nullptr;
+static void *s_eiemMeshGetBoneWeights = nullptr;
+static void *s_eiemMeshGetBindPoses = nullptr;
 static void *s_eiemMeshAddBlendShapeFrame = nullptr;
 static void *s_eiemMaterialClass = nullptr;
 static void *s_eiemRendererClass = nullptr;
@@ -311,14 +355,54 @@ static void *s_eiemResourceManagerLoad = nullptr;
 static void *s_eiemProxyLoadImmediate = nullptr;
 static void *s_eiemProxyGet = nullptr;
 static void *s_eiemTexture2DClass = nullptr;
+static void *s_eiemTextureClass = nullptr;
 static void *s_eiemImageConversionClass = nullptr;
 static void *s_eiemByteClass = nullptr;
 static void *s_eiemTexture2DCtor = nullptr;
 static void *s_eiemImageLoad = nullptr;
+static void *s_eiemTextureSetFilterMode = nullptr;
+static void *s_eiemTextureSetWrapMode = nullptr;
+static void *s_eiemTextureSetAnisoLevel = nullptr;
+static void *s_eiemTextureSetMipMapBias = nullptr;
+
+static void EiemLogManagedValueTypeLayout(const char *label, void *klass,
+                                          size_t nativeSize) {
+  if (!klass) {
+    Log("[DEBUG-SKIN-LAYOUT] type=%s class=<null> nativeSize=%zu",
+        label ? label : "unknown", nativeSize);
+    return;
+  }
+  uint32_t alignment = 0;
+  const int32_t managedSize = il2cpp_class_value_size
+                                  ? il2cpp_class_value_size(klass, &alignment)
+                                  : -1;
+  Log("[DEBUG-SKIN-LAYOUT] type=%s class=%p nativeSize=%zu managedSize=%d alignment=%u",
+      label ? label : "unknown", klass, nativeSize, managedSize, alignment);
+  if (!il2cpp_class_get_fields || !il2cpp_field_get_name ||
+      !il2cpp_field_get_offset)
+    return;
+  void *iterator = nullptr;
+  void *field = nullptr;
+  while ((field = il2cpp_class_get_fields(klass, &iterator))) {
+    const char *fieldName = il2cpp_field_get_name(field);
+    void *fieldType = il2cpp_field_get_type ? il2cpp_field_get_type(field) : nullptr;
+    const char *typeName = fieldType && il2cpp_type_get_name
+                               ? il2cpp_type_get_name(fieldType)
+                               : nullptr;
+    Log("[DEBUG-SKIN-LAYOUT] type=%s field=%s fieldType=%s offset=0x%zX",
+        label ? label : "unknown", fieldName ? fieldName : "<unknown>",
+        typeName ? typeName : "<unknown>", il2cpp_field_get_offset(field));
+  }
+}
 static void *s_eiemMaterialSetTexture = nullptr;
+static void *s_eiemMaterialGetTexture = nullptr;
 // Updated by the game's own resource-load hook. Using that live manager keeps
 // source= paths inside the original VFS/decryption/manifest pipeline.
 static void *s_eiemResourceManagerInstance = nullptr;
+// UnityEngine.Object construction and most Unity property calls must happen
+// on the thread that initialized the IL2CPP backend. Resource hooks can also
+// run on worker threads; those calls are left to the Renderer fallback there.
+static DWORD s_eiemUnityThreadId = 0;
 
 // Mesh, material and texture resources are generated on demand. Keep their
 // Unity objects rooted so repeated renderer reconciliation (F10, scene loads)
@@ -336,6 +420,8 @@ static SRWLOCK s_eiemTextureResourceCacheLock = SRWLOCK_INIT;
 static std::vector<EiemObjectResourceCacheEntry> s_eiemTextureResourceCache;
 
 static uint64_t EiemMeshResourceFileStamp(const char *path);
+static uint64_t EiemTextureDependencyStamp(const EiemModResource &resource,
+                                           uint64_t fileStamp);
 
 static void *EiemFindCachedObject(
     const std::vector<EiemObjectResourceCacheEntry> &cache,
@@ -430,6 +516,7 @@ static void EiemResolveResourceBackend(void **assemblies, size_t assemblyCount) 
   s_eiemBoneWeightClass = FindClass("UnityEngine", "BoneWeight", assemblies, assemblyCount);
   s_eiemMatrix4x4Class = FindClass("UnityEngine", "Matrix4x4", assemblies, assemblyCount);
   s_eiemInt32Class = FindClass("System", "Int32", assemblies, assemblyCount);
+  s_eiemObjectClass = FindClass("UnityEngine", "Object", assemblies, assemblyCount);
   s_eiemMaterialClass = FindClass("UnityEngine", "Material", assemblies, assemblyCount);
   s_eiemRendererClass = FindClass("UnityEngine", "Renderer", assemblies, assemblyCount);
   s_eiemResourceManagerClass = FindClass("Beyond.Resource.Runtime", "BundleResourceManager",
@@ -437,13 +524,18 @@ static void EiemResolveResourceBackend(void **assemblies, size_t assemblyCount) 
   s_eiemProxyHandleClass = FindClass("Beyond.Resource", "FAssetProxyHandle",
                                      assemblies, assemblyCount);
   s_eiemTexture2DClass = FindClass("UnityEngine", "Texture2D", assemblies, assemblyCount);
+  s_eiemTextureClass = FindClass("UnityEngine", "Texture", assemblies, assemblyCount);
   s_eiemImageConversionClass = FindClass("UnityEngine", "ImageConversion",
                                          assemblies, assemblyCount);
   s_eiemByteClass = FindClass("System", "Byte", assemblies, assemblyCount);
+  if (s_eiemObjectClass) {
+    s_eiemObjectSetName = FindMethod(s_eiemObjectClass, "set_name", 1);
+  }
   if (s_eiemMeshClass) {
     s_eiemMeshCtor = FindMethod(s_eiemMeshClass, ".ctor", 0);
     s_eiemMeshSetIndexFormat = FindMethod(s_eiemMeshClass, "set_indexFormat", 1);
     s_eiemMeshSetVertices = FindMethod(s_eiemMeshClass, "set_vertices", 1);
+    s_eiemMeshGetVertices = FindMethod(s_eiemMeshClass, "get_vertices", 0);
     s_eiemMeshSetNormals = FindMethod(s_eiemMeshClass, "set_normals", 1);
     s_eiemMeshSetTangents = FindMethod(s_eiemMeshClass, "set_tangents", 1);
     s_eiemMeshSetColors = FindMethod(s_eiemMeshClass, "set_colors", 1);
@@ -467,6 +559,9 @@ static void EiemResolveResourceBackend(void **assemblies, size_t assemblyCount) 
         _countof(setTrianglesTypes));
     s_eiemMeshSetBoneWeights = FindMethod(s_eiemMeshClass, "set_boneWeights", 1);
     s_eiemMeshSetBindPoses = FindMethod(s_eiemMeshClass, "set_bindposes", 1);
+    s_eiemMeshUploadMeshData = FindMethod(s_eiemMeshClass, "UploadMeshData", 1);
+    s_eiemMeshGetBoneWeights = FindMethod(s_eiemMeshClass, "get_boneWeights", 0);
+    s_eiemMeshGetBindPoses = FindMethod(s_eiemMeshClass, "get_bindposes", 0);
     static const char *const blendShapeTypes[] = {
         "System.String", "System.Single", "UnityEngine.Vector3[]",
         "UnityEngine.Vector3[]", "UnityEngine.Vector3[]"};
@@ -476,12 +571,16 @@ static void EiemResolveResourceBackend(void **assemblies, size_t assemblyCount) 
     g_mesh_recalculateBounds = FindMethod(s_eiemMeshClass, "RecalculateBounds", 0);
   }
   if (s_eiemMaterialClass) {
+    static const char *const materialCopyCtorTypes[] = {"UnityEngine.Material"};
     static const char *const stringFloatTypes[] = {"System.String", "System.Single"};
     static const char *const stringIntTypes[] = {"System.String", "System.Int32"};
     static const char *const stringColorTypes[] = {"System.String", "UnityEngine.Color"};
     static const char *const stringTextureTypes[] = {"System.String", "UnityEngine.Texture"};
+    static const char *const stringTypes[] = {"System.String"};
     static const char *const stringVector2Types[] = {"System.String", "UnityEngine.Vector2"};
-    s_eiemMaterialCtorCopy = FindMethod(s_eiemMaterialClass, ".ctor", 1);
+    s_eiemMaterialCtorCopy = EiemFindMethodWithParamTypes(
+        s_eiemMaterialClass, ".ctor", materialCopyCtorTypes,
+        _countof(materialCopyCtorTypes));
     s_eiemMaterialSetFloat = EiemFindMethodWithParamTypes(
         s_eiemMaterialClass, "SetFloat", stringFloatTypes, _countof(stringFloatTypes));
     s_eiemMaterialSetInt = EiemFindMethodWithParamTypes(
@@ -490,6 +589,8 @@ static void EiemResolveResourceBackend(void **assemblies, size_t assemblyCount) 
         s_eiemMaterialClass, "SetColor", stringColorTypes, _countof(stringColorTypes));
     s_eiemMaterialSetTexture = EiemFindMethodWithParamTypes(
         s_eiemMaterialClass, "SetTexture", stringTextureTypes, _countof(stringTextureTypes));
+    s_eiemMaterialGetTexture = EiemFindMethodWithParamTypes(
+        s_eiemMaterialClass, "GetTexture", stringTypes, _countof(stringTypes));
     s_eiemMaterialSetTextureScale = EiemFindMethodWithParamTypes(
         s_eiemMaterialClass, "SetTextureScale", stringVector2Types,
         _countof(stringVector2Types));
@@ -511,10 +612,26 @@ static void EiemResolveResourceBackend(void **assemblies, size_t assemblyCount) 
         s_eiemProxyHandleClass, "Get", "UnityEngine.Object", 0);
   }
   if (s_eiemTexture2DClass) {
-    static const char *const textureCtorTypes[] = {"System.Int32", "System.Int32"};
+    static const char *const textureCtorTypes[] = {
+        "System.Int32", "System.Int32", "UnityEngine.TextureFormat",
+        "System.Boolean", "System.Boolean"};
     s_eiemTexture2DCtor = EiemFindMethodWithParamTypes(
         s_eiemTexture2DClass, ".ctor", textureCtorTypes,
         _countof(textureCtorTypes));
+  }
+  if (s_eiemTextureClass) {
+    static const char *const filterTypes[] = {"UnityEngine.FilterMode"};
+    static const char *const wrapTypes[] = {"UnityEngine.TextureWrapMode"};
+    static const char *const intTypes[] = {"System.Int32"};
+    static const char *const floatTypes[] = {"System.Single"};
+    s_eiemTextureSetFilterMode = EiemFindMethodWithParamTypes(
+        s_eiemTextureClass, "set_filterMode", filterTypes, _countof(filterTypes));
+    s_eiemTextureSetWrapMode = EiemFindMethodWithParamTypes(
+        s_eiemTextureClass, "set_wrapMode", wrapTypes, _countof(wrapTypes));
+    s_eiemTextureSetAnisoLevel = EiemFindMethodWithParamTypes(
+        s_eiemTextureClass, "set_anisoLevel", intTypes, _countof(intTypes));
+    s_eiemTextureSetMipMapBias = EiemFindMethodWithParamTypes(
+        s_eiemTextureClass, "set_mipMapBias", floatTypes, _countof(floatTypes));
   }
   if (s_eiemImageConversionClass) {
     static const char *const loadImageTypes[] = {
@@ -523,19 +640,28 @@ static void EiemResolveResourceBackend(void **assemblies, size_t assemblyCount) 
         s_eiemImageConversionClass, "LoadImage", loadImageTypes,
         _countof(loadImageTypes));
   }
-  Log("[MOD] Mesh backend: ctor=%p vertices=%p normals=%p tangents=%p uv=%p triangles=%p bones=%p bindposes=%p blendShapes=%p bounds=%p",
-      s_eiemMeshCtor, s_eiemMeshSetVertices, s_eiemMeshSetNormals,
-      s_eiemMeshSetTangents, s_eiemMeshSetUVs2, s_eiemMeshSetTriangles,
-      s_eiemMeshSetBoneWeights, s_eiemMeshSetBindPoses,
+  Log("[MOD] Mesh backend: setName=%p ctor=%p vertices=%p/%p normals=%p tangents=%p uv=%p triangles=%p bones=%p/%p bindposes=%p/%p upload=%p blendShapes=%p bounds=%p",
+      s_eiemObjectSetName, s_eiemMeshCtor, s_eiemMeshSetVertices,
+      s_eiemMeshGetVertices, s_eiemMeshSetNormals, s_eiemMeshSetTangents,
+      s_eiemMeshSetUVs2, s_eiemMeshSetTriangles,
+      s_eiemMeshSetBoneWeights, s_eiemMeshGetBoneWeights,
+      s_eiemMeshSetBindPoses, s_eiemMeshGetBindPoses,
+      s_eiemMeshUploadMeshData,
       s_eiemMeshAddBlendShapeFrame,
       g_mesh_recalculateBounds);
   Log("[MOD] Material backend: load=%p immediate=%p get=%p clone=%p setMaterials=%p scale=%p offset=%p",
       s_eiemResourceManagerLoad, s_eiemProxyLoadImmediate, s_eiemProxyGet,
       s_eiemMaterialCtorCopy, s_eiemRendererSetSharedMaterials,
       s_eiemMaterialSetTextureScale, s_eiemMaterialSetTextureOffset);
-  Log("[MOD] Texture backend: texture2D=%p imageConversion=%p loadImage=%p setTexture=%p",
+  Log("[MOD] Texture backend: texture2D=%p imageConversion=%p loadImage=%p setTexture=%p getTexture=%p ctor=%p filter=%p wrap=%p aniso=%p bias=%p",
       s_eiemTexture2DClass, s_eiemImageConversionClass, s_eiemImageLoad,
-      s_eiemMaterialSetTexture);
+      s_eiemMaterialSetTexture, s_eiemMaterialGetTexture, s_eiemTexture2DCtor,
+      s_eiemTextureSetFilterMode, s_eiemTextureSetWrapMode,
+      s_eiemTextureSetAnisoLevel, s_eiemTextureSetMipMapBias);
+  EiemLogManagedValueTypeLayout("UnityEngine.BoneWeight",
+                                s_eiemBoneWeightClass, sizeof(BoneWeight));
+  EiemLogManagedValueTypeLayout("UnityEngine.Matrix4x4",
+                                s_eiemMatrix4x4Class, sizeof(Matrix4x4));
 }
 
 template <typename T>
@@ -547,21 +673,426 @@ static void *EiemMakeValueArray(void *klass, const std::vector<T> &values) {
   return array;
 }
 
-static void *EiemBuildNativeMesh(const char *path, char *error, size_t errorSize) {
+static int32_t EiemBackendManagedArrayLength(void *array) {
+  __try {
+    const uintptr_t count = array ? *(uintptr_t *)((char *)array + 24) : 0;
+    return count <= INT32_MAX ? (int32_t)count : -1;
+  } __except (1) {
+    return -1;
+  }
+}
+
+template <typename T>
+static bool EiemCopyBackendArray(void *array, std::vector<T> *out) {
+  if (!array || !out) return false;
+  const int32_t count = EiemBackendManagedArrayLength(array);
+  if (count < 0 || count > 10000000) return false;
+  out->resize((size_t)count);
+  if (count)
+    memcpy(out->data(), (char *)array + IL2CPP_ARRAY_DATA,
+           (size_t)count * sizeof(T));
+  return true;
+}
+
+static void *EiemBackendInvokeNoThrow(void *method, void *self);
+
+template <typename T>
+static void EiemLogArrayDiff(const char *kind, const std::vector<T> &payload,
+                             const std::vector<T> &runtime,
+                             size_t compareCount = SIZE_MAX) {
+  const size_t count = (std::min)((std::min)(payload.size(), runtime.size()),
+                                  compareCount);
+  size_t byteMismatch = 0;
+  float maxAbs = 0.0f;
+  const float *left = reinterpret_cast<const float *>(payload.data());
+  const float *right = reinterpret_cast<const float *>(runtime.data());
+  const size_t floatsPerItem = sizeof(T) / sizeof(float);
+  for (size_t item = 0; item < count; ++item) {
+    if (memcmp(&payload[item], &runtime[item], sizeof(T)) != 0) ++byteMismatch;
+    for (size_t component = 0; component < floatsPerItem; ++component) {
+      const float delta = std::fabs(left[item * floatsPerItem + component] -
+                                    right[item * floatsPerItem + component]);
+      if (delta > maxAbs) maxAbs = delta;
+    }
+  }
+  Log("[DEBUG-SKIN-DIFF] kind=%s payload=%zu runtime=%zu compared=%zu "
+      "byteMismatch=%zu maxAbs=%.9g",
+      kind ? kind : "unknown", payload.size(), runtime.size(), count,
+      byteMismatch, maxAbs);
+}
+
+static void EiemLogBoneWeightDiff(const std::vector<BoneWeight> &payload,
+                                  const std::vector<BoneWeight> &runtime,
+                                  size_t compareCount = SIZE_MAX) {
+  const size_t count = (std::min)((std::min)(payload.size(), runtime.size()),
+                                  compareCount);
+  size_t weightMismatch = 0;
+  size_t indexMismatch = 0;
+  size_t firstWeightMismatch = SIZE_MAX;
+  size_t firstIndexMismatch = SIZE_MAX;
+  float maxWeightDelta = 0.0f;
+  for (size_t item = 0; item < count; ++item) {
+    const float *leftWeights = &payload[item].weight0;
+    const float *rightWeights = &runtime[item].weight0;
+    const int *leftIndices = &payload[item].boneIndex0;
+    const int *rightIndices = &runtime[item].boneIndex0;
+    bool weightsDiffer = false;
+    bool indicesDiffer = false;
+    for (size_t component = 0; component < 4; ++component) {
+      const float delta =
+          std::fabs(leftWeights[component] - rightWeights[component]);
+      if (delta != 0.0f) weightsDiffer = true;
+      if (delta > maxWeightDelta) maxWeightDelta = delta;
+      if (leftIndices[component] != rightIndices[component])
+        indicesDiffer = true;
+    }
+    if (weightsDiffer) {
+      ++weightMismatch;
+      if (firstWeightMismatch == SIZE_MAX) firstWeightMismatch = item;
+    }
+    if (indicesDiffer) {
+      ++indexMismatch;
+      if (firstIndexMismatch == SIZE_MAX) firstIndexMismatch = item;
+    }
+  }
+  Log("[DEBUG-SKIN-DIFF] kind=boneWeights payload=%zu runtime=%zu "
+      "compared=%zu weightMismatch=%zu indexMismatch=%zu "
+      "firstWeight=%lld firstIndex=%lld maxWeightDelta=%.9g",
+      payload.size(), runtime.size(), count, weightMismatch, indexMismatch,
+      firstWeightMismatch == SIZE_MAX ? -1ll : (long long)firstWeightMismatch,
+      firstIndexMismatch == SIZE_MAX ? -1ll : (long long)firstIndexMismatch,
+      maxWeightDelta);
+}
+
+static void EiemLogBoneWeightSample(const char *kind,
+                                    const std::vector<BoneWeight> &values) {
+  const size_t count = (std::min)(values.size(), (size_t)3);
+  for (size_t index = 0; index < count; ++index) {
+    const BoneWeight &value = values[index];
+    const uint8_t *raw = reinterpret_cast<const uint8_t *>(&value);
+    char hex[sizeof(BoneWeight) * 2 + 1] = {};
+    for (size_t byte = 0; byte < sizeof(BoneWeight); ++byte)
+      sprintf_s(hex + byte * 2, sizeof(hex) - byte * 2, "%02X", raw[byte]);
+    Log("[DEBUG-SKIN-SAMPLE] kind=%s index=%zu weights=%.9g,%.9g,%.9g,%.9g "
+        "indices=%d,%d,%d,%d raw=%s",
+        kind ? kind : "unknown", index, value.weight0, value.weight1,
+        value.weight2, value.weight3, value.boneIndex0, value.boneIndex1,
+        value.boneIndex2, value.boneIndex3, hex);
+  }
+}
+
+static void EiemLogMatrixSample(const char *kind,
+                                const std::vector<Matrix4x4> &values) {
+  if (values.empty()) return;
+  const Matrix4x4 &value = values.front();
+  Log("[DEBUG-SKIN-SAMPLE] kind=%s index=0 "
+      "m=%.9g,%.9g,%.9g,%.9g|%.9g,%.9g,%.9g,%.9g|"
+      "%.9g,%.9g,%.9g,%.9g|%.9g,%.9g,%.9g,%.9g",
+      kind ? kind : "unknown", value.m[0], value.m[1], value.m[2], value.m[3],
+      value.m[4], value.m[5], value.m[6], value.m[7], value.m[8], value.m[9],
+      value.m[10], value.m[11], value.m[12], value.m[13], value.m[14],
+      value.m[15]);
+}
+
+static void EiemLogBindPoseRelations(const std::vector<Matrix4x4> &payload,
+                                     const std::vector<Matrix4x4> &runtime) {
+  const size_t count = (std::min)(payload.size(), runtime.size());
+  size_t exactMismatch = 0;
+  size_t transposeMismatch = 0;
+  float exactMaxAbs = 0.0f;
+  float transposeMaxAbs = 0.0f;
+  for (size_t item = 0; item < count; ++item) {
+    bool exactDifferent = false;
+    bool transposeDifferent = false;
+    for (size_t row = 0; row < 4; ++row) {
+      for (size_t column = 0; column < 4; ++column) {
+        const size_t component = column * 4 + row;
+        const size_t transposed = row * 4 + column;
+        const float exactDelta =
+            std::fabs(payload[item].m[component] - runtime[item].m[component]);
+        const float transposeDelta =
+            std::fabs(payload[item].m[component] - runtime[item].m[transposed]);
+        exactDifferent = exactDifferent || exactDelta != 0.0f;
+        transposeDifferent = transposeDifferent || transposeDelta != 0.0f;
+        exactMaxAbs = (std::max)(exactMaxAbs, exactDelta);
+        transposeMaxAbs = (std::max)(transposeMaxAbs, transposeDelta);
+      }
+    }
+    if (exactDifferent) ++exactMismatch;
+    if (transposeDifferent) ++transposeMismatch;
+  }
+  Log("[DEBUG-SKIN-RELATION] kind=bindposes count=%zu exactMismatch=%zu "
+      "exactMaxAbs=%.9g transposeMismatch=%zu transposeMaxAbs=%.9g",
+      count, exactMismatch, exactMaxAbs, transposeMismatch, transposeMaxAbs);
+}
+
+static void EiemComparePayloadWithRuntimeMesh(
+    const char *label, const EiemNativeMeshDocument &document, void *mesh) {
+  if (!mesh) return;
+  std::vector<Vector3> vertices;
+  std::vector<BoneWeight> skin;
+  std::vector<Matrix4x4> bindPoses;
+  if (s_eiemMeshGetVertices)
+    EiemCopyBackendArray(EiemBackendInvokeNoThrow(s_eiemMeshGetVertices, mesh),
+                         &vertices);
+  if (s_eiemMeshGetBoneWeights)
+    EiemCopyBackendArray(
+        EiemBackendInvokeNoThrow(s_eiemMeshGetBoneWeights, mesh), &skin);
+  if (s_eiemMeshGetBindPoses)
+    EiemCopyBackendArray(
+        EiemBackendInvokeNoThrow(s_eiemMeshGetBindPoses, mesh), &bindPoses);
+  Log("[DEBUG-SKIN-DIFF] mesh=%s object=%p", label ? label : "unknown", mesh);
+  EiemLogArrayDiff("vertices", document.vertices, vertices,
+                   document.vertices.size());
+  EiemLogBoneWeightDiff(document.skin, skin, document.skin.size());
+  EiemLogArrayDiff("bindposes", document.bindPoses, bindPoses,
+                   document.bindPoses.size());
+  EiemLogBoneWeightSample("payloadWeight", document.skin);
+  EiemLogBoneWeightSample(label && strcmp(label, "source") == 0
+                              ? "sourceWeight"
+                              : "replacementWeight",
+                          skin);
+  EiemLogMatrixSample("payloadBindpose", document.bindPoses);
+  EiemLogMatrixSample(label && strcmp(label, "source") == 0
+                          ? "sourceBindpose"
+                          : "replacementBindpose",
+                      bindPoses);
+  EiemLogBindPoseRelations(document.bindPoses, bindPoses);
+}
+
+static uint64_t EiemHashBytes(uint64_t hash, const void *data, size_t size) {
+  const uint8_t *bytes = static_cast<const uint8_t *>(data);
+  for (size_t index = 0; index < size; ++index) {
+    hash ^= bytes[index];
+    hash *= 1099511628211ull;
+  }
+  return hash;
+}
+
+static void EiemLogRendererBoneFingerprint(const char *label, void *renderer) {
+  if (!renderer || !g_smr_get_bones) return;
+  void *bones = EiemBackendInvokeNoThrow(g_smr_get_bones, renderer);
+  const int32_t count = EiemBackendManagedArrayLength(bones);
+  if (!bones || count <= 0 || count > 512) return;
+  void **items = (void **)((char *)bones + IL2CPP_ARRAY_DATA);
+  uint64_t references = 1469598103934665603ull;
+  uint64_t matrices = 1469598103934665603ull;
+  for (int32_t index = 0; index < count; ++index) {
+    references = EiemHashBytes(references, &items[index], sizeof(items[index]));
+    if (!items[index] || !g_transform_get_localToWorldMatrix) continue;
+    void *boxed = EiemBackendInvokeNoThrow(g_transform_get_localToWorldMatrix,
+                                           items[index]);
+    if (boxed)
+      matrices = EiemHashBytes(matrices, (char *)boxed + 16,
+                               sizeof(Matrix4x4));
+  }
+  Log("[DEBUG-SKIN-DIFF] bones=%s renderer=%p count=%d refs=%016llX "
+      "matrices=%016llX",
+      label ? label : "unknown", renderer, count,
+      (unsigned long long)references, (unsigned long long)matrices);
+}
+
+static void EiemLogNativeMeshSkinState(const char *label, void *mesh) {
+  if (!mesh) return;
+  void *weights = s_eiemMeshGetBoneWeights
+                      ? Invoke(s_eiemMeshGetBoneWeights, mesh)
+                      : nullptr;
+  void *bindPoses = s_eiemMeshGetBindPoses
+                       ? Invoke(s_eiemMeshGetBindPoses, mesh)
+                       : nullptr;
+  Log("[DEBUG-mesh-state] %s mesh=%p boneWeights=%d bindposes=%d",
+      label ? label : "mesh", mesh,
+      EiemBackendManagedArrayLength(weights),
+      EiemBackendManagedArrayLength(bindPoses));
+}
+
+static uint32_t EiemBonePathCrc32(const std::string &value) {
+  uint32_t crc = 0xFFFFFFFFu;
+  for (unsigned char byte : value) {
+    crc ^= byte;
+    for (int bit = 0; bit < 8; ++bit)
+      crc = (crc & 1u) ? ((crc >> 1) ^ 0xEDB88320u) : (crc >> 1);
+  }
+  return crc ^ 0xFFFFFFFFu;
+}
+
+static void *EiemBackendInvokeNoThrow(void *method, void *self) {
+  if (!method || !self) return nullptr;
+  __try { return Invoke(method, self); }
+  __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+
+static void EiemCollectBonePathHashes(void *transform,
+                                      std::vector<uint32_t> *out) {
+  if (!transform || !out || !g_object_get_name) return;
+  std::vector<std::string> names;
+  for (void *current = transform; current && names.size() < 128;) {
+    char name[192] = {};
+    void *nameObject = EiemBackendInvokeNoThrow(g_object_get_name, current);
+    if (nameObject) ReadStrUtf8(nameObject, name, sizeof(name));
+    names.emplace_back(name[0] ? name : "<unnamed>");
+    current = g_transform_get_parent
+                  ? Invoke(g_transform_get_parent, current)
+                  : nullptr;
+  }
+  // ModelConverter emits the complete path and then removes one leading
+  // ancestor at a time (root/a/b -> root/a/b, a/b, b). `names` is collected
+  // in the opposite direction (bone -> parent -> root), so a candidate is
+  // the reverse of names[start..0]. The old implementation removed the bone
+  // from the end and generated prefixes instead of the required suffixes.
+  for (size_t start = names.size(); start > 0; --start) {
+    std::string path;
+    for (size_t index = start; index > 0; --index) {
+      if (!path.empty()) path.push_back('/');
+      path += names[index - 1];
+    }
+    out->push_back(EiemBonePathCrc32(path));
+  }
+}
+
+// Mesh bone indices address SkinnedMeshRenderer.bones[], not the prefab's
+// complete Transform table. A rebuilt Mesh has no serialized bone-name-hash
+// metadata, so use the payload hashes to verify/remap that compact palette
+// before handing it to Unity. Require an exact match: a partial guess is more
+// dangerous than leaving the source order untouched.
+static bool EiemAlignSkinningPalette(EiemNativeMeshDocument *document,
+                                     void *renderer) {
+  if (!document || !renderer || document->boneHashes.empty() ||
+      !g_smr_get_bones || !g_transform_get_parent || !g_object_get_name)
+    return false;
+  if (document->boneHashes.size() != document->bindPoses.size()) {
+    Log("[DEBUG-SKIN-PALETTE] renderer=%p payloadHashes=%zu bindposes=%zu status=skip-payload-mismatch",
+        renderer, document->boneHashes.size(), document->bindPoses.size());
+    return false;
+  }
+  void *bonesArray = nullptr;
+  bonesArray = EiemBackendInvokeNoThrow(g_smr_get_bones, renderer);
+  const size_t boneCount = EiemBackendManagedArrayLength(bonesArray);
+  if (!bonesArray || boneCount == 0 || boneCount > 512 ||
+      boneCount != document->bindPoses.size()) {
+    Log("[DEBUG-SKIN-PALETTE] renderer=%p payload=%zu live=%zu status=skip-size",
+        renderer, document->boneHashes.size(), boneCount);
+    return false;
+  }
+  // BoneNameHashes emitted by Unity are complete Transform paths.  Keep that
+  // identity separate from the suffix candidates used only for old assets;
+  // putting both in one map lets a repeated leaf name win over the real path
+  // and silently sends a vertex to the wrong bone.
+  std::unordered_map<uint32_t, size_t> liveFullByHash;
+  std::unordered_map<uint32_t, size_t> liveByHash;
+  size_t duplicateFull = 0;
+  void **items = (void **)((char *)bonesArray + IL2CPP_ARRAY_DATA);
+  for (size_t index = 0; index < boneCount; ++index) {
+    std::vector<uint32_t> hashes;
+    EiemCollectBonePathHashes(items[index], &hashes);
+    if (!hashes.empty()) {
+      auto full = liveFullByHash.emplace(hashes.front(), index);
+      if (!full.second && full.first->second != index) ++duplicateFull;
+    }
+    for (uint32_t hash : hashes) {
+      auto suffix = liveByHash.emplace(hash, index);
+      if (!suffix.second && suffix.first->second != index)
+        suffix.first->second = SIZE_MAX; // ambiguous suffix; never guess
+    }
+  }
+  std::vector<size_t> remap(document->boneHashes.size(), SIZE_MAX);
+  size_t exactMatches = 0;
+  size_t suffixMatches = 0;
+  for (size_t index = 0; index < document->boneHashes.size(); ++index) {
+    auto exact = liveFullByHash.find(document->boneHashes[index]);
+    auto suffix = liveByHash.find(document->boneHashes[index]);
+    if (exact == liveFullByHash.end() &&
+        (suffix == liveByHash.end() || suffix->second == SIZE_MAX)) {
+      Log("[DEBUG-SKIN-PALETTE] renderer=%p payload=%zu live=%zu status=skip-unmatched index=%zu hash=%u",
+          renderer, document->boneHashes.size(), boneCount, index,
+          document->boneHashes[index]);
+      return false;
+    }
+    if (exact != liveFullByHash.end()) {
+      remap[index] = exact->second;
+      ++exactMatches;
+    } else {
+      remap[index] = suffix->second;
+      ++suffixMatches;
+    }
+    if (index < 12) {
+      char boneName[192] = {};
+      void *bone = items[remap[index]];
+      if (bone && g_object_get_name)
+        ReadStrUtf8(EiemBackendInvokeNoThrow(g_object_get_name, bone),
+                    boneName, sizeof(boneName));
+      Log("[DEBUG-SKIN-MAP] renderer=%p payloadIndex=%zu payloadHash=%u liveIndex=%zu source=%s liveName=%s",
+          renderer, index, document->boneHashes[index], remap[index],
+          exact != liveFullByHash.end() ? "full" : "suffix",
+          boneName[0] ? boneName : "<unnamed>");
+    }
+  }
+  bool identity = true;
+  for (size_t index = 0; index < remap.size(); ++index)
+    identity = identity && remap[index] == index;
+  if (!identity) {
+    std::vector<Matrix4x4> reordered(boneCount);
+    for (size_t source = 0; source < remap.size(); ++source)
+      reordered[remap[source]] = document->bindPoses[source];
+    document->bindPoses.swap(reordered);
+    for (BoneWeight &weight : document->skin) {
+      int *indices[] = {&weight.boneIndex0, &weight.boneIndex1,
+                        &weight.boneIndex2, &weight.boneIndex3};
+      for (int *index : indices)
+        if (*index >= 0 && (size_t)*index < remap.size())
+          *index = (int)remap[(size_t)*index];
+    }
+  }
+  Log("[DEBUG-SKIN-PALETTE] renderer=%p payload=%zu live=%zu status=%s exact=%zu suffix=%zu duplicateFull=%zu",
+      renderer, document->boneHashes.size(), boneCount,
+      identity ? "identity" : "remapped", exactMatches, suffixMatches,
+      duplicateFull);
+  return true;
+}
+
+static void *EiemBuildNativeMesh(const char *path, void *templateMesh,
+                                 char *error, size_t errorSize,
+                                 void *skinRenderer = nullptr) {
   EiemNativeMeshDocument document;
   if (!EiemReadNativeMesh(path, &document, error, errorSize)) return nullptr;
+  if (skinRenderer) EiemAlignSkinningPalette(&document, skinRenderer);
+  if (skinRenderer) EiemLogRendererBoneFingerprint("before-build", skinRenderer);
+  EiemComparePayloadWithRuntimeMesh("source", document, templateMesh);
+  Log("[DEBUG-mesh] payload path=%s vertices=%d indices=%zu submeshes=%zu "
+      "normals=%zu tangents=%zu colors=%zu skin=%zu bindposes=%zu tid=%lu",
+      path ? path : "<null>", document.vertexCount, document.indices.size(),
+      document.subMeshes.size(), document.normals.size(),
+      document.tangents.size(), document.colors.size(), document.skin.size(),
+      document.bindPoses.size(), (unsigned long)GetCurrentThreadId());
   if (!s_eiemMeshClass || !s_eiemMeshCtor || !s_eiemMeshSetVertices ||
       !s_eiemMeshSetSubMeshCount || !s_eiemMeshSetTriangles ||
       !s_eiemVector3Class || !s_eiemInt32Class) {
     if (error) strncpy_s(error, errorSize, "Unity Mesh write APIs are unavailable", _TRUNCATE);
     return nullptr;
   }
+  // Build a fresh Mesh and write every channel explicitly.  Cloning a source
+  // Mesh is unsafe in Endfield: its native vertex-layout/cache can survive
+  // the managed setters, leaving the replacement with the source vertex
+  // count while its payload contains a different buffer.
   void *mesh = il2cpp_object_new(s_eiemMeshClass);
   if (!mesh) {
     if (error) strncpy_s(error, errorSize, "Unable to allocate Unity Mesh", _TRUNCATE);
     return nullptr;
   }
   Invoke(s_eiemMeshCtor, mesh);
+  // Preserve the logical sub-asset name on generated Mesh objects.  The game
+  // uses this name in a few post-model paths when the serialized SubMeshInfo
+  // meshName field is absent; without it the replacement can be rebound to
+  // the original resource on the next LOD/skin pass.
+  if (s_eiemObjectSetName && !document.name.empty()) {
+    void *name = il2cpp_string_new(document.name.c_str());
+    if (name) {
+      void *nameParams[] = {name};
+      Invoke(s_eiemObjectSetName, mesh, nameParams);
+    }
+  }
+  Log("[DEBUG-mesh] replacement mesh=%p sourceTemplate=%p construction=fresh", mesh,
+      templateMesh);
   if (document.vertices.size() > 65535 && s_eiemMeshSetIndexFormat) {
     int32_t indexFormat = 1;  // UnityEngine.Rendering.IndexFormat.UInt32
     void *params[] = {&indexFormat};
@@ -630,8 +1161,11 @@ static void *EiemBuildNativeMesh(const char *path, char *error, size_t errorSize
     void *params[] = {array, &index};
     Invoke(s_eiemMeshSetTriangles, mesh, params);
   }
-  if (!setRequired(s_eiemMeshSetBoneWeights, s_eiemBoneWeightClass, document.skin) ||
-      !setRequired(s_eiemMeshSetBindPoses, s_eiemMatrix4x4Class, document.bindPoses)) {
+  // Bind poses define the bone palette consumed by BoneWeight indices. Write
+  // that palette first so Unity never observes a transient skin whose indices
+  // address an empty bind-pose array.
+  if (!setRequired(s_eiemMeshSetBindPoses, s_eiemMatrix4x4Class, document.bindPoses) ||
+      !setRequired(s_eiemMeshSetBoneWeights, s_eiemBoneWeightClass, document.skin)) {
     if (error) strncpy_s(error, errorSize, "Unity Mesh skinning APIs are unavailable", _TRUNCATE);
     return nullptr;
   }
@@ -671,7 +1205,8 @@ static void *EiemBuildNativeMesh(const char *path, char *error, size_t errorSize
                                "Unable to allocate BlendShape arrays", _TRUNCATE);
           return nullptr;
         }
-        void *params[] = {name, &weight, verticesArray, normalsArray, tangentsArray};
+        void *params[] = {name, &weight, verticesArray, normalsArray,
+                          tangentsArray};
         Invoke(s_eiemMeshAddBlendShapeFrame, mesh, params);
       }
     }
@@ -680,6 +1215,78 @@ static void *EiemBuildNativeMesh(const char *path, char *error, size_t errorSize
   // recalculating it, the renderer can cull a valid replacement immediately.
   if (g_mesh_recalculateBounds)
     Invoke(g_mesh_recalculateBounds, mesh);
+  // The managed channel setters update Unity's CPU-side Mesh data. Explicitly
+  // submit the completed buffer so Endfield's custom skin/GPU path cannot see
+  // an uninitialized native vertex buffer on its first draw.
+  if (s_eiemMeshUploadMeshData) {
+    bool markNoLongerReadable = false;
+    void *uploadParams[] = {&markNoLongerReadable};
+    Invoke(s_eiemMeshUploadMeshData, mesh, uploadParams);
+  }
+  if (g_mesh_get_vertexCount && g_mesh_get_subMeshCount && g_mesh_GetIndexCount) {
+    auto unboxInt = [](void *boxed) -> int32_t {
+      __try { return boxed ? *(int32_t *)((char *)boxed + 16) : -1; }
+      __except (1) { return -1; }
+    };
+    const int32_t actualVertices = unboxInt(Invoke(g_mesh_get_vertexCount, mesh));
+    const int32_t actualSubMeshes = unboxInt(Invoke(g_mesh_get_subMeshCount, mesh));
+    int64_t actualIndices = 0;
+    if (actualSubMeshes >= 0 && actualSubMeshes <= 64) {
+      for (int32_t index = 0; index < actualSubMeshes; ++index) {
+        void *params[] = {&index};
+        const int32_t count = unboxInt(Invoke(g_mesh_GetIndexCount, mesh, params));
+        if (count < 0) { actualIndices = -1; break; }
+        actualIndices += count;
+      }
+    }
+    Log("[DEBUG-mesh] Unity mesh result=%p vertices=%d submeshes=%d indices=%lld",
+        mesh, actualVertices, actualSubMeshes, (long long)actualIndices);
+    const bool readbackOk =
+        actualVertices == document.vertexCount &&
+        actualSubMeshes == (int32_t)document.subMeshes.size() &&
+        actualIndices == (int64_t)document.indices.size();
+    if (!readbackOk) {
+      if (error) strncpy_s(error, errorSize,
+                           "Unity Mesh read-back does not match EIEM payload",
+                           _TRUNCATE);
+      Log("[MOD] Mesh construction rejected: payload vertices=%d submeshes=%zu indices=%zu; "
+          "readback vertices=%d submeshes=%d indices=%lld",
+          document.vertexCount, document.subMeshes.size(), document.indices.size(),
+          actualVertices, actualSubMeshes, (long long)actualIndices);
+      return nullptr;
+    }
+  }
+  EiemLogNativeMeshSkinState("result", mesh);
+  EiemComparePayloadWithRuntimeMesh("replacement", document, mesh);
+  if (s_eiemMeshGetBoneWeights || s_eiemMeshGetBindPoses) {
+    const int32_t actualSkin = s_eiemMeshGetBoneWeights
+                                   ? EiemBackendManagedArrayLength(
+                                         EiemBackendInvokeNoThrow(
+                                             s_eiemMeshGetBoneWeights, mesh))
+                                   : -1;
+    const int32_t actualBindPoses = s_eiemMeshGetBindPoses
+                                        ? EiemBackendManagedArrayLength(
+                                              EiemBackendInvokeNoThrow(
+                                                  s_eiemMeshGetBindPoses, mesh))
+                                        : -1;
+    const bool skinOk =
+        (document.skin.empty() || actualSkin < 0 ||
+         actualSkin == (int32_t)document.skin.size()) &&
+        (document.bindPoses.empty() || actualBindPoses < 0 ||
+         actualBindPoses == (int32_t)document.bindPoses.size());
+    if (!skinOk) {
+      if (error) strncpy_s(error, errorSize,
+                           "Unity Mesh skin read-back does not match EIEM payload",
+                           _TRUNCATE);
+      Log("[MOD] Mesh construction rejected: payload skin=%zu bindposes=%zu; "
+          "readback skin=%d bindposes=%d",
+          document.skin.size(), document.bindPoses.size(), actualSkin,
+          actualBindPoses);
+      return nullptr;
+    }
+  }
+  Log("[DEBUG-mesh-state] expected boneWeights=%zu bindposes=%zu",
+      document.skin.size(), document.bindPoses.size());
   return mesh;
 }
 
@@ -687,6 +1294,7 @@ struct EiemMeshResourceCacheEntry {
   char modPath[MAX_PATH] = {};
   char section[96] = {};
   uint64_t fileStamp = 0;
+  uint64_t skinPaletteKey = 0;
   uint32_t handle = 0;
 };
 
@@ -729,8 +1337,24 @@ static void EiemClearNativeMeshResourceCache() {
     Log("[MOD] Released %zu generated mesh resource(s)", count);
 }
 
+static uint64_t EiemSkinPaletteFingerprint(void *renderer) {
+  if (!renderer || !g_smr_get_bones) return 0;
+  void *bonesArray = EiemBackendInvokeNoThrow(g_smr_get_bones, renderer);
+  const size_t count = EiemBackendManagedArrayLength(bonesArray);
+  if (!bonesArray || count == 0 || count > 512) return 0;
+  void **items = (void **)((char *)bonesArray + IL2CPP_ARRAY_DATA);
+  uint64_t hash = 1469598103934665603ull ^ (uint64_t)count;
+  for (size_t index = 0; index < count; ++index) {
+    hash ^= (uint64_t)(uintptr_t)items[index];
+    hash *= 1099511628211ull;
+  }
+  return hash ? hash : 1;
+}
+
 static bool EiemBuildMeshResource(const EiemModRule &rule, void **outMesh,
-                                  char *error, size_t errorSize) {
+                                  char *error, size_t errorSize,
+                                  void *templateMesh = nullptr,
+                                  void *skinRenderer = nullptr) {
   if (outMesh) *outMesh = nullptr;
   EiemModResource resource = {};
   if (!rule.hasMesh || !EiemFindModResource(rule.modPath, rule.mesh, "Mesh", &resource)) {
@@ -748,12 +1372,14 @@ static bool EiemBuildMeshResource(const EiemModRule &rule, void **outMesh,
   if (!GetFullPathNameA(path, _countof(fullPath), fullPath, nullptr))
     strncpy_s(fullPath, sizeof(fullPath), path, _TRUNCATE);
   const uint64_t fileStamp = EiemMeshResourceFileStamp(fullPath);
+  const uint64_t skinPaletteKey = EiemSkinPaletteFingerprint(skinRenderer);
   AcquireSRWLockExclusive(&s_eiemMeshResourceCacheLock);
   for (auto it = s_eiemMeshResourceCache.begin();
        it != s_eiemMeshResourceCache.end();) {
     const auto &entry = *it;
     if (_stricmp(entry.modPath, resource.modPath) != 0 ||
-        _stricmp(entry.section, resource.section) != 0) {
+        _stricmp(entry.section, resource.section) != 0 ||
+        entry.skinPaletteKey != skinPaletteKey) {
       ++it;
       continue;
     }
@@ -779,7 +1405,8 @@ static bool EiemBuildMeshResource(const EiemModRule &rule, void **outMesh,
   }
   ReleaseSRWLockExclusive(&s_eiemMeshResourceCacheLock);
 
-  void *mesh = EiemBuildNativeMesh(fullPath, error, errorSize);
+  void *mesh = EiemBuildNativeMesh(fullPath, templateMesh, error, errorSize,
+                                   skinRenderer);
   if (!mesh) return false;
   uint32_t cacheHandle = 0;
   if (il2cpp_gchandle_new && il2cpp_gchandle_get_target) {
@@ -787,6 +1414,7 @@ static bool EiemBuildMeshResource(const EiemModRule &rule, void **outMesh,
     strncpy_s(entry.modPath, sizeof(entry.modPath), resource.modPath, _TRUNCATE);
     strncpy_s(entry.section, sizeof(entry.section), resource.section, _TRUNCATE);
     entry.fileStamp = fileStamp;
+    entry.skinPaletteKey = skinPaletteKey;
     entry.handle = il2cpp_gchandle_new(mesh, false);
     cacheHandle = entry.handle;
     if (entry.handle) {
@@ -867,7 +1495,8 @@ static uint64_t EiemMaterialDependencyStamp(
                             &texture)) {
       char path[MAX_PATH] = {};
       if (EiemResolveResourceDiskPath(texture, path, sizeof(path)))
-        dependency = EiemMeshResourceFileStamp(path);
+        dependency = EiemTextureDependencyStamp(
+            texture, EiemMeshResourceFileStamp(path));
     }
     for (const unsigned char byte : pair.second) {
       stamp ^= byte;
@@ -883,7 +1512,8 @@ static void *EiemLoadOriginalAsset(const char *logicalPath, void *assetClass,
                                    char *error, size_t errorSize) {
   if (!logicalPath || !logicalPath[0] || !assetClass ||
       !s_eiemResourceManagerInstance || !s_eiemResourceManagerLoad ||
-      !s_eiemProxyLoadImmediate || !s_eiemProxyGet) {
+      !s_eiemProxyLoadImmediate || !s_eiemProxyGet ||
+      !il2cpp_object_unbox) {
     if (error) strncpy_s(error, errorSize, "Game resource loader is unavailable", _TRUNCATE);
     return nullptr;
   }
@@ -891,13 +1521,27 @@ static void *EiemLoadOriginalAsset(const char *logicalPath, void *assetClass,
   void *type = il2cpp_type_get_object(il2cpp_class_get_type(assetClass));
   uint8_t category = 0;  // Beyond.Resource.RootCategory.Main
   void *params[] = {managedPath, type, &category};
-  void *handle = Invoke(s_eiemResourceManagerLoad, s_eiemResourceManagerInstance, params);
+  void *handle = Invoke(s_eiemResourceManagerLoad,
+                        s_eiemResourceManagerInstance, params);
   if (!handle) {
     if (error) strncpy_s(error, errorSize, "Game resource loader returned no handle", _TRUNCATE);
     return nullptr;
   }
-  Invoke(s_eiemProxyLoadImmediate, handle);
-  void *asset = Invoke(s_eiemProxyGet, handle);
+  // BundleResourceManager.Load returns the value type FAssetProxyHandle.
+  // il2cpp_runtime_invoke boxes value-type return values; its instance methods
+  // require the address of the unboxed payload, not the Il2CppObject header.
+  // Do not replace this with a fixed object-header offset: the exported IL2CPP
+  // API is the authoritative ABI boundary.
+  void *unboxedHandle = il2cpp_object_unbox(handle);
+  if (!unboxedHandle) {
+    if (error)
+      strncpy_s(error, errorSize,
+                "Game resource loader returned an invalid value-type handle",
+                _TRUNCATE);
+    return nullptr;
+  }
+  Invoke(s_eiemProxyLoadImmediate, unboxedHandle);
+  void *asset = Invoke(s_eiemProxyGet, unboxedHandle);
   if (!asset && error)
     strncpy_s(error, errorSize, "Game resource loader could not resolve source path", _TRUNCATE);
   return asset;
@@ -933,6 +1577,24 @@ static bool EiemParseInt32(const std::string &text, int32_t *out) {
   return true;
 }
 
+static uint64_t EiemTextureDependencyStamp(const EiemModResource &resource,
+                                           uint64_t fileStamp) {
+  uint64_t stamp = 1469598103934665603ull ^ fileStamp;
+  const auto mix = [&stamp](uint64_t value) {
+    stamp ^= value;
+    stamp *= 1099511628211ull;
+  };
+  mix(resource.textureLinear ? 1u : 0u);
+  mix(resource.textureMipmaps ? 1u : 0u);
+  mix((uint32_t)resource.textureFilter);
+  mix((uint32_t)resource.textureWrap);
+  mix((uint32_t)resource.textureAniso);
+  uint32_t biasBits = 0;
+  memcpy(&biasBits, &resource.textureMipBias, sizeof(biasBits));
+  mix(biasBits);
+  return stamp;
+}
+
 static bool EiemBuildTextureResource(const EiemModRule &rule, const char *section,
                                      void **outTexture, char *error,
                                      size_t errorSize) {
@@ -952,7 +1614,8 @@ static bool EiemBuildTextureResource(const EiemModRule &rule, const char *sectio
     if (error) strncpy_s(error, errorSize, "Unable to resolve EIEM texture path", _TRUNCATE);
     return false;
   }
-  const uint64_t fileStamp = EiemMeshResourceFileStamp(texturePath);
+  const uint64_t fileStamp = EiemTextureDependencyStamp(
+      resource, EiemMeshResourceFileStamp(texturePath));
   AcquireSRWLockShared(&s_eiemTextureResourceCacheLock);
   void *cachedTexture = EiemFindCachedObject(s_eiemTextureResourceCache,
                                              resource.modPath, resource.section,
@@ -991,14 +1654,48 @@ static bool EiemBuildTextureResource(const EiemModRule &rule, const char *sectio
     return false;
   }
   int32_t width = 2, height = 2;
-  void *ctorParams[] = {&width, &height};
+  int32_t format = 4;  // UnityEngine.TextureFormat.RGBA32
+  bool mipmaps = resource.textureMipmaps;
+  bool linear = resource.textureLinear;
+  void *ctorParams[] = {&width, &height, &format, &mipmaps, &linear};
   Invoke(s_eiemTexture2DCtor, texture, ctorParams);
-  bool markNonReadable = false;
+  bool markNonReadable = true;
   void *loadParams[] = {texture, managedBytes, &markNonReadable};
   void *result = Invoke(s_eiemImageLoad, nullptr, loadParams);
-  if (!result) {
+  const bool decoded = result && *(bool *)((char *)result + 16);
+  if (!decoded) {
     if (error) strncpy_s(error, errorSize, "Unity failed to decode external PNG", _TRUNCATE);
     return false;
+  }
+  if (!s_eiemTextureSetFilterMode || !s_eiemTextureSetWrapMode ||
+      !s_eiemTextureSetAnisoLevel || !s_eiemTextureSetMipMapBias) {
+    if (error) strncpy_s(error, errorSize, "Unity texture sampler APIs are unavailable", _TRUNCATE);
+    return false;
+  }
+  if (resource.textureFilter < 0 || resource.textureFilter > 2 ||
+      resource.textureWrap < 0 || resource.textureWrap > 3 ||
+      resource.textureAniso < 0 || resource.textureAniso > 16) {
+    if (error) strncpy_s(error, errorSize, "EIEM texture sampler values are invalid", _TRUNCATE);
+    return false;
+  }
+  int32_t filter = resource.textureFilter;
+  int32_t wrap = resource.textureWrap;
+  int32_t aniso = resource.textureAniso;
+  float mipBias = resource.textureMipBias;
+  void *filterParams[] = {&filter};
+  void *wrapParams[] = {&wrap};
+  void *anisoParams[] = {&aniso};
+  void *biasParams[] = {&mipBias};
+  Invoke(s_eiemTextureSetFilterMode, texture, filterParams);
+  Invoke(s_eiemTextureSetWrapMode, texture, wrapParams);
+  Invoke(s_eiemTextureSetAnisoLevel, texture, anisoParams);
+  Invoke(s_eiemTextureSetMipMapBias, texture, biasParams);
+  if (s_eiemObjectSetName) {
+    void *name = il2cpp_string_new(resource.targetAsset[0]
+                                       ? resource.targetAsset
+                                       : resource.section);
+    void *nameParams[] = {name};
+    Invoke(s_eiemObjectSetName, texture, nameParams);
   }
   if (outTexture) *outTexture = texture;
   EiemCacheObject(s_eiemTextureResourceCache, &s_eiemTextureResourceCacheLock,
@@ -1120,8 +1817,8 @@ static bool EiemBuildMaterialResource(const EiemModRule &rule, const char *secti
       void *params[] = {name, &offset};
       Invoke(s_eiemMaterialSetTextureOffset, material, params);
     } else if (_strnicmp(key, "texture.", 8) == 0) {
-      if (!s_eiemMaterialSetTexture) {
-        if (error) strncpy_s(error, errorSize, "Unity Material.SetTexture is unavailable", _TRUNCATE);
+      if (!s_eiemMaterialSetTexture || !s_eiemMaterialGetTexture) {
+        if (error) strncpy_s(error, errorSize, "Unity Material texture APIs are unavailable", _TRUNCATE);
         return false;
       }
       void *texture = nullptr;
@@ -1130,12 +1827,49 @@ static bool EiemBuildMaterialResource(const EiemModRule &rule, const char *secti
       void *name = il2cpp_string_new(key + 8);
       void *params[] = {name, texture};
       Invoke(s_eiemMaterialSetTexture, material, params);
+      void *getParams[] = {name};
+      if (Invoke(s_eiemMaterialGetTexture, material, getParams) != texture) {
+        if (error) strncpy_s(error, errorSize, "Unity Material texture read-back failed", _TRUNCATE);
+        return false;
+      }
     }
   }
   if (outMaterial) *outMaterial = material;
   EiemCacheObject(s_eiemMaterialResourceCache, &s_eiemMaterialResourceCacheLock,
                   resource.modPath, resource.section, dependencyStamp, material);
   return true;
+}
+
+// Build a declared resource for the global redirect path. This deliberately
+// reuses the same builders used by Render rules, so Blender-exported payloads
+// have one construction and caching path regardless of how they are reached.
+static bool EiemBuildGlobalResource(const EiemModResource &resource,
+                                    void *sourceObject, void **outObject, char *error,
+                                    size_t errorSize) {
+  if (outObject) *outObject = nullptr;
+  if (!resource.modPath[0] || !resource.section[0]) {
+    if (error) strncpy_s(error, errorSize, "Global resource declaration is invalid", _TRUNCATE);
+    return false;
+  }
+  EiemModRule rule = {};
+  EiemModInitRule(&rule);
+  strncpy_s(rule.modPath, sizeof(rule.modPath), resource.modPath, _TRUNCATE);
+  if (_stricmp(resource.kind, "Mesh") == 0) {
+    strncpy_s(rule.mesh, sizeof(rule.mesh), resource.section, _TRUNCATE);
+    rule.hasMesh = true;
+    // Build from the game object when possible. Beyond's custom skinning
+    // setup may retain native state not represented by public Mesh arrays.
+    return EiemBuildMeshResource(rule, outObject, error, errorSize,
+                                 sourceObject);
+  }
+  if (_stricmp(resource.kind, "Material") == 0)
+    return EiemBuildMaterialResource(rule, resource.section, outObject,
+                                     error, errorSize);
+  if (_stricmp(resource.kind, "Texture") == 0)
+    return EiemBuildTextureResource(rule, resource.section, outObject,
+                                    error, errorSize);
+  if (error) strncpy_s(error, errorSize, "Unsupported global resource type", _TRUNCATE);
+  return false;
 }
 
 static void EiemApplySubmeshMaterialMap(const EiemModRule &rule,

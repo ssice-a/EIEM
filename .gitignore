@@ -6,6 +6,19 @@ bin/
 *.pdb
 *.ilk
 
+# Generated build and language caches
+**/obj/
+**/__pycache__/
+*.py[cod]
+
+# Local game indexes and one-off investigation artifacts
+/Maps/
+/tmp_*
+/tools/_inspect_skel.py
+
+# AnimeStudio keeps its own source-control history.
+/tools/AnimeStudio/
+
 !deps/**/*.lib
 !deps/**/*.dll
 !deps/**/*.pdb

@@ -57,6 +57,7 @@ static void *g_transform_Find = nullptr;
 static void *g_transform_get_parent = nullptr;
 static void *g_transform_set_parent = nullptr;
 static void *g_transform_get_position = nullptr; 
+static void *g_transform_get_localToWorldMatrix = nullptr;
 
 static void *g_animator_GetBoneTransform = nullptr;
 static void *g_animator_get_avatar = nullptr;
@@ -213,6 +214,11 @@ static void *g_slotOrigGet = nullptr;
 static void *g_slotSetFn = nullptr;   
 
 static void *g_gameObject_get_transform = nullptr;
+static void *g_gameObject_get_activeSelf = nullptr;
+static void *g_gameObject_get_activeInHierarchy = nullptr;
+static void *g_gameObject_set_active = nullptr;
+static void *g_gameObject_get_layer = nullptr;
+static void *g_gameObject_set_layer = nullptr;
 static void *g_gameObject_ctor = nullptr;
 static void *g_gameObject_ctorDefault = nullptr;
 static void *g_gameObject_set_name = nullptr;
@@ -220,6 +226,7 @@ static void *g_gameObject_AddComponent = nullptr;
 static void *g_component_get_gameObject = nullptr;
 static void *g_component_get_transform = nullptr;
 static void *g_gameObject_GetComponent = nullptr;
+static void *g_gameObject_GetComponentsInChildren = nullptr;
 static void *g_object_get_name = nullptr;
 static void *g_object_destroy = nullptr;
 static void *g_object_find_objects_of_type = nullptr;
@@ -380,11 +387,14 @@ static void *g_smr_get_bones =
 static void *g_smr_set_bones = nullptr;
 static void *g_smr_get_rootBone = nullptr;
 static void *g_smr_set_rootBone = nullptr;
+static void *g_smr_get_localBounds = nullptr;
+static void *g_smr_set_localBounds = nullptr;
 
 // Renderer state API used by the Dump tab. It lets a row disable the actual
 // scene Renderer on Unity's main thread without touching materials/assets.
 static void *g_renderer_get_enabled = nullptr;
 static void *g_renderer_set_enabled = nullptr;
+static void *g_renderer_get_isVisible = nullptr;
 static void *g_rendererClass = nullptr;
 static void *g_lodGroupClass = nullptr;
 static void *g_lodGroup_get_lods = nullptr;

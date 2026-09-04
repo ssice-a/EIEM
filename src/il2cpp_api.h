@@ -23,6 +23,7 @@ D(uint32_t, il2cpp_method_get_param_count, void *);
 D(const char *, il2cpp_class_get_name, void *);
 D(const char *, il2cpp_class_get_namespace, void *);
 D(void *, il2cpp_object_get_class, void *);
+D(void *, il2cpp_object_unbox, void *);
 D(void *, il2cpp_class_from_name, void *, const char *, const char *);
 D(void *, il2cpp_method_get_param, void *, uint32_t);
 D(const char *, il2cpp_type_get_name, void *);
@@ -41,6 +42,7 @@ D(void *, il2cpp_class_from_type, void *);
 D(void *, il2cpp_resolve_icall, const char *);
 D(void *, il2cpp_string_new, const char *);
 D(void *, il2cpp_class_get_type, void *);
+D(int32_t, il2cpp_class_value_size, void *, uint32_t *);
 D(void *, il2cpp_type_get_object, void *);
 D(void *, il2cpp_object_new, void *);
 D(void *, il2cpp_array_new_specific, void *, size_t);
@@ -122,6 +124,7 @@ static bool Resolve() {
   R(il2cpp_class_get_name);
   R(il2cpp_class_get_namespace);
   R(il2cpp_object_get_class);
+  R(il2cpp_object_unbox);
   R(il2cpp_class_from_name);
   R(il2cpp_method_get_param);
   R(il2cpp_type_get_name);
@@ -138,6 +141,7 @@ static bool Resolve() {
   R(il2cpp_resolve_icall);
   R(il2cpp_string_new);
   R(il2cpp_class_get_type);
+  R(il2cpp_class_value_size);
   R(il2cpp_type_get_object);
   R(il2cpp_object_new);
   R(il2cpp_array_new_specific);
@@ -263,6 +267,41 @@ static int FindFieldInHierarchy(void *klass, const char **names, int nameCount,
           return (int)il2cpp_field_get_offset(f);
         }
       }
+    }
+    cur = il2cpp_class_get_parent(cur);
+    depth++;
+  }
+  return -1;
+}
+
+// Resolve a reference field by its managed type when compiler-generated field
+// names change (for example, a property backing field). This keeps runtime
+// resource lookup metadata-driven instead of tying it to one game build's
+// private member name.
+static int FindFieldByTypeInHierarchy(void *klass, const char *typeName,
+                                      const char **outFieldName) {
+  if (!klass || !typeName || !typeName[0] || !il2cpp_class_get_parent ||
+      !il2cpp_field_get_type || !il2cpp_type_get_name)
+    return -1;
+  void *cur = klass;
+  int depth = 0;
+  while (cur && depth < 10) {
+    void *it = nullptr, *f;
+    while ((f = il2cpp_class_get_fields(cur, &it))) {
+      void *fieldType = nullptr;
+      const char *managedType = nullptr;
+      __try {
+        fieldType = il2cpp_field_get_type(f);
+        managedType = fieldType ? il2cpp_type_get_name(fieldType) : nullptr;
+      } __except (EXCEPTION_EXECUTE_HANDLER) {
+        fieldType = nullptr;
+        managedType = nullptr;
+      }
+      if (!managedType || strcmp(managedType, typeName) != 0)
+        continue;
+      if (outFieldName)
+        *outFieldName = il2cpp_field_get_name(f);
+      return (int)il2cpp_field_get_offset(f);
     }
     cur = il2cpp_class_get_parent(cur);
     depth++;

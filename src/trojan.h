@@ -2306,6 +2306,11 @@ static void AudioStartFresh() {
 
 static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                                    LPARAM lParam) {
+  // This window procedure runs on Unity's window/main thread. Record it at
+  // the first message, before a later character load reaches the resource
+  // proxy hooks.
+  if (!s_eiemUnityThreadId) s_eiemUnityThreadId = GetCurrentThreadId();
+
   // Capture the original procedure before signalling worker threads. The
   // hotkey thread restores the subclass asynchronously during shutdown.
   WNDPROC originalWndProc = g_origWndProc;

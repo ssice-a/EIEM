@@ -181,6 +181,8 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
 
   LoadEiemConfig();
   EiemReloadMods();
+  EiemQueueModReconcile("game window ready");
+  EiemScheduleLifecycleReconcile("game window ready");
 
   // Prefer thread hotkeys over GetAsyncKeyState. Endfield's input stack can
   // consume keyboard state in a way that leaves asynchronous polling blind,
@@ -251,6 +253,8 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
           g_pluginActive ? 1 : 0, g_guiToggleVK, g_guiVisible ? 1 : 0);
       lastHotkeyDiag = now;
     }
+
+    EiemPumpLifecycleReconcile();
 
     Sleep(20);
   }
@@ -574,6 +578,8 @@ static DWORD WINAPI InitThread(LPVOID) {
       CreateFileA("plugin\\eiem_log.txt", GENERIC_WRITE, FILE_SHARE_READ, NULL,
                   CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
   Log("=== EIEM Phase 1: Skeleton Discovery ===");
+  Log("[BUILD] material-controller-lifecycle-v23 dll=%s %s", __DATE__,
+      __TIME__);
 
   if (!Resolve()) {
     Log("[FATAL] Failed to resolve IL2CPP API");
@@ -636,6 +642,8 @@ static DWORD WINAPI InitThread(LPVOID) {
     g_transform_get_parent = FindMethod(g_transformClass, "get_parent", 0);
     g_transform_set_parent = FindMethod(g_transformClass, "SetParent", 2);
     g_transform_get_position = FindMethod(g_transformClass, "get_position", 0);
+    g_transform_get_localToWorldMatrix =
+        FindMethod(g_transformClass, "get_localToWorldMatrix", 0);
     Log("  get_localRotation: %p", g_transform_get_localRotation);
     Log("  set_localRotation: %p", g_transform_set_localRotation);
     Log("  get_localPosition: %p", g_transform_get_localPosition);
@@ -645,6 +653,7 @@ static DWORD WINAPI InitThread(LPVOID) {
     Log("  get_childCount: %p", g_transform_get_childCount);
     Log("  GetChild: %p", g_transform_GetChild);
     Log("  Find: %p", g_transform_Find);
+    Log("  get_localToWorldMatrix: %p", g_transform_get_localToWorldMatrix);
     Log("  get_position: %p, SetParent(Transform,bool): %p",
         g_transform_get_position, g_transform_set_parent);
   } else {
@@ -654,18 +663,22 @@ static DWORD WINAPI InitThread(LPVOID) {
   void *objectClass = FindClass("UnityEngine", "Object", asms, ac);
   if (objectClass) {
     g_object_get_name = FindMethod(objectClass, "get_name", 0);
-    g_object_find_objects_of_type =
-        FindMethod(objectClass, "FindObjectsOfType", 1);
+    static const char *const typeParameter[] = {"System.Type"};
+    g_object_find_objects_of_type = EiemFindMethodWithParamTypes(
+        objectClass, "FindObjectsOfType", typeParameter,
+        _countof(typeParameter));
     g_object_destroy = FindMethod(objectClass, "Destroy", 1);
-    Log("[OK] Object.get_name: %p, FindObjectsOfType: %p, Destroy: %p",
+    Log("[OK] Object.get_name: %p, FindObjectsOfType(Type): %p, Destroy: %p",
         g_object_get_name, g_object_find_objects_of_type, g_object_destroy);
   }
 
   void *resourcesClass = FindClass("UnityEngine", "Resources", asms, ac);
   if (resourcesClass) {
-    g_resources_find_objects_of_type_all =
-        FindMethod(resourcesClass, "FindObjectsOfTypeAll", 1);
-    Log("[DUMP] Resources.FindObjectsOfTypeAll: %p",
+    static const char *const typeParameter[] = {"System.Type"};
+    g_resources_find_objects_of_type_all = EiemFindMethodWithParamTypes(
+        resourcesClass, "FindObjectsOfTypeAll", typeParameter,
+        _countof(typeParameter));
+    Log("[DUMP] Resources.FindObjectsOfTypeAll(Type): %p",
         g_resources_find_objects_of_type_all);
   }
 
@@ -909,13 +922,24 @@ static DWORD WINAPI InitThread(LPVOID) {
   if (g_gameObjectClass) {
     g_gameObject_get_transform =
         FindMethod(g_gameObjectClass, "get_transform", 0);
+    g_gameObject_get_activeSelf =
+        FindMethod(g_gameObjectClass, "get_activeSelf", 0);
+    g_gameObject_get_activeInHierarchy =
+        FindMethod(g_gameObjectClass, "get_activeInHierarchy", 0);
+    g_gameObject_set_active = FindMethod(g_gameObjectClass, "SetActive", 1);
+    g_gameObject_get_layer = FindMethod(g_gameObjectClass, "get_layer", 0);
+    g_gameObject_set_layer = FindMethod(g_gameObjectClass, "set_layer", 1);
     g_gameObject_ctor = FindMethod(g_gameObjectClass, ".ctor", 1);
     g_gameObject_ctorDefault = FindMethod(g_gameObjectClass, ".ctor", 0);
     g_gameObject_set_name = FindMethod(g_gameObjectClass, "set_name", 1);
     g_gameObject_AddComponent = FindMethod(g_gameObjectClass, "AddComponent", 1);
-    Log("[OK] GameObject: transform=%p ctor(string)=%p ctor()=%p set_name=%p AddComponent=%p",
-        g_gameObject_get_transform, g_gameObject_ctor, g_gameObject_ctorDefault,
-        g_gameObject_set_name, g_gameObject_AddComponent);
+    Log("[OK] GameObject: transform=%p active=%p/%p setActive=%p layer=%p/%p "
+        "ctor(string)=%p ctor()=%p set_name=%p AddComponent=%p",
+        g_gameObject_get_transform, g_gameObject_get_activeSelf,
+        g_gameObject_get_activeInHierarchy, g_gameObject_set_active,
+        g_gameObject_get_layer, g_gameObject_set_layer,
+        g_gameObject_ctor, g_gameObject_ctorDefault, g_gameObject_set_name,
+        g_gameObject_AddComponent);
   }
 
   g_componentClass = FindClass("UnityEngine", "Component", asms, ac);
@@ -930,7 +954,11 @@ static DWORD WINAPI InitThread(LPVOID) {
   if (g_gameObjectClass) {
     g_gameObject_GetComponent =
         FindMethod(g_gameObjectClass, "GetComponent", 1);
+    g_gameObject_GetComponentsInChildren =
+        FindMethod(g_gameObjectClass, "GetComponentsInChildren", 2);
     Log("[OK] GameObject.GetComponent: %p", g_gameObject_GetComponent);
+    Log("[OK] GameObject.GetComponentsInChildren(Type,bool): %p",
+        g_gameObject_GetComponentsInChildren);
   }
 
   g_skinnedMeshRendererClass =
@@ -948,11 +976,14 @@ static DWORD WINAPI InitThread(LPVOID) {
     g_smr_set_bones = FindMethod(g_skinnedMeshRendererClass, "set_bones", 1);
     g_smr_get_rootBone = FindMethod(g_skinnedMeshRendererClass, "get_rootBone", 0);
     g_smr_set_rootBone = FindMethod(g_skinnedMeshRendererClass, "set_rootBone", 1);
+    g_smr_get_localBounds = FindMethod(g_skinnedMeshRendererClass, "get_localBounds", 0);
+    g_smr_set_localBounds = FindMethod(g_skinnedMeshRendererClass, "set_localBounds", 1);
     Log("[OK] SkinnedMeshRenderer: get/set sharedMesh=%p/%p, GetWeight=%p, SetWeight=%p, "
-        "get/set bones=%p/%p rootBone=%p/%p",
+        "get/set bones=%p/%p rootBone=%p/%p localBounds=%p/%p",
         g_smr_get_sharedMesh, g_smr_set_sharedMesh, g_smr_GetBlendShapeWeight,
         g_smr_SetBlendShapeWeight, g_smr_get_bones, g_smr_set_bones,
-        g_smr_get_rootBone, g_smr_set_rootBone);
+        g_smr_get_rootBone, g_smr_set_rootBone, g_smr_get_localBounds,
+        g_smr_set_localBounds);
   } else {
     Log("[WARN] SkinnedMeshRenderer class NOT found");
   }
@@ -975,10 +1006,13 @@ static DWORD WINAPI InitThread(LPVOID) {
         FindMethodInHierarchy(rendererClass, "get_enabled", 0);
     g_renderer_set_enabled =
         FindMethodInHierarchy(rendererClass, "set_enabled", 1);
+    g_renderer_get_isVisible =
+        FindMethodInHierarchy(rendererClass, "get_isVisible", 0);
     g_renderer_get_sharedMaterials =
         FindMethodInHierarchy(rendererClass, "get_sharedMaterials", 0);
-    Log("[DUMP] Renderer enabled get/set: %p / %p", g_renderer_get_enabled,
-        g_renderer_set_enabled);
+    Log("[DUMP] Renderer enabled get/set/isVisible: %p / %p / %p",
+        g_renderer_get_enabled, g_renderer_set_enabled,
+        g_renderer_get_isVisible);
   }
 
   // LOD membership is optional: older Unity builds or stripped metadata may
@@ -1342,6 +1376,7 @@ static DWORD WINAPI InitThread(LPVOID) {
           // instantiating this character, bypassing set_sharedMesh. Reconcile
           // once through the window procedure after the switch completes.
           EiemQueueModReconcile("main character changed");
+          EiemScheduleLifecycleReconcile("main character changed");
 
           s_ikDisabled = false;
           memset(s_bipedIK, 0, sizeof(s_bipedIK));

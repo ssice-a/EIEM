@@ -86,6 +86,89 @@ if (args.Length == 5 && args[0] == "--extract-closure")
     return bundles.Count > 0 ? 0 : 1;
 }
 
+if (args.Length == 6 && args[0] == "--inspect-mesh")
+{
+    var meshArchive = EndfieldVfsArchive.Open(args[1]);
+    var loadedIndex = EndfieldIndexStore.Load(args[2]);
+    var logicalPath = args[3];
+    var targetPathId = long.Parse(args[5]);
+    var record = loadedIndex.Assets.Records.FirstOrDefault(x =>
+        x.PathId == targetPathId && x.Type == "Mesh" &&
+        string.Equals(x.Container, logicalPath, StringComparison.OrdinalIgnoreCase));
+    if (record == null)
+    {
+        Console.Error.WriteLine("target Mesh index record not found");
+        return 1;
+    }
+    var bundlePaths = loadedIndex.Dependencies.ResolveBundleClosure(record.Source);
+    var cachePaths = bundlePaths.Select(path => meshArchive.ExtractToCache(path, args[4])).ToArray();
+    var manager = new AssetsManager
+    {
+        Game = GameManager.GetGameByType(GameType.ArknightsEndfield),
+        ResolveDependencies = false,
+    };
+    manager.LoadFiles(cachePaths, mergeSplitAssets: false);
+    var mesh = manager.assetsFileList.SelectMany(x => x.Objects).OfType<Mesh>()
+        .FirstOrDefault(x => x.m_PathID == targetPathId);
+    if (mesh == null)
+    {
+        Console.Error.WriteLine("target Mesh not found");
+        return 1;
+    }
+
+    Console.WriteLine($"mesh={mesh.Name} pathId={mesh.m_PathID} cab={mesh.assetsFile.fileName} " +
+                      $"vertices={mesh.m_VertexCount} indices={mesh.m_Indices.Count} " +
+                      $"skin={mesh.m_Skin?.Count ?? 0} bindposes={mesh.m_BindPose?.Length ?? 0} " +
+                      $"boneHashes={mesh.m_BoneNameHashes?.Length ?? 0}");
+    if (mesh.m_Skin?.Count > 0)
+    {
+        var skin = mesh.m_Skin[0];
+        Console.WriteLine("skin[0].weights=" + string.Join(",", skin.weight.Select(x => x.ToString("R"))));
+        Console.WriteLine("skin[0].indices=" + string.Join(",", skin.boneIndex));
+    }
+    if (mesh.m_BindPose?.Length > 0)
+        Console.WriteLine("bindpose[0]=" + string.Join(",", Enumerable.Range(0, 16)
+            .Select(i => mesh.m_BindPose[0][i].ToString("R"))));
+
+    var field = typeof(Mesh).GetField("m_VertexData",
+        System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+    var vertexData = field?.GetValue(mesh) as VertexData;
+    if (vertexData == null)
+    {
+        Console.Error.WriteLine("Mesh vertex data is unavailable");
+        return 1;
+    }
+    Console.WriteLine($"vertexData.vertices={vertexData.m_VertexCount} bytes={vertexData.m_DataSize.Length} " +
+                      $"channels={vertexData.m_Channels.Count} streams={vertexData.m_Streams.Count}");
+    for (var index = 0; index < vertexData.m_Channels.Count; index++)
+    {
+        var channel = vertexData.m_Channels[index];
+        Console.WriteLine($"channel[{index}] stream={channel.stream} offset={channel.offset} " +
+                          $"format={channel.format} dimension={channel.dimension}");
+    }
+    for (var index = 0; index < vertexData.m_Streams.Count; index++)
+    {
+        var stream = vertexData.m_Streams[index];
+        Console.WriteLine($"stream[{index}] mask=0x{stream.channelMask:X8} offset={stream.offset} stride={stream.stride}");
+    }
+    foreach (var index in new[] { 12, 13 })
+    {
+        if (index >= vertexData.m_Channels.Count)
+            continue;
+        var channel = vertexData.m_Channels[index];
+        if (channel.dimension == 0 || channel.stream >= vertexData.m_Streams.Count)
+            continue;
+        var stream = vertexData.m_Streams[channel.stream];
+        var componentSize = (int)MeshHelper.GetFormatSize(
+            MeshHelper.ToVertexFormat(channel.format, mesh.version));
+        var size = componentSize * channel.dimension;
+        var offset = checked((int)stream.offset + channel.offset);
+        Console.WriteLine($"channel[{index}].vertex[0].raw=" +
+                          Convert.ToHexString(vertexData.m_DataSize.AsSpan(offset, size)));
+    }
+    return 0;
+}
+
 if (args.Length == 6 && args[0] == "--inspect-closure")
 {
     var closureArchive = EndfieldVfsArchive.Open(args[1]);

@@ -40,6 +40,17 @@ struct EiemModResource {
   char path[768] = {};
   char kind[24] = {};
   char source[768] = {};
+  // Optional logical identity of the game resource to redirect globally.
+  // Resource declarations remain usable without these fields as ordinary
+  // payloads referenced by Render rules.
+  char targetPath[768] = {};
+  char targetAsset[192] = {};
+  bool textureLinear = false;
+  bool textureMipmaps = true;
+  int32_t textureFilter = 1;
+  int32_t textureWrap = 0;
+  int32_t textureAniso = 1;
+  float textureMipBias = 0.0f;
 };
 
 static void EiemModInitRule(EiemModRule *rule) {
@@ -117,7 +128,7 @@ static bool EiemModParseFile(const char *path, std::vector<EiemModRule> &out,
       EiemModTrim(section);
       inRender = section.size() >= 6 &&
                  _strnicmp(section.c_str(), "Render", 6) == 0;
-      inResource = !inRender && section.size() >= 5 &&
+      inResource = !inRender &&
                    (_strnicmp(section.c_str(), "Mesh", 4) == 0 ||
                     _strnicmp(section.c_str(), "Skeleton", 8) == 0 ||
                     _strnicmp(section.c_str(), "Material", 8) == 0 ||
@@ -148,6 +159,22 @@ static bool EiemModParseFile(const char *path, std::vector<EiemModRule> &out,
     if (inResource) {
       if (_stricmp(key.c_str(), "source") == 0)
         EiemModCopy(resource.source, sizeof(resource.source), value);
+      else if (_stricmp(key.c_str(), "target.path") == 0)
+        EiemModCopy(resource.targetPath, sizeof(resource.targetPath), value);
+      else if (_stricmp(key.c_str(), "target.asset") == 0)
+        EiemModCopy(resource.targetAsset, sizeof(resource.targetAsset), value);
+      else if (_stricmp(key.c_str(), "linear") == 0)
+        resource.textureLinear = EiemModEquals(value.c_str(), "true") || value == "1";
+      else if (_stricmp(key.c_str(), "mipmaps") == 0)
+        resource.textureMipmaps = EiemModEquals(value.c_str(), "true") || value == "1";
+      else if (_stricmp(key.c_str(), "filter") == 0)
+        resource.textureFilter = (int32_t)strtol(value.c_str(), nullptr, 10);
+      else if (_stricmp(key.c_str(), "wrap") == 0)
+        resource.textureWrap = (int32_t)strtol(value.c_str(), nullptr, 10);
+      else if (_stricmp(key.c_str(), "aniso") == 0)
+        resource.textureAniso = (int32_t)strtol(value.c_str(), nullptr, 10);
+      else if (_stricmp(key.c_str(), "mip_bias") == 0)
+        resource.textureMipBias = strtof(value.c_str(), nullptr);
     }
     if (!inRender) continue;
     if (_stricmp(key.c_str(), "asset") == 0)
@@ -230,6 +257,12 @@ static void EiemReloadMods() {
         rule.hasMesh ? rule.mesh : "<none>", rule.partnerCount);
   }
   ReleaseSRWLockExclusive(&s_eiemModLock);
+  for (const auto &resource : s_eiemModResources) {
+    if (resource.targetPath[0])
+      Log("[MOD] global resource=%s kind=%s target=%s asset=%s",
+          resource.section, resource.kind, resource.targetPath,
+          resource.targetAsset[0] ? resource.targetAsset : "<any>");
+  }
   Log("[MOD] Reloaded %zu Render rule(s), %zu resource declaration(s), generation=%ld",
       count, resourceCount, generation);
 }
@@ -262,9 +295,14 @@ static bool EiemFindResourceRenderRule(const char *source, const char *asset,
   for (auto it = s_eiemModRules.rbegin(); it != s_eiemModRules.rend(); ++it) {
     const auto &rule = *it;
     if (!rule.asset[0] || !EiemModEquals(rule.asset, asset)) continue;
-    if (rule.matchVertices >= 0 && rule.matchVertices != vertices) continue;
+    // Logical SubMeshInfo records may expose the asset name before Unity has
+    // materialized a Mesh. Unknown shape values must not reject the rule;
+    // once a Mesh exists these fields remain strict checks.
+    if (rule.matchVertices >= 0 && vertices >= 0 &&
+        rule.matchVertices != vertices) continue;
     if (rule.matchIndices >= 0 && indices >= 0 && rule.matchIndices != indices) continue;
-    if (rule.matchSubMeshes >= 0 && rule.matchSubMeshes != subMeshes) continue;
+    if (rule.matchSubMeshes >= 0 && subMeshes >= 0 &&
+        rule.matchSubMeshes != subMeshes) continue;
     if (!source || !source[0] || !EiemModSameLogicalPath(rule.path, source)) continue;
     candidate = rule;
     found = true;
@@ -279,9 +317,11 @@ static bool EiemFindResourceRenderRule(const char *source, const char *asset,
     for (auto it = s_eiemModRules.rbegin(); it != s_eiemModRules.rend(); ++it) {
       const auto &rule = *it;
       if (!rule.asset[0] || !EiemModEquals(rule.asset, asset)) continue;
-      if (rule.matchVertices >= 0 && rule.matchVertices != vertices) continue;
+      if (rule.matchVertices >= 0 && vertices >= 0 &&
+          rule.matchVertices != vertices) continue;
       if (rule.matchIndices >= 0 && indices >= 0 && rule.matchIndices != indices) continue;
-      if (rule.matchSubMeshes >= 0 && rule.matchSubMeshes != subMeshes) continue;
+      if (rule.matchSubMeshes >= 0 && subMeshes >= 0 &&
+          rule.matchSubMeshes != subMeshes) continue;
       if (!fallbackPath[0]) {
         strncpy_s(fallbackPath, sizeof(fallbackPath), rule.path, _TRUNCATE);
         candidate = rule;
@@ -315,6 +355,65 @@ static bool EiemFindModResource(const char *modIni, const char *section,
     break;
   }
   ReleaseSRWLockShared(&s_eiemModLock);
+  return found;
+}
+
+// Finds a resource declaration that opted into global logical redirection.
+// Matching is intentionally strict on type and path; asset name is an
+// optional disambiguator for bundles containing multiple sub-assets.
+static bool EiemFindGlobalResource(const char *path, const char *asset,
+                                   const char *kind, EiemModResource *out) {
+  if (!path || !path[0] || !out) return false;
+  bool found = false;
+  AcquireSRWLockShared(&s_eiemModLock);
+  for (auto it = s_eiemModResources.rbegin();
+       it != s_eiemModResources.rend(); ++it) {
+    const auto &resource = *it;
+    if (!resource.targetPath[0] ||
+        !EiemModSameLogicalPath(resource.targetPath, path))
+      continue;
+    if (kind && kind[0] && _stricmp(resource.kind, kind) != 0) continue;
+    if (resource.targetAsset[0] &&
+        (!asset || !asset[0] || !EiemModEquals(resource.targetAsset, asset)))
+      continue;
+    *out = resource;
+    found = true;
+    break;
+  }
+  ReleaseSRWLockShared(&s_eiemModLock);
+  return found;
+}
+
+// A few game paths expose only the final sub-asset name at the proxy boundary.
+// Allow an asset-only fallback only when that name identifies one declaration
+// unambiguously; never choose between resources with the same name.
+static bool EiemFindGlobalResourceByAsset(const char *asset, const char *kind,
+                                          EiemModResource *out) {
+  if (!asset || !asset[0] || !out) return false;
+  bool found = false;
+  EiemModResource candidate = {};
+  AcquireSRWLockShared(&s_eiemModLock);
+  for (auto it = s_eiemModResources.rbegin();
+       it != s_eiemModResources.rend(); ++it) {
+    const auto &resource = *it;
+    if (!resource.targetPath[0] || !resource.targetAsset[0] ||
+        !EiemModEquals(resource.targetAsset, asset))
+      continue;
+    if (kind && kind[0] && _stricmp(resource.kind, kind) != 0) continue;
+    if (!found) {
+      candidate = resource;
+      found = true;
+      continue;
+    }
+    if (!EiemModSameLogicalPath(candidate.targetPath, resource.targetPath) ||
+        _stricmp(candidate.modPath, resource.modPath) != 0 ||
+        _stricmp(candidate.section, resource.section) != 0) {
+      found = false;
+      break;
+    }
+  }
+  ReleaseSRWLockShared(&s_eiemModLock);
+  if (found) *out = candidate;
   return found;
 }
 
