@@ -38,6 +38,7 @@ mesh_payloads = {}
 skeleton_keys = set()
 material_values = {}
 texture_values = {}
+prefab_values = {}
 for section in parser.sections():
     values = parser[section]
     if section.lower().startswith("mesh") and values.get("path"):
@@ -50,6 +51,8 @@ for section in parser.sections():
             addon.safe_path(package, values["path"]))
     elif section.lower().startswith("texture") and values.get("path"):
         texture_values[section] = dict(values)
+    elif section.lower().startswith("prefab") and values.get("path"):
+        prefab_values[section] = dict(values)
 
 addon.import_package(package, clean=True)
 collection = bpy.data.collections["EIEM"]
@@ -138,6 +141,7 @@ with (output / "mod.ini").open("r", encoding="utf-8-sig") as stream:
     roundtrip.read_file(stream)
 
 assert sum(name.lower().startswith("skeleton") for name in roundtrip.sections()) == len(skeleton_keys)
+assert sum(name.lower().startswith("prefab") for name in roundtrip.sections()) == 0
 # An untouched imported material inherits the game's original resource. The
 # incremental package therefore contains no redundant .mat or Texture copies.
 assert sum(name.lower().startswith("material") for name in roundtrip.sections()) == 0

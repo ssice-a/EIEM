@@ -340,6 +340,7 @@ static void* g_actionInvokeMethod = nullptr;
 
 static void *g_skinnedMeshRendererClass = nullptr;
 static void *g_meshFilterClass = nullptr;
+static void *g_meshRendererClass = nullptr;
 static void *g_smr_get_sharedMesh = nullptr;
 static void *g_meshFilter_get_sharedMesh = nullptr;
 static void *g_smr_set_sharedMesh = nullptr;

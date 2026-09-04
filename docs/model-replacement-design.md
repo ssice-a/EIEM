@@ -1,1356 +1,177 @@
-# EIEM Model Replacement Design
-
-Status: extraction/browser and fresh runtime Mesh replacement verified;
-EIEMESH v3 Mesh/Skeleton/Material/Texture Blender round-trip implemented;
-live Material/Texture replacement test pending
-
-## Current Runtime Backend (2026-08-31)
-
-The plugin parses `plugin/mods/<mod>/mod.ini` into reusable resource records
-and Render records. A Render record combines two responsibilities: its
-identity fields (`path`, `asset`, and optional `match.*`) find the source
-Renderer, while its resource fields modify that source Renderer. A Render may
-also name one or more `partner.N` Render records; those records never match a
-source and are created as additional Renderers with the source object's
-lifecycle.
-
-```text
-[Mesh...].path       -> EIEMESH binary written by AnimeStudio/Blender
-[Material...].path   -> EIEMMAT text file
-[Render...].path     -> source Mesh logical path (resource match key)
-[Render...].asset    -> Mesh sub-resource name inside that container
-[Render...].match.*  -> original Mesh structure fingerprint
-[Render...].mesh     -> Mesh resource section
-[Render...].material.N -> Material resource section
-[Render...].partner.N -> additional Render section, never a match rule
-```
-
-On `SkinnedMeshRenderer.set_sharedMesh` or `MeshFilter.set_sharedMesh`, a
-matching Render record now performs the following work on Unity's own thread:
-
-1. Reads `EIEMESH` v2/v3 and validates vertices, normals, tangents, colours, eight
-   UV channels, triangle submeshes, skin weights and bind poses.
-2. Constructs a real `UnityEngine.Mesh` with the game's IL2CPP APIs and assigns
-   it to the existing renderer. Reusing the renderer deliberately preserves the
-   game-owned transform, Animator binding, bones/rootBone, LOD selection,
-   culling and entity lifetime.
-3. Reads each requested `EIEMMAT`, loads its `source=` Material through the
-   already-running `BundleResourceManager`, clones it with `new Material(source)`,
-   and applies exported `float.*`, `int.*`, `value4.*`,
-   `texture_scale.*`, and `texture_offset.*` overrides before assigning
-   `sharedMaterials`.
-4. When the current game build exposes `Texture2D` plus
-   `ImageConversion.LoadImage(Texture2D, Byte[], Boolean)`, reads a PNG declared
-   by `texture.Property=TextureSection`, recreates the exported linear/mipmap
-   and sampler settings, assigns it with `SetTexture`, and verifies the result
-   through `GetTexture`.
-5. For a `partner.N` record, creates one child GameObject/Renderer, copies the
-   source Transform and SkinnedMeshRenderer bone references, and adds the new
-   Renderer to every `LODGroup` level that already contains the source Renderer.
-   On reload it removes that reference before destroying the partner object.
-   If a build does not expose `LODGroup.GetLODs/SetLODs`, partner creation still
-   succeeds and the limitation is logged.
-
-Generated Mesh, Material and Texture objects are cached by the mod file,
-resource section and file timestamp. Reconciliation therefore reuses unchanged
-objects instead of rebuilding them for every Renderer or F10 press. When a
-resource file changes, the old generated object for that section is released
-after the previous Renderer state has been restored, then the new object is
-created and rooted for the next pass.
-
-The implementation has compiled successfully but Material/Texture replacement
-must not be described as end-to-end verified until a deliberately obvious
-material/PNG package is tested in-game. The previous live metadata probe did
-resolve `ImageConversion.LoadImage`, `Material.SetTexture` and the game resource
-loader; the next run must also confirm the exact five-argument Texture2D
-constructor and sampler methods introduced by the metadata-preserving path.
-EIEMESH BlendShape frames are decoded and reconstructed with
-`Mesh.AddBlendShapeFrame`; if that API is absent, replacement fails explicitly.
-
-## Runtime experiment log
-
-### 2026-09-03: source-Mesh clone rejected
-
-Test package: `MeshWulfaBodyLod0` points to `body_lod0_half.mesh`, containing
-2451 vertices and 12207 indices. The Render rule matched the live Wulfa body
-renderer and reported `applied=true`. With the clone-first implementation the
-log contained:
-
-```text
-[DEBUG-mesh] ... vertices=2451 ...
-[DEBUG-mesh] ... cloned=1
-[DEBUG-mesh] Unity mesh result=... vertices=4902 ...
-[DEBUG-mesh-state] expected boneWeights=2451 bindposes=99
-[DEBUG-DRAW-STATE] ... enabled=true visible=false
-```
-
-The read-back vertex count remained the original 4902 instead of the payload
-2451, and the character disappeared. This proves that the clone path did not
-accept the managed channel writes as a replacement in Endfield's native mesh
-cache. It is not a match failure: the rule matched and the renderer received a
-different object, but that object still exposed the source layout.
-
-Decision: construct a fresh `UnityEngine.Mesh`, write all payload channels,
-bind poses and submeshes, recalculate bounds, upload the mesh, and verify the
-read-back counts before considering the resource usable. Do not clone a source
-Mesh. A future optimization may only be added after it preserves the exact
-payload counts in the same live-build read-back check.
-
-### Debugging invariants
-
-Every replacement test must record, in order: rule match, payload counts,
-construction mode, read-back vertex/index/submesh counts, skin-array counts,
-renderer enabled state, and the final assignment result. `visible=false` is a
-camera-time diagnostic and is not by itself proof of a failed assignment; a
-count mismatch or a failed assignment is the actionable failure signal.
-
-## Current offline browser implementation (2026-08-28)
-
-The chosen inspection path is now a direct, indexed VFS browser inside the
-normal AnimeStudio GUI. It does not load or decrypt the complete 53 GB VFS.
-
-```text
-Endfield .blc metadata + encrypted .chk ranges
-    -> one-Bundle-at-a-time in-memory decrypt and Unity parse
-    -> compact resource/CAB dependency index with checkpoint/resume
-    -> unified virtual Container directory tree
-    -> native AnimeStudio type filters and search
-    -> user selects one resource
-    -> read/decrypt its Bundle and transitive CAB dependencies on demand
-    -> native Texture/Mesh/GameObject preview and selected export
-```
-
-The `.blc` parser and ChaCha20 implementation are local code and were verified
-against the previous full extraction byte-for-byte. The completed direct scan
-indexed 237,794 Bundles into 3,385,891 resource records and 237,794 CAB mappings
-with zero failed Bundles. The compact `endfield_assets.eidx` is 702 MB, loads in
-14.44 seconds and retains about 546 MiB of managed data. The old external XML
-AssetMap and full plaintext `.ab` directory are no longer part of the Endfield
-GUI workflow.
-
-Prefab dependency traversal is included. Two real model Prefabs automatically
-resolved closures of 13 and 19 Bundles. The export validation produced an FBX
-with four meshes and seven PNG textures. This completes the VFS-to-Blender
-extraction slice; Blender-to-runtime Bundle authoring is still a separate,
-unfinished slice.
-
-## 1. Objective
-
-Add a runtime model replacement system for the Unity IL2CPP game without
-modifying the original game installation. The plugin should redirect selected
-game resources to user-provided assets and fall back to the original resource
-when a replacement is unavailable or incompatible.
-
-The first supported target is a same-skeleton visual replacement: preserve the
-game character's Animator, Avatar, gameplay components, IK, cloth, colliders,
-and entity lifecycle while replacing the rendered mesh and materials.
-
-Endfield Mesh vertex buffers are authored in Z-up model space. Blender flips
-their handedness for editing (`x,y,z` becomes `-x,y,z`) and reverses that flip
-on export. Prefab Transform TRS is different: it remains in Unity's Y-up
-space, so the Blender Armature view maps it as
-`(x,y,z) -> (-x,-z,y)`. Source local TRS is retained for an unchanged export;
-the runtime assigns the original-basis buffers and bind poses without another
-coordinate rotation. The old `model-z-up-left-handed` marker is accepted as a
-compatibility alias for packages written by the experimental exporter. The
-runtime also verifies the payload's bone-name CRCs against the live
-`SkinnedMeshRenderer.bones[]` hierarchy; it remaps only on a complete match
-and leaves the source order untouched when the match is incomplete.
-
-Whole-Prefab replacement is a later capability, not the first implementation
-target.
-
-## 2. Terms and asset relationships
-
-### Prefab
-
-A Prefab is a serialized Unity object graph or template. It may contain a
-root GameObject, child Transforms, Components, Animator references,
-SkinnedMeshRenderer components, material references, colliders, scripts, and
-other serialized fields.
-
-### Mesh
-
-A Mesh is the geometry asset. For a skinned character it normally contains
-vertices, indices, bind poses, bone weights, sub-meshes, and possibly blend
-shape data. A Mesh does not contain the complete character behavior.
-
-### Material and texture
-
-Materials and textures are separate assets referenced by Renderer components or
-by a Prefab. A material change does not inherently require changing the Prefab:
-
-- Runtime assignment to `SkinnedMeshRenderer.materials` or `sharedMaterials`
-  only changes the instantiated object.
-- A persistent serialized change to the Prefab does require editing the Prefab
-  or replacing the serialized asset that contains the reference.
-
-The first implementation should keep the original Prefab and replace the
-Renderer's Mesh/material references at runtime.
-
-## 3. Proposed runtime architecture
-
-```text
-Game resource request
-    -> game ResourceManager / Addressables / native resource API
-    -> EIEM replacement decision
-       -> replacement artifact, if present and compatible
-       -> original resource on miss or failure
-    -> selected replacement backend applies the result
-```
-
-AssetBundle is one possible replacement artifact, not a design prerequisite.
-The actual artifact format must be selected only after observing the game's
-resource loader. A path may identify a Bundle while the actual asset is
-selected by an internal asset name, an Addressables key, a GUID/FileID pair,
-or a catalog entry.
-
-The plugin's core responsibility is to decide whether a replacement exists. It
-must not embed character-specific asset authoring rules. The replacement
-decision will eventually use:
-
-- Game build identifier and compatibility rules
-- Original resource key/path
-- Replacement file or artifact path
-- Replacement artifact type and identifier
-- Fallback policy and diagnostic reason
-
-The actual replacement mechanism is a separate backend. Possible backends are
-file/path redirection, resource API redirection, or patching an already
-instantiated Unity object. Backend-specific lifetime and dependency rules must
-not leak into the replacement decision layer.
-
-### Responsibility split
-
-```text
-Extractor / third-party tools:
-  unpack and inspect original resources; export editable reference data
-
-Authoring pipeline:
-  modify the exported model; produce a replacement artifact
-
-EIEM replacement decision:
-  scan the replacement directory and decide whether a matching artifact exists
-
-Replacement backend:
-  perform the selected file, resource, or instantiated-object replacement
-```
-
-The term `PFB` must be defined before implementation. It may mean an editor
-`.prefab` YAML export, a game's custom `.pfb` binary, or a logical prefab dump.
-An editor Prefab export is not automatically loadable by a Unity player. It can
-only be directly redirected if the game's runtime loader accepts that exact
-format.
-
-## 4. Discovery phase: IL2CPP dump layer
-
-The first engineering task is metadata discovery, not resource replacement.
-
-`src/il2cpp_dump.h` now runs once after the IL2CPP domain and assemblies are
-available. It writes:
-
-- `plugin/eiem_il2cpp_classes.txt`: all assemblies and type names
-- `plugin/eiem_il2cpp_resource_dump.txt`: detailed candidate classes, fields,
-  methods, parameter types, return types, `MethodInfo` addresses, and native
-  method pointers
-
-The candidate filter includes Unity and game types containing terms such as:
-`AssetBundle`, `Addressable`, `ResourceManager`, `Resource`, `Catalog`,
-`GameObject`, `Transform`, `SkinnedMeshRenderer`, `Mesh`, `Material`,
-`Animator`, `Avatar`, `Character`, `Entity`, and `Visual`.
-
-The dump is metadata-only. It does not instantiate objects or invoke managed
-methods. This makes it suitable for the first run in a live game process.
-
-`src/il2cpp_trace.h` began as the observation layer. When the corresponding
-methods are present, it hooks `AssetBundle.LoadAsset`,
-`AssetBundle.LoadAssetAsync`, `SkinnedMeshRenderer.set_sharedMesh`, and
-`MeshFilter.set_sharedMesh`. Mesh replacement now enters at the logical
-resource boundary: a declared Mesh is redirected from the proxy result before
-the avatar creates its Renderer and custom skin cache. The
-`SubMeshInfo.get_mesh/set_mesh` and avatar-construction hooks remain early
-construction coverage for paths that bypass the proxy. Event-bound/F10 scene
-reconciliation uses the same resource builder for cached models whose original
-construction callback was not observed; it is not a separate fallback format.
-The next build also observes
-`FAssetProxyHandle.get_pathOrName`, `FAssetProxyHandle.Get`,
-`FAssetProxyHandle.GetAssetProxy`, and
-`FAssetProxyUntrackedHandle.Get`. Resource declarations with `target.path` can
-now substitute the final compatible Unity object at those proxy boundaries;
-unmatched requests remain pass-through.
-
-After collecting the dump, the next investigation is to identify:
-
-1. Whether the game uses direct AssetBundle APIs, Addressables, a custom
-   resource manager, or a combination.
-2. Which methods are synchronous and which are asynchronous.
-3. The asset key/path and type passed through the load pipeline.
-4. The point at which a loaded Prefab or Mesh becomes attached to a character.
-5. Whether the game performs integrity checks or custom decryption before the
-   Unity resource API is reached.
-
-## 5. Hook strategy
-
-For Meshes, use the earliest logical resource boundary that still preserves
-the game's own construction pipeline:
-
-```text
-FAssetProxyHandle.Get()
-    -> EIEM resolves target.path and builds replacement Mesh
-    -> game receives replacement Mesh from its normal resource path
-    -> SubMeshInfo / CreateSMS / AssignSkin consume that Mesh
-    -> original game CreateSMS/AssignSkin pipeline
-    -> game initializes bones, materials, LOD and renderer caches normally
-```
-
-`SubMeshInfo.get_mesh/set_mesh` and the pre-call avatar construction hooks are
-kept as coverage for resources that do not pass through `FAssetProxyHandle`.
-They must run before the original skin/cache initialization, never as a late
-`sharedMesh` repair.
-
-This is important for cached or prefab-embedded Meshes: they may never issue a
-new file-load request. `ModelManager._OnGameObjectAllocate` is therefore the
-common instance boundary for both newly instantiated and pooled GameObjects,
-with `LoadFromPersistentPool` retaining the logical path when it is available.
-The handle-based `BaseModelViewPart._OnLoadUseHandleFinish*` route is covered
-separately because it bypasses `_OnLoadModelFinish*`.
-
-F10 restores tracked source state, reloads the declarations, and is allowed to
-reapply Mesh resources to already-live renderers. This is not a second Mesh
-implementation: construction hooks and reconciliation both call the same
-resolver, resource builder and assignment function. A loader hook remains
-useful for Materials and Textures, while runtime hide/show remains a Renderer
-directive.
-
-Preferred order:
-
-1. Game-specific resource manager methods discovered from metadata.
-2. Addressables/ResourceManager load methods.
-3. `AssetBundle.LoadAsset` and `LoadAssetAsync`.
-4. File I/O redirection only as a last-resort diagnostic or compatibility
-   layer.
-
-The initial Hook should capture arguments and return values without changing
-them. It should record the resource key, requested type, Bundle identity,
-thread, and whether the operation is synchronous or asynchronous.
-
-Only after the call chain is understood should the resolver return a
-replacement asset.
-
-### Current validation result (2026-08-27)
-
-The first live observation pass confirmed that Endfield's common resource
-entry point is the game-specific overload:
-
-```text
-BundleResourceManager._LoadAssetInternal(
-    Beyond.Resource.StringPathHash, System.Type, RootCategory, immediate, priority)
-    -> FAssetProxyHandle / asset proxy
-```
-
-During one normal startup, the hook observed 500 requests representing 267
-distinct 64-bit hashes. Repeated hashes are expected cache/proxy reuse and are
-not evidence that the underlying Bundle was read repeatedly.
-
-This is evidence for a resource-manager/object-layer backend as the first
-replacement candidate. It is not evidence that raw file interception is
-impossible; the Bundle and decryption boundary has not yet been observed.
-
-The observation runs confirmed that the runtime installs and executes the VFS
-bundle hooks:
-
-```text
-VFS.VirtualFileSystem.LoadBundleFromFile(string)
-VFS.VirtualFileSystem.LoadBundleFromFileAsync(string)
-VFS.VirtualFileSystem.GetAssetStream(string)
-```
-
-It also observed repeated `FAssetProxyHandle.Get` and
-`FAssetProxyHandle.GetAssetProxy` calls, while
-`FAssetProxyHandle.get_pathOrName` and `Asset._FinishWithAsset` did not produce
-runtime records in this session. The resource requests still enter through
-`BundleResourceManager._LoadAssetInternal(StringPathHash, ...)` and resolve to
-proxy objects. The replacement boundary is now explicit: `LoadBundleFromFile`
-and its async overload check `plugin\\mods\\override\\<logical path>` for a
-plaintext Unity AssetBundle. When present, the plugin calls Unity's
-`AssetBundle.LoadFromFile` or `LoadFromFileAsync` on that file; a null result
-falls back to the original encrypted VFS request. `GetAssetStream` remains
-observation-only because redirecting it to a
-filesystem path would not produce a valid VFS stream. The lower
-`ReadFileByLowIO` method returns a large value-type handle and is intentionally
-not used for replacement.
-
-The run also confirmed a character mesh attachment directly:
-
-```text
-SkinnedMeshRenderer.set_sharedMesh
-  renderer=S_npc_gentleman_glass_common_b_01_lod3
-  mesh=S_npc_gentleman_glass_common_b_01_lod3
-```
-
-No replacement artifact was present, so no `[VFS-OVERRIDE]` record was
-expected. End-to-end validation needs one valid plaintext replacement Bundle
-at the exact logical path and one normal startup; a failed replacement must
-fall back to the original path.
-
-### Diagnostic result (2026-09-04)
-
-The latest run loaded the mod configuration successfully, but its log contains
-zero `[RES-REDIRECT]`, `[MOD-LOGICAL-*]`, or mesh-replacement records. The
-recorded scene objects are environment assets and
-`anm_5123_pigeon_postmodel`; it contains no Wulfa asset name. Therefore that
-run proves only that the target Wulfa resource was not observed by the active
-process, not that `body_lod0_half.mesh` failed to build. The hash-based loader
-also returned `FAssetProxyHandle` values whose origin was recorded on the
-heap proxy rather than on the short-lived value-type handle. The current fix
-recovers `StringPathHash.get_path` and binds the origin through
-`FAssetProxyHandle.GetAssetProxy()` before attempting a global Mesh redirect.
-
-The current build captures the actual low-level read result instead of calling
-`GetAssetBytes` after the fact. `FVFSUntrackedLowIOReadHandle.GetData`/
-`GetDataThread` and the corresponding tracked-handle methods return a
-`NativeArray<byte>` after the VFS has read and decrypted a block. The hooks copy
-that native range unchanged into `plugin/captures/lowio/lowio_XXXX.bin` and
-write a sidecar containing the physical `.chk` path, `fileNameHash`, offset,
-encrypted flag, length, and a first-header classification (`UnityFS`,
-`UnityRaw`, `UnityWeb`, or `custom`). F9 only stops the capture and reports
-file/byte totals; it does not invoke IL2CPP or Unity APIs and therefore cannot
-trigger the previous unknown-thread GC failure. Capture is bounded (4096 files,
-64 MiB per read) and deduplicates the two data accessors for the same handle.
-
-Because the startup trace showed Bundle reads through the low-level async path,
-the build still observes both
-`VFSFileReadStream.Read(byte[],int,int)` and the confirmed
-`VFSFileReadStream.Read(Span<byte>)` overload. The Span hook uses the IL2CPP
-Windows x64 value-type ABI (a reference to a 16-byte Span containing pointer
-and length), validates the memory ranges, and captures the first read buffer
-for up to 32 distinct stream instances (maximum 1 MiB each) into
-`plugin/captures/span_XXX.bin`. These stream probes remain observation-only and
-are not used as the bundle dump source. All probes call the original method
-first and leave its return value and caller buffer unchanged.
-
-### Diagnostic result (2026-09-04, v17)
-
-The reported full native Wulfa mesh was consistent with a missing early
-replacement, not proof that the half-mesh payload was rendered and ignored.
-`NPCAvatarLodMeshAssets.GetSubMeshInfo` exposes Wulfa records with a logical
-`meshName` while the `mesh` field is still null. The previous
-`NPCAvatarUtils._GetPartCPUMesh` hook discarded exactly those records via
-`if (!sourceMesh)`, leaving the later `SkinnedMeshRenderer.set_sharedMesh`
-hook as the only remaining point, after the game's skin/GPU state was built.
-
-v17 removes that source-pointer requirement. It resolves the Render rule from
-the logical name, builds the replacement with a null template when necessary,
-and writes it back through `SubMeshInfo.set_mesh` before the game's renderer
-construction. Targeted `[DEBUG-LOGICAL-MESH]` records include the source
-pointer and thread IDs so one run distinguishes no target record,
-unsafe-thread deferral, resource-build failure, or successful logical
-assignment. The change is generic for all Mesh rules; Wulfa is only a bounded
-diagnostic log filter.
-
-The previous `GetAssetBytes` batch dump produced 4096 files but none had a
-UnityFS/UnityRaw/UnityWeb header; those files were VFS wrapper/table data, not
-complete Unity bundles. It has been removed. The lowIO capture is now the
-correct validation point because it runs on the successful decrypted read and
-records the request metadata needed to correlate blocks with the source VFS
-container. A `custom` header is expected until we confirm whether the game
-stores complete bundles or compressed/encrypted blocks at this boundary.
-
-### Diagnostic probe (2026-09-04, v18)
-
-The existing runtime trace covered NPC Avatar construction and final Unity
-renderer setters, but it had no observation point for the shared character
-model path. v18 adds bounded, observation-only hooks for
-`Beyond.Gameplay.View.ModelManager.Load/LoadAsync(string)`,
-`BaseModelComponent.LoadMainModelSync/Async/OnMainPartLoadFinish`, and
-`BaseModelViewPart.OnLoadFinish/PostDealLoadedModel`. The probe reads
-`m_modelId`, `m_modelPath`, the part model and `BaseModelViewPartData.modelPath`
-when those fields are available, and emits `[TRACE-CHAR-PATH]` and
-`[TRACE-CHAR-FLOW]` records. It calls each original method first and does not
-alter meshes, materials, lifecycle, or renderer state. One run with the target
-character is sufficient to prove whether Wulfa uses this shared path; if no
-records appear, the next investigation target is the game's separate ECS or
-custom character construction path, not resource-file replacement. Because
-`ComplexModelViewPart` overrides `PostDealLoadedModel`, v18 hooks that override
-as well as the base implementation; otherwise virtual dispatch could bypass
-the base probe entirely.
-
-### Diagnostic result (2026-09-04, v18 runtime)
-
-The v18 run confirms Wulfa's construction path. The log contains
-`ModelManager.LoadAsync` for
-`Assets/Beyond/DynamicAssets/Gameplay/Actors/PostModels/Characters/chr_0028_wulfa_postmodel.prefab`
-followed by `ComplexModelViewPart.PostDealLoadedModel` and
-`BaseModelViewPart.OnLoadFinish` for the instantiated Wulfa GameObject. The
-same run contains no Wulfa record in the `NPCAvatar` mesh hooks and no
-`MOD-LOGICAL-MESH` assignment. Therefore the earlier NPC-only logical mesh
-replacement was never a valid Wulfa entry point; its successful `skip` effects
-came from the separate late Renderer path. Wulfa's concrete mesh/renderers are
-assembled inside the generic model-part completion path (or its custom
-`EntityRenderHelper`) after the prefab is returned. The next hook must capture
-the loaded GameObject's renderer arrays at that boundary, before the helper's
-skin/GPU cache is finalized. Resource-file replacement remains deferred.
-
-### Early replacement probe (2026-09-04, v19)
-
-v19 moves the first real replacement attempt to the two concrete completion
-methods exposed by `BaseModelViewPart`:
-`_OnLoadModelFinishCallback(int, StringPathHash, GameObject)` and
-`_OnLoadModelFinish(int, StringPathHash, GameObject)`. The detours receive the
-instantiated prefab object directly, walk its bounded Transform hierarchy, and
-inspect every `SkinnedMeshRenderer` before and after the original completion
-method. A renderer is eligible only when its source Mesh name resolves to an
-explicit `Render` rule; no name guessing or global replacement is performed.
-The generated Mesh is assigned through the same Unity setter used by the game,
-then the original callback continues so the game's own skin/GPU setup can read
-the replacement. This keeps `handling=skip` independent from `mesh=` and avoids
-the old NPC-only path.
-
-The deployed v19 build is a runtime probe, not yet a success claim. The next
-single game run should provide `[TRACE-CHAR-RENDER]` and
-`[TRACE-CHAR-RENDER-SUMMARY]` records for the Wulfa prefab. `matched=0` means
-the source Mesh identity does not equal the configured `asset` and the match
-key must be corrected; `matched>0` with `safe=0` means the callback runs before
-the plugin has recorded the Unity thread and the thread gate must be fixed;
-`matched>0` with a mesh-build failure points to the payload or Unity Mesh write
-path. Only after these records are present should visual deformation or skin
-palette issues be investigated.
-
-The first v19 run showed the callback boundary itself was still too early:
-`_OnLoadModelFinish` received Wulfa's root object, but its hierarchy contained
-no `SkinnedMeshRenderer` yet (`visited=512, renderers=0`). At the same time,
-the later scene reconciliation reported `matched=1, applied=0`; this is
-intentional because that pass calls the rule with `allowMeshReplacement=false`.
-The follow-up build therefore runs the same inspection after
-`PostDealLoadedModel` and `OnLoadFinish`, and uses Unity's
-`GameObject.GetComponentsInChildren(Type, true)` before falling back to a
-bounded hierarchy walk. This removes the 512-node blind spot and places the
-assignment after prefab components exist but before any future late repair pass.
-
-### Cached-model coverage and incremental authoring export (2026-09-04)
-
-The first Typhoea material/Mesh package was present in-game, but the trace had
-no Typhoea lifecycle or target-candidate records. This was a monitoring and
-entry-point defect, not evidence that the character was absent:
-
-- the single character-flow counter stopped at exactly 320 records (256 flow
-  and 64 path records), so later model loads were silent;
-- renderer diagnostics were hard-coded to one earlier character or to an
-  already-successful full rule match, hiding configured targets that failed
-  identity/shape resolution;
-- only string-path and fresh `_OnLoadModelFinish*` routes were covered, while
-  `ModelManager` exposes a persistent pool and `BaseModelViewPart` exposes a
-  distinct handle-reuse completion route;
-- reconciliation explicitly passed `allowMeshReplacement=false`, so F10 could
-  restore a source Mesh but could not mount the newly reloaded Mesh.
-
-The runtime now applies the same resource rule at
-`ModelManager._OnGameObjectAllocate`, after `LoadFromPersistentPool`, and after
-both handle-reuse completion methods. Configured Mesh names receive uncapped
-candidate/mismatch records without character-name special cases. F10 passes
-through the normal Mesh assignment path after the generation restore. Static
-contract tests require all of these invariants, and the complete DLL builds
-with the exact metadata-selected overloads. Live Typhoea validation remains
-required before this coverage change is called end-to-end verified.
-
-Blender export is now an incremental dependency closure rooted at selected
-EIEM Mesh objects:
-
-```text
-selected Mesh
-    -> its Render rule and Mesh payload
-    -> only a changed/reassigned Material clone
-    -> only Texture resources referenced by changed texture properties
-    -> Skeleton only when the Armature is explicitly selected
-```
-
-Material import records an authoring baseline. Exported EIEMMAT files contain
-the original `source=` material and only properties changed from that baseline;
-the runtime clones the game Material, so omitted properties continue to come
-from the game. This avoids copying every original shader parameter and PNG.
-The Blender 5.0 background regression imported all 62 Typhoea Mesh resources,
-edited one cloth Mesh and its `_BaseMap`, then produced exactly one Mesh, one
-Material, one Texture, zero Skeletons, and one Render rule. The full untouched
-geometry/channel round trip still validates all 62 Meshes and the single shared
-skeleton while correctly omitting unchanged Materials and Textures.
-
-## 6. Packaging and unpacking assumptions
-
-Unpacking the original model is useful for discovering:
-
-- Skeleton and bone names
-- Mesh/sub-mesh layout
-- Material and shader requirements
-- BlendShape names
-- Prefab hierarchy and component dependencies
-- Bundle and Addressables relationships
-
-Extraction does not automatically produce a Bundle that Unity can load again.
-Rebuilding may require matching the game's Unity version, platform, asset
-serialization version, compression mode, shader setup, and dependency graph.
-
-Possible obstacles include:
-
-- Encrypted or custom-wrapped Bundle files
-- LZ4/LZMA compression and block metadata
-- Addressables catalogs and hash files
-- GUID/FileID references across Bundles
-- Runtime decryption in a game-specific loader
-- Version-specific Unity serialization
-- Asset integrity checks or signatures
-
-The authoring pipeline is intentionally separate from `eiem.dll`. The target
-workflow is a round-trip resource workspace: decrypt and unpack the source
-game data, import a versioned dump into a Blender add-on, edit it, then build a
-replacement artifact for the runtime loader. Third-party parsers may be used
-inside the offline pipeline, but they are not runtime plugin dependencies.
-
-### Better-Endfield comparison
-
-Better-Endfield confirms a useful architecture boundary. Its host dynamically
-resolves IL2CPP classes and methods by assembly, namespace, type, signature,
-and field descriptors, while a HookBroker owns hook creation, conflict
-detection, and per-module release. Its model module consumes a generated
-resource manifest containing a logical asset path, a `pathHash`, and the
-corresponding `bundleHash`; it then calls the game's
-`I18NAssetLoader.Load(hash, type, category)` for a configured login actor.
-
-That is valuable for our host/runtime design, but it is not a generic model
-replacement backend. The model module still contains a feature-specific
-contract, login-scene discovery, prefab cloning, Animator/PlayableGraph
-setup, and explicit character configuration. We should reuse the principles:
-
-- resolve IL2CPP methods by metadata descriptors instead of fixed addresses;
-- centralize Hook ownership and release so shutdown does not deadlock;
-- generate path/hash/bundle indexes offline and keep them outside the DLL;
-- let a missing or incompatible contract disable one feature only.
-
-We should not copy its login actor logic or make the replacement engine depend
-on character IDs. Our plugin's generic path is:
-
-```text
-VFS extractor -> logical files and manifest/index -> external Unity tools
-              -> edited replacement Bundle at the same logical path
-              -> EIEM LoadBundleFromFile hook -> original VFS fallback
-```
-
-The repository includes `tools/extract_endfield_vfs.ps1` as an orchestration
-script. It invokes the current EndfieldUnpacker Python extractor, processes
-the base `StreamingAssets` VFS, and writes an extraction report. It does not
-put VFS decryption or Unity serialization code into `eiem.dll`.
-
-During validation, the early FkArkEnd `Beyond.VFS` build failed with
-`EndOfStreamException` on the installed client's small version-3 BLC files.
-The current `endGuaGua/EndfieldUnpacker` Python implementation succeeds on the
-same installation: its dry run reports `code_ver=4`, identifies the
-`Bundle`/`Audio` layers, and enumerates real paths such as
-`Bundles/Windows/initial/<hash>.ab`. This establishes the correct extraction
-tool and explains why the earlier C# tool must not be used as the baseline.
-
-The resulting `.ab` files are still Endfield's custom Unity bundle wrapper.
-They require the matching AnimeStudio CLI (or an equivalent version-aware
-decoder) before Unity objects can be consumed by the authoring pipeline. The
-extraction pipeline is therefore:
-
-```text
-VFS .blc/.chk --EndfieldUnpacker--> logical .ab files
-logical .ab --AnimeStudio--> parsed Unity objects + source metadata
-parsed objects --EIEM Blender add-on--> versioned authoring dump
-authoring dump --Blender--> edited authoring dump
-edited dump --bundle builder--> loadable replacement artifact
-replacement artifact --> plugin/mods/override/<same logical path>
-```
-
-AssetRipper/UABEA are optional inspection backends in this pipeline. They are
-not the authoring format and are not assumed to provide a working Endfield
-round trip. The Blender add-on and runtime plugin will consume the same
-EIEM-owned resource files. They retain the data needed for round-trip editing:
-prefab hierarchy, transforms, mesh buffers and submeshes, original normals and
-tangents, bind poses and weights, blend shapes, skeleton metadata, material and
-texture references, and physics metadata where the source parser exposes it.
-
-User replacements can be stored in whatever artifact the selected backend can
-consume. A custom AssetBundle is one option, but it is not required. A custom
-PFB file is only valid if the game or a replacement backend can deserialize it.
-
-## 7. Replacement levels
-
-### Level 1: Renderer patch
-
-Keep the original Prefab and character hierarchy. Replace the existing
-`SkinnedMeshRenderer` Mesh and materials after the model is instantiated.
-
-Requirements:
-
-- Compatible bone count and ordering, or an explicit bone remapping table
-- Compatible bind poses and weights
-- Compatible shader/material properties
-- BlendShape name/index mapping where facial animation is required
-
-Expected result: visual model replacement with original gameplay behavior.
-
-### Level 2: Asset load redirection
-
-When the game requests a known Mesh or Material asset, return or apply the
-equivalent replacement artifact. The original Prefab remains unchanged.
-
-Expected result: replacement happens at the resource boundary and survives
-character recreation, provided the selected backend covers all load paths.
-
-### Level 3: Prefab replacement
-
-Return a replacement Prefab or instantiate a replacement GameObject. This may
-require reattaching Animator, gameplay scripts, IK, colliders, cloth, and
-entity-specific references.
-
-Expected result: complete visual hierarchy replacement, with substantially
-higher compatibility risk.
-
-## 8. Authoring package and configuration (agreed v1)
-
-The package contains one generated `mod.ini` and one EIEM-owned set of resource
-files. The offline exporter, Blender add-on, and runtime plugin read and write
-this exact structure. FBX is not part of the authoring or runtime format.
-
-```text
-mod/
-  mod.ini
-  meshes/<name>.mesh
-  skeletons/<name>.skeleton
-  materials/<name>.mat
-  textures/<name>.png
-```
-
-`mod.ini` uses EFMI-like section/key/value syntax. Blender generates it, while
-advanced users may edit it. There are two deliberately separate concerns:
-
-1. `Texture`, `Material`, and `Mesh` declare reusable resources.
-2. `Render` finds a scene Renderer and organises an operation using those
-   resources.
-
-Resource declarations without a target are inert payloads for `Render` rules.
-When a declaration includes `target.path` (and optionally `target.asset`), it
-also opts into global logical resource redirection. The declaration still does
-not control drawing; `handling=skip` remains a `Render` operation.
-
-### 8.1 Resource files
-
-`*.mesh` is one Unity Mesh-equivalent resource. It must preserve every source
-field required for a faithful round trip: positions, original normals and
-tangents, every UV channel, vertex colours, index buffers, submeshes, skin
-weights, bind poses, blend shapes, and the submesh-to-material-slot mapping.
-The writer chooses 16- or 32-bit indices according to the data. It records the
-source coordinate marker; Blender applies the documented X-axis handedness
-flip to the already Z-up Mesh channels and reverses it on export, so a round
-trip does not change axes, scale, winding, normals, or tangents. This Mesh
-conversion must not be reused verbatim for prefab Transform TRS, which is
-Y-up.
-
-The first binary layout is little-endian and versioned. It begins with
-`EIEMESH\0`, version, coordinate-space marker, source logical path and name;
-it then writes vertex arrays, eight independent UV arrays, normalized triangle
-indices, submesh index ranges, four-weight skinning data, bind poses, bone-name
-hashes, and complete blend-shape data. Submesh ranges address the normalized
-triangle index list, never Unity's original byte offsets. A reader must reject
-an unknown version instead of guessing its layout.
-
-`*.skeleton` is the same file on import and export. It records the complete
-prefab Transform hierarchy, relative paths, parent relationships and local
-TRS. Renderer-local bone palettes and bind poses belong to each `*.mesh`, not
-to this shared hierarchy. An author may elect not to export a skeleton and thereby inherit the
-original game's bones unchanged. If a skeleton is exported and modified, the
-runtime must really consume it; adding or removing bones is not silently
-claimed as supported until Animator, Avatar and physics compatibility are
-implemented.
-
-Its first binary layout starts with `EIESKEL\0`, version and coordinate-space
-marker, followed by the union of every `SkinnedMeshRenderer.bones[]` Transform
-and the ancestors required to preserve that hierarchy. Renderer, LODGroup and
-shadow-proxy GameObjects are not bones and are excluded. Renderer-local palette
-order remains in each EIEMESH through exact bone paths, including palette
-entries that currently have zero vertex weight. This mirrors Unity's actual
-binding relation: Mesh weights index `SkinnedMeshRenderer.bones[]`; a Mesh does
-not directly refer to a standalone skeleton asset.
-
-`*.mat` is one material authoring file. Its source field names the original
-game Material by logical resource path. The current offline package records the
-complete serialized saved-property snapshot with its real property names and
-types (`Texture`, `Float`, `Range`, `Color`/`Vector`, and integer where exposed).
-The serialized `*.mat` values refer to declared texture resources. In Blender,
-those texture properties are deliberately placed first in Material Custom
-Properties and display editable absolute image paths instead of internal INI
-section names. On export the add-on reuses the matching Texture section, or
-creates one for a newly entered image path and copies the source slot's colour,
-mipmap and sampler metadata. Runtime construction first clones the source
-Material, so shader, keywords and properties not represented by the authoring
-file remain inherited.
-
-Textures are external PNG files for the first version. AnimeStudio records the
-source texture's linear/sRGB choice, mipmap flag, filter mode, wrap mode,
-anisotropy and mip bias. The runtime recreates those settings around Unity's
-`ImageConversion.LoadImage` result; texture scale and offset remain Material
-properties. Users do not need to author BC5, BC7 or DDS files.
-
-### 8.2 INI syntax
+# 模型、材质、贴图替换：当前设计
+
+状态：v31 架构清理。大世界替换有用户验证；v30 修复了 UI 回调崩溃，
+v31 的完整游戏场景回归尚未验收。不能把赋值成功、编译成功当成画面正确。
+
+## 1. 核心职责
+
+替换按 Mesh 资源身份选中**所有匹配的 Renderer 实例**，操作在实例上执行。
+不是重新打包，也不是覆盖 VFS 文件。PFB 可提供模型根和可选作用域，
+但不是独立资源身份证明；不同 PFB 可以使用同一个 Mesh。
+
+| Module | Interface：调用者需要知道的事 | Implementation |
+|---|---|---|
+| Mod document | INI 输入，得到资源声明与 Render 动作，出错有行号 | `eiem_mod_document.h`；无 Unity、线程或全局配置状态 |
+| Mod program | 按 mod/section 查声明，取顶层 Render 集合 | `eiem_mods.h`；一次发布配置和预计算的引用索引 |
+| Mod update | 提交 Reconcile / Reapply / Reload 请求 | `eiem_mod_update.h`；合并请求，明确恢复、发布、重应用顺序 |
+| Render 执行 | 模型根或 Renderer + 规则集合 | `il2cpp_trace.h` 中唯一 `EiemApplyRenderRuleSet` 路径 |
+| Resource backend | 根据声明构造 Mesh、材质克隆、贴图 | `eiem_resource_backend.h`；格式检查、Unity API、资源缓存 |
+| Blender authoring | 导入离线资源、编辑、输出资源与 INI | Blender addon；不把运行时语法当作工程里唯一的数据源 |
+
+`il2cpp_trace.h` 仍偏大，包含观察器、生命周期适配和执行 Implementation。
+本轮没有为了目录好看把它拆成循环引用的几个头文件；后续应通过真实 Interface
+提取实例/资源所有权，而非把同一组全局变量分散到不同文件。
+
+## 2. 现在支持的 INI 语义
 
 ```ini
-[TextureWulfaBody]
-path=textures/wulfa_body.png
+[MeshBody]
+path=meshes/body.mesh
+target.path=assets/.../body.asset
+target.asset=Body
 
-[MaterialWulfaBody]
-path=materials/wulfa_body.mat
+[MaterialCloth]
+path=materials/cloth.mat
 
-[MeshWulfaBodyLod0]
-path=meshes/wulfa_body_lod0.mesh
-target.path=assets/beyond/arts/entity/actor/loli/wulfa/models/s_actor_wulfa_body_01_lod0.asset
-target.asset=S_actor_wulfa_body_01_lod0
+[TextureCloth]
+path=textures/cloth.png
+linear=false
+mipmaps=true
+filter=1
+wrap=0
+aniso=1
+mip_bias=0
 
-[RenderWulfaBodyLod0]
-path=assets/beyond/arts/entity/actor/loli/wulfa/models/s_actor_wulfa_body_01_lod0.asset
-asset=S_actor_wulfa_body_01_lod0
-match.vertices=4902
-match.indices=23220
-match.submeshes=1
-mesh=MeshWulfaBodyLod0
-material.0=MaterialWulfaBody
-partner.0=RenderWulfaShoe
+[RenderBody]
+asset=Body
+mesh=MeshBody
+material.0=MaterialCloth
+partner.0=RenderAccessory
+
+[RenderAccessory]
+mesh=MeshAccessory
+
+[MeshAccessory]
+path=meshes/accessory.mesh
 ```
 
-`target.path` remains available for global Material/Texture object redirection
-at the final `FAssetProxyHandle.Get` boundary. Mesh declarations are instead
-consumed by the logical `SubMeshInfo.set_mesh` hook, because cached or
-prefab-embedded Meshes can bypass the loader entirely. A `Render` block is
-still required for per-instance actions such as skipping the original draw or
-changing a material slot.
+- Mesh / Material / Texture / Skeleton 是资源声明，不执行替换。
+  `source`、`asset`、`target.*` 是来源/创作信息，不暗中触发全局重定向。
+- 未被 Prefab 或 partner 引用、且具有选择器的 Render 是顶层规则。
+  `asset=` 匹配原 Mesh 对象名称，不是 Renderer 实例名。
+- `Render.mesh` 给命中的**原 Renderer**换 Mesh；不是创建另一份绘制。
+- `handling=skip` 仅禁用命中的原 Renderer，与 `mesh=` 独立。
+  同时设置则绑定新 Mesh 后保持原 Renderer 禁用。
+- `partner.N` 显式创建额外 Renderer，跟随原实例生命周期。
+  partner 模板不会自动提升为顶层命中规则。
+- `material.N` 是该 Renderer 的材质槽；没指定的槽保留源值。
+  Mesh 文件记录 submesh，但不嵌入材质文件身份。
+- `submesh.N=M` 可将 submesh N 映射到材质槽 M。槽号是资源布局，
+  删除槽 0 的全部面不能把槽 1 自动重编号为 0。
+- `match.vertices/indices/submeshes` 是可选附加条件，不是必须写的身份。
+- 同一规则集合按配置顺序采用第一条命中的规则。文件夹按不区分大小写排序，
+  根 `plugin/mods/mod.ini` 最后读取；不要依赖操作系统枚举顺序。
+- 多个作用域都命中同一 Renderer 时的完整冲突/合并政策还未设计。
+  当前不要把相互矛盾的规则分散到多个作用域，再假设它们会自动合成。
 
-The section name inside `[]` uses plain identifiers without dots. Dots are
-reserved for indexed keys such as `material.0` and `partner.0`.
+资源路径与 Transform 路径必须区分：
 
-The `.mat` file referenced above can be represented as simple typed text while
-the final parser is implemented, for example:
+- `Mesh.path` / `Material.path` / `Texture.path`：mod 内磁盘文件。
+- `Prefab.path`：游戏逻辑 PFB 路径。
+- 现有 `Render.path`：相对模型根的 Transform 路径，不是逻辑 .asset 路径。
+  普通 Blender 导出不再生成这个易混淆的字段，只生成 `Render.asset`。
+- 仅靠名称不能证明跨所有包的资源身份唯一；运行时已观察到的逻辑路径
+  是辅助来源信息，不能把它宣称为普遍可拦截的文件请求。
+
+可选的 PFB 作用域如下（不要求普通 mod 写）：
 
 ```ini
-source=assets/beyond/.../M_actor_other_body
-texture._BaseMap=TextureWulfaBody
-color._Color=1,1,1,1
-float._Metallic=0.2
+[PrefabExample]
+path=assets/.../example.prefab
+render.0=RenderBody
 ```
 
-The source Material is always loaded by its game logical path and then copied.
-There is no `from=original` branch and no material source chosen from only the
-currently visible scene. This permits using a material from an unloaded
-character.
+其作用仅是选择规则集合，然后调用与顶层规则相同的执行器。
+不再保留一套只处理 SkinnedMeshRenderer 的 PFB 专用替换循环。
 
-`Render.path` is the source Mesh's logical game path. `Render.asset` identifies
-the Mesh sub-resource inside that file, and `match.vertices`, `match.indices`
-and `match.submeshes` are optional structure fingerprints. The exporter may
-provide them to make a match stricter; they are not required when `path` and
-`asset` are already unique. The exporter never exposes Bundle hashes,
-physical `.ab` paths or pointers.
+## 3. 解析与发布约束
 
-Submesh/material assembly is declared by `Render`, while Mesh, Material and
-Texture sections remain resource declarations. A Render's identity fields are
-evaluated wherever the matching source Mesh is assigned, including ordinary,
-shadow and LOD Renderers that share it. A separate Render rule is used when
-those LODs or instances need different edits.
+- 文本解析与规则执行分开；字段解析不创建 Unity 对象。
+- 支持 UTF-8 BOM、CRLF、整行分号/井号注释。
+- 关键数字必须完整有效；`12garbage` 不当成 12。
+- 重复 `material.N` 更新该槽，不追加重复槽记录。
+- 同一文件内重复 section 报错，不再让资源查找“取第一条”而 Render 查找“取最后一条”。
+- 不完整语句、未知 handling、坏数字不会静默变成无条件执行。
+  非法文件不发布其前半部分；记录文件和行号，跳过该文件，不偷偷保留旧版动作。
+- 当前尚无条件语句、变量、按键配置 DSL。不能把 `if` 当注释吞掉。
+- 部分元数据键允许保持为离线信息；这不是完整 schema 验证器。
+  长度截断、跨节引用和循环引用诊断仍有待完善，见审查记录。
+- 现有固定数组容量是实现限制，不是已证明的 Unity 上限；后续语法设计不能继续随意加魔法数字。
 
-The operation set is intentionally small:
+## 4. 生命周期和热更新
 
 ```text
-mesh present                     assign the named Mesh to the matched source Renderer
-handling=skip                    disable the matched source Renderer
-partner.N                        create an additional Renderer from that Render record
-neither                          leave the matched source Renderer unchanged
+启动：读取并发布 Mod program → 安装 hooks
+模型完成/重新启用：模型根 → 规则集合 → 匹配原 Mesh → Render 操作
+共享 Mesh 重新赋值：保留已有绑定，或执行相同的顶层 Mesh 规则
+材质控制器提交：对已绑定 Renderer 重应用材质部分
+
+F10/管理器：提交 Reload 请求
+Unity 主线程：恢复旧效果 → 读取/发布新 program → 重应用已登记实例
+
+后续状态变化：提交 Reapply 请求
+Unity 主线程：恢复旧效果 → 用当前 program 重应用（不读磁盘）
 ```
 
-`mesh` and `handling=skip` are independent. With `mesh` and no
-`handling=skip`, the named Mesh is assigned to the matched source Renderer.
-With both present, the named Mesh is assigned first and the same source
-Renderer is then disabled. No implicit replacement or partner Renderer is
-created; use an explicit `partner.N` entry when an additional draw is wanted.
-`handling=skip` without `mesh` only disables the matched source Renderer.
-`partner.N` always means an additional Renderer; it never replaces the source
-Renderer and it never performs another match. There is no `clone`, `override`,
-implicit duplication, polling reload, or condition language in v1. Resource
-declarations remain separate from the Render record that organizes them.
-
-When `mesh` is present on the matching Render, the plugin assigns one cached
-Mesh resource to the existing source Renderer. The existing `bones[]`,
-`rootBone`, Animator, LOD and physics remain owned by the game. Omitted
-material slots retain the source Renderer values. For each `partner.N`, the
-plugin creates a separate Renderer, copies the source Transform's local
-position, rotation and scale, plus bones,
-`rootBone`, relevant Renderer settings and LOD membership, then applies the
-partner's Mesh and material slots. Partner objects are tracked and destroyed
-or recreated together with their source Renderer.
-
-### 8.3 LOD and Blender contract
-
-Each distinct source LOD Mesh remains an independent resource and Render rule.
-Repeated Renderer instances that reference the same Mesh do not create extra
-Blender objects or package records. Users may intentionally reuse one edited
-Mesh across several LOD rules, but the exporter never does so implicitly.
-
-The Blender add-on presents the original Mesh resource path, LOD,
-material slots, material source paths, shader parameter names/types and texture
-bindings as an explicit editing workflow. It must not require a user to inspect
-Bundle hashes or maintain hidden metadata. The exact Blender UI may use
-dedicated panels, collections or helper objects, but it must remain visible and
-low-friction; that UI is designed separately from this file format.
-
-The runtime reload is manual: a configured hotkey schedules reload on the game
-thread, removes objects/resources created by the previous application, reads
-the changed package, and reapplies its rules. It does not poll the filesystem.
-
-## 9. Milestones and acceptance criteria
-
-### Dump UI contract (agreed)
-
-The in-game Ins panel exposes exactly two dump actions:
-
-- `Dump Current`: dump the selected Mesh and its complete dependency closure.
-- `Full Dump`: dump every Mesh/Renderer resource reachable from the current
-  scene, including inactive LOD objects and their dependency closures.
-
-Both actions include all resolvable LOD levels. `Full Dump` means the current
-scene and its serialized/resource dependencies; it does not scan or decrypt the
-entire VFS. The user chooses the output directory. The dump writes a readable
-directory tree plus a machine-readable `manifest.json` containing the game
-build, logical paths, type, PathID, source Bundle, renderer path, LOD,
-SubMesh/material-slot mapping, and unresolved references.
-
-The Mesh list has an independent `Highlight` checkbox. Highlighting is
-temporary and applies only to Mesh users in the scene; it must be removed on
-uncheck, scene unload, object destruction, or plugin shutdown. It must not
-mutate the original Material or Shader.
-
-The first implementation must preserve the distinction between an asset file
-and the objects serialized inside it. A Prefab is one file in the dump tree;
-its contained Meshes and references are represented in `manifest.json` and are
-not emitted as duplicate virtual files.
-
-Known implementation boundaries:
-
-- inactive LODs that are present in the instantiated hierarchy can be dumped;
-  LODs held only in an unresolved/unloaded external asset must be reported as
-  unresolved rather than silently omitted;
-- true 3D outline rendering is a separate renderer task and must not block the
-  first metadata/export pass;
-- Unity/IL2CPP object enumeration and object creation run on the game main
-  thread; disk serialization runs off-thread after data has been copied;
-- a failed dependency or unsupported object type falls back to the original
-  game object and is recorded in the manifest/report.
-
-### M0: Metadata discovery
-
-- Dump is generated on game startup.
-- Resource-related classes and methods are present in the dump.
-- No managed calls or model changes occur during discovery.
-
-### M1: Resource observation
-
-- Log one complete original model load path.
-- Identify sync/async behavior and requested asset types.
-- Confirm whether the game uses encryption or a custom resource layer.
-
-### M2: Same-skeleton renderer replacement
-
-- Replace one known character Mesh and material.
-- Original Animator, IK, cloth, and gameplay remain active.
-- Stop/reload/character-switch restores or reapplies the correct state.
-
-Endfield performs additional character skinning/GPU setup after
-`NPCAvatarCreatorUtils.CreateSMSGO` and
-`CreateSMSInfoForPostModel` produce their `SkinnedMeshRenderer[]` outputs.
-Assigning `sharedMesh` after that setup can produce a valid Unity Mesh pointer
-and valid public arrays while drawing no geometry. Character Mesh rules are
-therefore mounted into those output arrays before the caller continues into
-the game's skin assignment and cache setup.
-Scene reconciliation is retained for lifecycle recovery and per-Renderer
-operations; it is not the primary construction boundary for skinned Meshes.
-
-### M3: Resource or object redirection
-
-- Redirect or patch one known asset using the backend selected from M1.
-- Keep dependencies and replacement artifact lifetime valid where applicable.
-- Fall back cleanly on load or type mismatch.
-
-The current implementation performs object-level redirect in
-`FAssetProxyHandle.Get` and `FAssetProxyUntrackedHandle.Get` for declared
-resources, including Meshes. Mesh replacement is therefore decided before
-Renderer construction; the original resource manager and VFS remain
-pass-through for identity and decryption. The Renderer reconciliation pass may
-still apply non-Mesh directives such as `handling=skip` or material changes,
-but it is forbidden from replacing Meshes.
-
-### M4: Multi-profile and versioning
-
-- Separate replacement profiles from code.
-- Detect unsupported game builds.
-- Disable only the incompatible profile instead of installing unsafe hooks.
-
-## 10. Current limitations and risks
-
-- Shutdown handling now sets a process-wide exit flag, restores the game
-  window procedure before forwarding close messages, wakes the GUI thread, and
-  disables MinHook asynchronously after the original close callback returns.
-  The new build still needs one normal in-game exit verification before any
-  replacement work is considered stable.
-- IL2CPP metadata and generated method layouts are not a stable public ABI.
-- Unity object creation and resource APIs generally need the Unity main thread.
-- Existing EIEM hooks and face/IK logic may overwrite replacement transforms.
-- The game may use custom native resource code that is invisible to managed
-  type metadata.
-- Game Terms of Service and account risk remain outside the technical design.
-
-## 11. Implemented model dump v1
-
-The in-game Dump tab now keeps the two agreed actions. `Dump Current` writes a
-reference manifest for the checked, deduplicated Mesh objects; `Full Dump`
-writes every Mesh observed in the current scene. These actions do not read
-vertex buffers or instantiate assets. They serialize runtime names, hierarchy,
-LOD and identity metadata plus the observed Bundle list; the offline
-AnimeStudio index resolves the actual files.
-
-The runtime reference dump contains:
-
-```text
-plugin/dumps/
-  scene_dump_current.json
-  scene_dump_full.json
-```
-
-Schema 2 records include `lookupType`, `lookupName`, `hierarchy`, `lod`, and a
-process-independent `identityHash`. They also snapshot the selected
-Renderer's material slots, shader names, texture-property-to-texture bindings,
-and, for `SkinnedMeshRenderer`, the bone names and root bone. `lookupName` and
-the dependency names are selectors for the offline index; native object
-pointers remain diagnostic only and are never used as persistent identity.
-
-The resource-load hooks connect `_LoadAssetInternal` proxy handles and
-`Asset._FinishWithAsset` completions to the resulting Unity object. When this
-evidence is available, Mesh, Material and Texture records also carry
-`runtimePathHash`, `runtimePath`, and a logical `container`. The mapping uses a
-fixed-size four-way pointer table: it allocates nothing in resource hooks and
-does not grow with play time. A resource that cannot be tied to a logical path
-is explicitly marked `resolution: name-only`.
-
-AnimeStudio's `Export EIEM from JSON...` action resolves the Mesh, Material and
-Texture selectors from the compact Endfield index, loads each required source
-Bundle only once, and exports the actual resources. Resolution performs one
-pass over the compact index rather than one full scan per dependency. The
-exported Material JSON supplies serialized shader/material parameters; the
-runtime plugin does not guess or duplicate those values. If a name-only
-selector matches multiple indexed resources, AnimeStudio reports it as
-ambiguous and skips it instead of silently exporting an arbitrary same-named
-asset.
-
-The older geometry exporter is retained only as an internal validation tool;
-it is not used by the Dump-tab buttons because runtime vertex reads were
-already shown to be unreliable for this client. Texture pixels and serialized
-material parameter values are resolved from the offline Bundle index instead
- of guessed from native memory. Complete prefab, animation and cloth/physics
-dependency traversal remains a later layer; it must not be presented as part
-of this Mesh/Material/Texture milestone.
-
-## 12. Runtime skinning diagnosis (2026-09-04)
-
-The fresh EIEM Mesh constructor produced the expected payload sizes
-(`2451` vertices, `1` submesh, `12207` indices, `2451` weights and `99`
-bindposes). Static comparison of the source and half-mesh payloads found that
-the retained vertices preserve their original weights, bindposes and bone hash
-order. The exported skeleton has 523 transform nodes and a compact 99-bone
-renderer palette; all 99 payload hashes match the complete transform paths in
-that palette in the same order. Therefore the half-mesh file is not currently
-known to contain a bad weight or bindpose.
-
-The live log showed `DEBUG-SKIN-PALETTE status=identity exact=0 suffix=99`.
-The runtime check now resolves complete paths first, then uses suffixes only
-when they are unique and explicitly records the first twelve
-payload-index-to-live-bone mappings. A zero exact-match count is expected when
-the runtime hierarchy has a different instance root; it is not a defect by
-itself. The decisive checks are unique suffixes, the expected palette count,
-and an unchanged index mapping. An ambiguous suffix or a non-identity mapping
-must be treated as a real skinning error rather than guessed through.
-
-The runtime now also observes `SkinnedMeshRenderer.set_bones` only for tracked
-replacement instances. The hook forwards the setter unchanged and records the
-final palette count and first entries as `DEBUG-SKIN-BONES`; it is diagnostic
-only and does not rewrite the game's bone array.
-
-The same log showed every `CreateSMSGO`/`AssignSkin` boundary with
-`prepared=0`; the old implementation therefore attached the replacement only
-from the late `SkinnedMeshRenderer.sharedMesh` reconciliation path, after
-Endfield's own skin/GPU state had been initialized. That path has now been
-removed for Meshes. The replacement is first attempted at the proxy resource
-return, with the logical SubMeshInfo/construction hooks covering direct cached
-asset paths. No weight or coordinate conversion should be changed until the
-early resource boundary is observed and its input Mesh is confirmed.
-
-### Skin palette preservation rule
-
-Reducing a mesh's vertex count must never reduce its skin palette. The export
-must preserve the complete `bindposes` and bone-identity table from the source
-mesh, including bones currently referenced only by zero-weight vertices (or not
-referenced by the reduced vertex subset). Vertex weights may be filtered with
-the retained vertices, but palette entries remain in their original order so
-the game's per-part indices still address the same transforms. Blender cleanup
-must therefore not remove apparently unused vertex groups or reorder them.
-
-This is especially important for Endfield's custom path: the normal Unity
-`SkinnedMeshRenderer.bones[]` array is only one input. The game also has
-per-part `VirtualMeshBoneWeight`, `skinBoneTransformIndices`, and
-`skinBoneBindPoses` buffers, populated before the Burst skinning kernels run.
-Replacing the public Mesh after those buffers are built can leave the source
-geometry's metadata paired with the replacement vertices, producing the
-observed twist. The replacement must enter before that custom import/cache
-step, or explicitly rebuild the same per-part buffers; CPU-side pre-skinned
-geometry is not equivalent because it bypasses the game's animation and
-rendering path.
-
-### v20 single-run discriminator
-
-The current visual result is animated but twisted. That proves the replacement
-is reaching a skinning path; it does not prove that the payload palette matches
-the live source Mesh. The next probe compares the retained payload directly
-against the runtime source Mesh before assignment and against the generated
-Mesh after construction. It reports positions, each vertex's four floating
-weights, each vertex's four integer bone indices, and all bind-pose matrices
-under the unique prefix `DEBUG-SKIN-DIFF`. It also fingerprints the 99 live
-Transform references and their `localToWorldMatrix` values before construction
-and after assignment.
-
-Only two outcomes are actionable:
-
-1. Any source comparison differs: the offline extraction or exchange-format
-   conversion is wrong, and the first differing channel identifies the format
-   defect.
-2. Source and replacement comparisons are exact while Transform references
-   stay unchanged: the public Unity Mesh data is correct, so the distortion is
-   caused by Endfield's already-built per-part GPU skin cache. The next change
-   must move replacement before that cache import or rebuild the single
-   confirmed cache owner; changing weights, bind poses, coordinates, or bone
-   names would be unjustified.
-
-There is deliberately no fallback behavior in this probe. One target run must
-decide between payload corruption and replacement timing.
-
-### v20 observed result
-
-The target run proved that the reduced Mesh is constructed and remains bound
-to the intended renderer. Its 2,451 weights and 99 bind poses read back exactly
-after construction. The renderer's 99 `bones[]` references and their animated
-`localToWorldMatrix` fingerprint also remain unchanged across assignment, and
-the payload bone-hash palette resolves to the same live indices 0 through 98.
-
-The only mismatch is between the offline payload and the original runtime
-Mesh's public `boneWeights` and `bindposes`: all compared entries differ. The
-source vertex array is not readable, so it cannot be used as evidence either
-way. This rules out setter failure, replacement loss, and mutation of the live
-Transform array, but does not yet distinguish a C++ value-type layout error
-from a load-time skin-table transformation performed by the game.
-
-The v21 probe therefore logs the actual IL2CPP field offsets and value sizes
-for `UnityEngine.BoneWeight` and `UnityEngine.Matrix4x4`, plus the first three
-weights and first bind pose from both the offline payload and runtime Mesh. It
-also tests whether the bind-pose difference is merely a matrix transpose. No
-runtime behavior or fallback is changed by this probe.
-
-### v21 result and v22 correction
-
-The runtime metadata reports `BoneWeight` as 32 bytes with four floats followed
-by four 32-bit indices, and `Matrix4x4` as 64 bytes in Unity's managed field
-order. These layouts exactly match the native EIEM structs. The live renderer
-bone palette is also identity-mapped, so neither struct packing nor bone-index
-remapping caused the distortion.
-
-The original Mesh's first bind pose is the exact transpose of the offline
-payload, and the same relation holds for all 99 matrices with zero error. The
-AnimeStudio export boundary was therefore writing Unity's serialized asset
-matrix order directly into the managed `Mesh.bindposes` order. Version 2 of
-the mesh exchange format transposes bind poses once in AnimeStudio and stores
-the canonical managed/runtime order. Blender preserves that canonical array
-unchanged. The runtime accepts v2 and v3; both use the corrected matrix order,
-while v3 adds authoring-only shared-skeleton palette paths.
-
-The original Mesh's legacy `boneWeights` getter returns 4,902 zero-filled
-entries in this title, while the raw vertex stream and replacement readback
-contain the expected non-zero weights. This is evidence that Endfield's source
-asset uses a newer/compressed weight path; it is not a reason to copy those
-zero values into the replacement. The v22 correction changes only bind-pose
-ordering and retains the payload weights and local bone indices.
-
-### EIEMESH v3 Blender resource model
-
-The authoring pipeline imports resources, not instantiated renderer copies.
-One unique Prefab transform hierarchy becomes one Blender Armature. A Mesh's
-compact bone indices do not identify separate skeletons: they address a local
-palette whose entries point into that shared hierarchy. EIEMESH v3 therefore
-stores those palette entries as transform paths alongside the existing bone
-hashes and bind poses. This is required because some exported game bone hashes
-cannot be reconstructed reliably from Prefab node names. EIEMESH v2 remains
-readable by migrating its exact renderer palette during import; all new
-AnimeStudio and Blender exports use v3.
-
-Blender import maps source channels as follows:
-
-- UV0 through UV7 become Blender UV layers. Three- and four-component UVs keep
-  XY in the UV layer and Z/W in a named point-domain Mesh Attribute.
-- Vertex colours become a point-domain Color Attribute named `Color`.
-- BlendShape channels and frames become editable Shape Keys; source normal and
-  tangent deltas use named point-domain Mesh Attributes because Blender has no
-  native editable container for those deltas.
-- Source normals are assigned to Blender's native per-corner custom-normal
-  channel and every imported face uses smooth shading. Because the X-axis
-  handedness reflection also reverses face orientation, import reverses each
-  triangle's winding and export reverses it back; omitting this step makes
-  Blender clamp otherwise valid authored normals against backwards faces.
-- Blender encodes custom normals in a face-fan-relative representation, whose
-  decoded values may be slightly quantized. `EIEM_SourceNormal` is therefore a
-  lossless point-domain backup used only while a checksum proves that the
-  native normal state is untouched. Once the user edits Blender's native
-  normals, export writes the evaluated edited normals instead. EIEMESH has one
-  normal per vertex, so a deliberate per-corner normal split must first split
-  that vertex or export fails explicitly.
-- Tangents remain named point-domain Mesh Attributes because Blender does not
-  provide an equivalent authorable tangent channel; they are not used as a
-  substitute for viewport normal shading.
-
-Export reads those same locations and rejects ambiguous per-corner UV or colour
-seams instead of silently choosing one value for an EIEM per-vertex channel.
-Meshes are grouped into LOD collections by their resource identity, while the
-single shared Armature remains at the package root. A Typhoea round-trip test
-currently covers 62 Mesh resources, 14 multi-UV Meshes, three tangent-bearing
-Meshes, two BlendShape-bearing Meshes and one unique skeleton hierarchy.
-
-### Blender skeleton-space diagnosis (2026-09-04)
-
-The first shared-Armature importer composed raw prefab Transform TRS directly
-as Blender edit-bone matrices. That put the biped along Blender Y while the
-Mesh was already upright on Blender Z, so the Armature visibly lay on its
-back. This was a real resource-space mismatch, not an octahedral-display or
-bone-roll artifact.
-
-The deterministic check compares named biped bones against the skinned Mesh
-space. Before the fix, the head was approximately `(0, 1.269, -0.011)`; after
-the Unity-Transform conversion it is `(0, 0.011, 1.269)`. Left and right thigh
-bones also align with their weighted vertex sides. The importer now conjugates
-the complete composed Transform matrix by the Unity-Y-up to Blender-Z-up basis
-instead of remapping quaternion components independently.
-
-### Skeleton membership and material/texture audit (2026-09-04)
-
-The earlier skeleton writer serialized all 556 Transform nodes in the Prefab,
-which incorrectly turned LOD containers, renderer GameObjects and shadow-proxy
-nodes into Blender bones. The writer now derives membership only from every
-SkinnedMeshRenderer bone palette and rootBone, then includes the required
-ancestors in original hierarchy order. The Typhoea result contains one
-316-node Armature, zero names matching LOD/shadowProxy, and zero unresolved
-palette paths across all 62 Mesh resources.
-
-The same audit found two blocking material round-trip defects:
-
-- The runtime selected `Material` construction by argument count. Endfield's
-  metadata shows that address was `Material(Shader)`, while the required
-  `Material(Material)` constructor is a different overload. Resolution now
-  uses the exact `UnityEngine.Material` parameter type.
-- Blender previously created materials from only their `mod.ini` declaration;
-  it never read the referenced `.mat`, and export emitted neither Texture
-  declarations nor PNG files. Import now reads every EIEMMAT file, and export
-  writes each unique Material and Texture resource exactly once.
-- Blender also previously inferred a Material `target.path` from its `source`.
-  That silently changed a renderer-local material clone into a global resource
-  redirect after one round trip. Import now preserves a global target only
-  when the resource declaration explicitly contains one.
-
-Texture declarations additionally carry source color-space/mipmap/sampler
-metadata. Runtime PNG decoding checks the returned Boolean, applies those
-settings, and verifies every Material texture assignment with `GetTexture`.
-Renderer material-array assignment is also read back element-by-element, so a
-failed IL2CPP setter is reported instead of being mistaken for success.
-The Blender regression package now verifies 62 Meshes, one skeleton, 31
-Materials and 65 Textures; all references resolve and all 65 untouched PNGs
-round-trip byte-for-byte. A separate edit probe changes a saved float and a
-`texture.*` reference in Blender, then verifies both values in the exported
-EIEMMAT while the Render material-slot references remain intact.
-
-Material and Texture `target.path` remain explicit opt-in global redirects.
-AnimeStudio does not enable them automatically for a model package: Render
-records assign cloned Materials to model renderers, and those Materials refer
-to Texture resources. This makes F10 restoration deterministic and avoids
-globally replacing every source texture merely because it was present in an
-offline authoring package. A live game test is still required before the
-Material/Texture runtime path is called end-to-end verified.
-
-### UI prefab coverage and material-handle correction (2026-09-04)
-
-The first successful Typhoea Mesh test applied in the open world but not in
-the character UI. Runtime metadata shows that the UI owns a separate
-`Beyond.UI.UIModelLoader`, while the successful lifecycle hooks were attached
-to gameplay `ModelManager` and `BaseModelViewPart`. This was a hook-coverage
-defect, not evidence that UI Meshes require a separate replacement model.
-
-Replacement now also enters through the common
-`Beyond.Resource.Runtime.PrefabInstantiateProxy.OnCompleted` boundary. After
-the game completes a prefab instance, EIEM traverses all child
-`SkinnedMeshRenderer` components, including inactive children, and applies the
-same resource-identity resolver used elsewhere. No UI-, character- or
-NPC-specific replacement rule is introduced. F10 reconciliation now prefers
-`Resources.FindObjectsOfTypeAll`, so already-loaded inactive and persistent UI
-instances are included without adding a polling loop.
-
-The missing texture had an independent, earlier failure. Logs showed
-`BundleResourceManager._LoadAssetInternal` returning a proxy, followed by
-`Game resource loader could not resolve source path`; therefore PNG decoding
-and `Material.SetTexture` were never reached. `BundleResourceManager.Load`
-returns the value type `FAssetProxyHandle`, and `il2cpp_runtime_invoke` returns
-that value boxed. EIEM was incorrectly calling `LoadImmediate` and `Get` with
-the boxed object header as `this`. The backend now resolves and uses the
-exported `il2cpp_object_unbox` API before invoking either instance method. The
-game's `RootCategory` is confirmed by runtime metadata to use `System.Byte`,
-so the existing one-byte `Main` argument remains correct.
-
-Static regression contracts cover the common prefab hook, inactive/persistent
-F10 enumeration, and mandatory value-type unboxing. The current
-`GameAssembly.dll` export table contains `il2cpp_object_unbox`, and the native
-DLL builds successfully. Visual confirmation of the UI Mesh and `_BaseMap`
-override remains the single required live-game check.
-
-### Material-controller lifecycle enforcement (2026-09-04)
-
-The next live test separated Mesh coverage from Material lifetime: the edited
-Mesh appeared in both paths and `_BaseMap` changed in the open world, while the
-character presentation view later showed the source texture. The UI target was
-already matched at `PrefabInstantiateProxy.OnCompleted`, and the cloned
-Material array passed immediate element-by-element read-back. This rules out
-resource identity, PNG decoding and the `_BaseMap` property name. The remaining
-lifetime gap is a later game-side material commit.
-
-The first attempted lifetime fix hooked Unity
-`Renderer.set_sharedMaterial`/`set_sharedMaterials`. A subsequent map-switch
-trace disproved that boundary: both hooks installed, but neither received a
-single game commit. In the same trace, one matched Renderer changed from three
-materials to two and then one, and a new UI Renderer was instantiated and
-successfully matched. Therefore the failure is neither a missing UI instance
-nor a lost Mesh identity; Endfield changes the material array through its own
-controller path without entering those public Unity wrappers.
-
-Runtime metadata identifies the actual owner as the nested
-`EntityRenderHelperMaterialController.RendererInfo`. It holds `m_renderer`,
-`sourceMaterials`, `replacingMaterials` and `materialReplacing`, and exposes
-`TrySetSharedMaterial`, `TrySetSharedMaterials` and
-`TryReplaceSharedMaterials`. EIEM now locates this class by that method shape,
-resolves `m_renderer` from IL2CPP field metadata, and hooks the three commit
-forms. Each detour calls the game first and then reapplies only the matched
-Render rule's Material slots to that Renderer. Mesh replacement,
-`handling=skip`, partners and scene-wide reconciliation are not run here.
-The ineffective Unity setter detours and their re-entry guard were removed.
-
-This remains common resource-rule behavior rather than a UI special case and
-adds no polling. Temporary `[DEBUG-matlifecycle]` records distinguish a
-controller array replacement (`reapplied`) from an unchanged material-array
-identity (`retained`). The latter result together with a visually reverted
-texture would prove a second mutation path inside the Material or a property
-block; that case must be fixed at its demonstrated boundary instead of adding
-a speculative fallback. One live `open presentation -> change map -> reopen
-presentation` trace is required to close the runtime regression loop.
+- Reconcile 只重试已登记模型；不会因初始 generation 不同而意外恢复启动 hooks 的成果。
+- 热键线程不再直接发布新配置。新配置不能在旧状态恢复前被 setter/材质 hook 看见。
+- 合并多个请求时，生命周期请求不能吞掉同时到达的 Reload。
+- 首次资源构造、恢复和实例操作仍限定在 Unity 线程。安全检查不是全部冗余：
+  失效对象、数组范围、类型/返回值、主线程约束不能为了少分支直接删除。
+- 无自动文件轮询，无全场景每帧扫描；Dump 页显式刷新是独立的观察功能。
+- UIModelLoader 异步调用只观察，原样传递游戏委托。不得再将原生代码地址当作
+  托管 MethodInfo 创建 delegate。UI 根由实际触发的 PFB/组件生命周期提交。
+- 所有权以具体模型实例记账；重复实例各自保留骨架、材质和状态。
+  这不表示已经覆盖所有未知游戏模型创建/销毁方式。
+
+## 5. 资源与 Blender
+
+- 离线包、Blender、DLL 使用 EIEMESH 与独立 .mat、贴图；不要求 FBX 中转。
+- 材质 .mat 指明游戏逻辑 `source=`，运行时加载该源材质再克隆。
+  例如 `texture._BaseMap=TextureCloth`、`float._SomeParameter=0.2`；
+  参数名来自实际材质，不编造通用游戏 Shader。
+- PNG 创建纹理时用声明的 linear/mipmap/sampler 设置；用户无需手工 DDS 压缩。
+- Blender 按资源去重，不为每个 Renderer 实例生成重复 Mesh/骨架；LOD 分集合便于编辑。
+  材质贴图路径优先显示，UV、颜色、形态键使用对应 Blender 数据。
+- 导出选中且修改的资源及依赖；新增网格通过明确 Render/partner 关系表达，
+  不靠合并模型继承一堆不透明自定义属性。
+- 旧 EIEMESH 输入版本及来源元数据不是旧运行时替换引擎。仍在使用的离线包
+  Reader 不因为“清理兼容”就任意删除，除非有迁移和等价验证。
+- 骨架编辑、同路径改像素的增量依赖、导出失败时保护旧输出等仍存在已记录限制；
+  本文不宣称这些已完整实现。
+
+## 6. 后续 if/endif、按键设计应落在哪里
+
+这次只搭接口，不预定用户尚未确认的语法：
+
+1. 解析器保留有顺序、可嵌套的语句信息；不能在读文件时简单删除“不成立”的行，
+   否则按键后无法重新求值。
+2. 变量/按键改变求值状态；状态层不直接调用 Unity，也不复制每种 hook 的逻辑。
+3. 求值结果交给现有 Render 执行模块；恢复与重应用走 Reapply，
+   修改磁盘文件才走 Reload。
+4. 资源声明与条件动作分离。Blender 项目保留语义数据，更新 exporter 后再生成新配置。
+5. 实例所有权、资源退休、规则冲突要先收敛，不能继续增加自动猜测或静默回退。
+
+本轮没有引入 VM、事件总线、插件接口层或第二套执行引擎。
+
+## 7. 验证与记录
+
+- `tests/test_mod_program.py`：真实文本解析/编译/排序，动作独立性，坏文件不部分发布，
+  更新请求合并及恢复→发布→应用顺序。
+- `tests/test_mesh_resource_cache.py`：真实缓存函数的七个状态场景。
+- `tests/test_ui_async_passthrough.py`：UI 回调原样传递的六个场景。
+- `tools/Blender/test_eiem_material_slot_gaps.py`：空材质槽、INI 槽号、重新导入一致。
+- 其余静态合同检查是代码组织护栏，不等同于游戏行为测试。
+- [架构审查与剩余风险](architecture-review-v1.md)
+- [UI 回调崩溃实证](debugging/2026-09-05-ui-callback-crash.md)
+- [历史设计与全部实验记录](archive/model-replacement-experiments.md)

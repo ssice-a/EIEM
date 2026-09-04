@@ -179,11 +179,6 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
     Log("[WARN] Failed to subclass game window (err=%lu)", GetLastError());
   }
 
-  LoadEiemConfig();
-  EiemReloadMods();
-  EiemQueueModReconcile("game window ready");
-  EiemScheduleLifecycleReconcile("game window ready");
-
   // Prefer thread hotkeys over GetAsyncKeyState. Endfield's input stack can
   // consume keyboard state in a way that leaves asynchronous polling blind,
   // while RegisterHotKey delivers an explicit WM_HOTKEY to this thread.
@@ -236,8 +231,7 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
     if (g_pluginActive && (modReloadHotkeyMessage || reloadPollingPressed)) {
       if (!reloadPressed) {
         reloadPressed = true;
-        EiemReloadMods();
-        EiemQueueModReconcile("mod reload hotkey");
+        EiemRequestModUpdate(EiemModUpdate::Reload, "mod reload hotkey");
         Log("[HOTKEY] Mod reload received via %s",
             modReloadHotkeyMessage ? "WM_HOTKEY" : "GetAsyncKeyState fallback");
       }
@@ -254,7 +248,6 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
       lastHotkeyDiag = now;
     }
 
-    EiemPumpLifecycleReconcile();
 
     Sleep(20);
   }
@@ -578,7 +571,7 @@ static DWORD WINAPI InitThread(LPVOID) {
       CreateFileA("plugin\\eiem_log.txt", GENERIC_WRITE, FILE_SHARE_READ, NULL,
                   CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
   Log("=== EIEM Phase 1: Skeleton Discovery ===");
-  Log("[BUILD] material-controller-lifecycle-v23 dll=%s %s", __DATE__,
+  Log("[BUILD] resource-runtime-v31-architecture-cleanup dll=%s %s", __DATE__,
       __TIME__);
 
   if (!Resolve()) {
@@ -614,6 +607,13 @@ static DWORD WINAPI InitThread(LPVOID) {
     Log("[FATAL] MinHook initialization failed");
     return 1;
   }
+
+  // Resource completion can begin before the game window and hotkey thread
+  // exist. Load the rules before enabling any resource hook so the first
+  // observed completion cannot commit an unmodified object due to startup
+  // ordering. Later reload requests are dispatched on Unity's thread.
+  LoadEiemConfig();
+  EiemReloadMods();
 
   Log("[RES-TRACE] Installing startup resource hooks before metadata dump");
   InitIl2CppResourceTrace(asms, ac);
@@ -998,6 +998,9 @@ static DWORD WINAPI InitThread(LPVOID) {
     Log("[OK] MeshFilter: get/set sharedMesh=%p/%p", g_meshFilter_get_sharedMesh,
         g_meshFilter_set_sharedMesh);
   }
+  g_meshRendererClass =
+      FindClass("UnityEngine", "MeshRenderer", asms, ac);
+  Log("[OK] MeshRenderer class: %p", g_meshRendererClass);
 
   void *rendererClass = FindClass("UnityEngine", "Renderer", asms, ac);
   if (rendererClass) {
@@ -1108,10 +1111,6 @@ static DWORD WINAPI InitThread(LPVOID) {
   } else {
     Log("[WARN] Mesh class NOT found");
   }
-
-  // All matching and resource APIs are now available. Queue the first scene
-  // pass rather than guessing from setter events that occurred during load.
-  EiemQueueModReconcile("initial mod load");
 
   g_cameraClass = FindClass("UnityEngine", "Camera", asms, ac);
   if (g_cameraClass) {
@@ -1371,12 +1370,6 @@ static DWORD WINAPI InitThread(LPVOID) {
             }
           }
           orig_SetMainCharacter(self, entity, flag);
-
-          // Unity may have assigned serialized renderer fields directly while
-          // instantiating this character, bypassing set_sharedMesh. Reconcile
-          // once through the window procedure after the switch completes.
-          EiemQueueModReconcile("main character changed");
-          EiemScheduleLifecycleReconcile("main character changed");
 
           s_ikDisabled = false;
           memset(s_bipedIK, 0, sizeof(s_bipedIK));

@@ -85,20 +85,9 @@ struct EiemNativeMeshDocument {
 // Y-up, left-handed mesh basis.  The earlier experimental package marker
 // called this Z-up and the runtime rotated vertices/bindposes on every load;
 // that mixed the mesh basis with the live bone palette and produced twisting.
-// Keep accepting the old marker as a compatibility alias, but do not mutate
-// the buffers at the Unity boundary: the package already stores native mesh
-// data and its bindposes in the exact basis consumed by SkinnedMeshRenderer.
-static bool EiemMeshUsesUnityYUp(const std::string &coordinateSpace) {
-  return _stricmp(coordinateSpace.c_str(), "unity-y-up-left-handed") == 0 ||
-         _stricmp(coordinateSpace.c_str(), "model-z-up-left-handed") == 0;
-}
-
-static void EiemConvertMeshDocumentToUnity(EiemNativeMeshDocument *document) {
-  if (!document || !EiemMeshUsesUnityYUp(document->coordinateSpace)) return;
-  // Native Unity basis: no coordinate conversion is required.  This function
-  // remains as the single format boundary so a future explicit coordinate
-  // marker can add a conversion without touching mesh construction.
-}
+// The package already stores native mesh data and bindposes in the exact
+// basis consumed by SkinnedMeshRenderer. Preserve the marker as metadata;
+// there is no coordinate conversion at this runtime boundary.
 
 class EiemNativeReader {
  public:
@@ -304,7 +293,6 @@ static bool EiemReadNativeMesh(const char *path, EiemNativeMeshDocument *out,
   }
   if (!EiemReadBlendShapes(reader, out) || !reader.End()) goto invalid;
   if (out->vertices.size() != (size_t)out->vertexCount || out->subMeshes.empty()) goto invalid;
-  EiemConvertMeshDocumentToUnity(out);
   return true;
 
 invalid:
@@ -1099,7 +1087,7 @@ static void *EiemBuildNativeMesh(const char *path, void *templateMesh,
     Invoke(s_eiemMeshSetIndexFormat, mesh, params);
   }
   auto setArray = [&](void *method, void *array) {
-    if (!method || !array) return true;
+    if (!method || !array) return false;
     void *params[] = {array};
     Invoke(method, mesh, params);
     return true;
@@ -1373,6 +1361,8 @@ static bool EiemBuildMeshResource(const EiemModRule &rule, void **outMesh,
     strncpy_s(fullPath, sizeof(fullPath), path, _TRUNCATE);
   const uint64_t fileStamp = EiemMeshResourceFileStamp(fullPath);
   const uint64_t skinPaletteKey = EiemSkinPaletteFingerprint(skinRenderer);
+  void *cachedMesh = nullptr;
+  uint32_t cachedHandle = 0;
   AcquireSRWLockExclusive(&s_eiemMeshResourceCacheLock);
   for (auto it = s_eiemMeshResourceCache.begin();
        it != s_eiemMeshResourceCache.end();) {
@@ -1383,27 +1373,27 @@ static bool EiemBuildMeshResource(const EiemModRule &rule, void **outMesh,
       ++it;
       continue;
     }
-    if (entry.fileStamp != fileStamp) {
-      // F10 restores every renderer before this path is reached, so an old
-      // generation cannot still reference the changed generated Mesh.
-      if (entry.handle && il2cpp_gchandle_free)
-        il2cpp_gchandle_free(entry.handle);
-      it = s_eiemMeshResourceCache.erase(it);
-      continue;
-    }
-    void *cached = il2cpp_gchandle_get_target
+    void *cached = entry.fileStamp == fileStamp && il2cpp_gchandle_get_target
                        ? il2cpp_gchandle_get_target(entry.handle)
                        : nullptr;
-    ReleaseSRWLockExclusive(&s_eiemMeshResourceCacheLock);
     if (cached) {
-      Log("[DEBUG-hr1] mesh cache hit mod=%s section=%s mesh=%p handle=%u",
-          resource.modPath, resource.section, cached, entry.handle);
-      if (outMesh) *outMesh = cached;
-      return true;
+      cachedMesh = cached;
+      cachedHandle = entry.handle;
+      break;
     }
-    ++it;
+    // Expired file data and a dead managed handle are both cache misses.
+    // Keep the iterator protected until lookup/eviction is complete.
+    if (entry.handle && il2cpp_gchandle_free)
+      il2cpp_gchandle_free(entry.handle);
+    it = s_eiemMeshResourceCache.erase(it);
   }
   ReleaseSRWLockExclusive(&s_eiemMeshResourceCacheLock);
+  if (cachedMesh) {
+    Log("[DEBUG-hr1] mesh cache hit mod=%s section=%s mesh=%p handle=%u",
+        resource.modPath, resource.section, cachedMesh, cachedHandle);
+    if (outMesh) *outMesh = cachedMesh;
+    return true;
+  }
 
   void *mesh = EiemBuildNativeMesh(fullPath, templateMesh, error, errorSize,
                                    skinRenderer);
@@ -1739,7 +1729,8 @@ static bool EiemBuildMaterialResource(const EiemModRule &rule, const char *secti
     if (error) strncpy_s(error, errorSize, "EIEM material has no source logical path", _TRUNCATE);
     return false;
   }
-  void *sourceMaterial = EiemLoadOriginalAsset(source.c_str(), s_eiemMaterialClass, error, errorSize);
+  void *sourceMaterial = EiemLoadOriginalAsset(
+      source.c_str(), s_eiemMaterialClass, error, errorSize);
   if (!sourceMaterial || !s_eiemMaterialClass || !s_eiemMaterialCtorCopy) return false;
   void *material = il2cpp_object_new(s_eiemMaterialClass);
   if (!material) {
@@ -1838,38 +1829,6 @@ static bool EiemBuildMaterialResource(const EiemModRule &rule, const char *secti
   EiemCacheObject(s_eiemMaterialResourceCache, &s_eiemMaterialResourceCacheLock,
                   resource.modPath, resource.section, dependencyStamp, material);
   return true;
-}
-
-// Build a declared resource for the global redirect path. This deliberately
-// reuses the same builders used by Render rules, so Blender-exported payloads
-// have one construction and caching path regardless of how they are reached.
-static bool EiemBuildGlobalResource(const EiemModResource &resource,
-                                    void *sourceObject, void **outObject, char *error,
-                                    size_t errorSize) {
-  if (outObject) *outObject = nullptr;
-  if (!resource.modPath[0] || !resource.section[0]) {
-    if (error) strncpy_s(error, errorSize, "Global resource declaration is invalid", _TRUNCATE);
-    return false;
-  }
-  EiemModRule rule = {};
-  EiemModInitRule(&rule);
-  strncpy_s(rule.modPath, sizeof(rule.modPath), resource.modPath, _TRUNCATE);
-  if (_stricmp(resource.kind, "Mesh") == 0) {
-    strncpy_s(rule.mesh, sizeof(rule.mesh), resource.section, _TRUNCATE);
-    rule.hasMesh = true;
-    // Build from the game object when possible. Beyond's custom skinning
-    // setup may retain native state not represented by public Mesh arrays.
-    return EiemBuildMeshResource(rule, outObject, error, errorSize,
-                                 sourceObject);
-  }
-  if (_stricmp(resource.kind, "Material") == 0)
-    return EiemBuildMaterialResource(rule, resource.section, outObject,
-                                     error, errorSize);
-  if (_stricmp(resource.kind, "Texture") == 0)
-    return EiemBuildTextureResource(rule, resource.section, outObject,
-                                    error, errorSize);
-  if (error) strncpy_s(error, errorSize, "Unsupported global resource type", _TRUNCATE);
-  return false;
 }
 
 static void EiemApplySubmeshMaterialMap(const EiemModRule &rule,

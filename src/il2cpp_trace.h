@@ -4,16 +4,15 @@
 #include <cstdio>
 #include <cstdint>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include "eiem_mods.h"
+#include "eiem_mod_update.h"
 #include "eiem_resource_backend.h"
 
 // Resource-loading hooks preserve the game's VFS/decryption pipeline and
-// observe logical identities. At the final proxy object boundary they can
-// redirect declared Mesh/Material/Texture resources; VFS path hooks retain
-// their plaintext-bundle diagnostic override as a separate legacy probe.
+// observe logical identities. Only the Render executor applies declared
+// replacement resources to the matching game instances.
 
 static volatile LONG s_traceLoadAssetCount = 0;
 static volatile LONG s_traceLoadAssetAsyncCount = 0;
@@ -31,18 +30,18 @@ static volatile LONG s_traceProxyGetCount = 0;
 static volatile LONG s_traceProxyAssetCount = 0;
 static volatile LONG s_traceVfsPathCount = 0;
 static volatile LONG s_traceStreamCaptureCount = 0;
-static thread_local bool s_vfsThreadAttached = false;
 static thread_local bool s_traceReentrant = false;
-static thread_local bool s_traceBuildingGlobalResource = false;
 static volatile LONG s_traceSetterThreadLogged = 0;
 static volatile LONG s_smsArrayProbeLogged = 0;
 static volatile LONG s_traceLogicalMeshFlowCount = 0;
 static volatile LONG s_traceSubMeshSetterCount = 0;
+static volatile LONG s_tracePrefabIdentityCount = 0;
 static volatile LONG s_traceBonesSetterCount = 0;
 static volatile LONG s_traceHgDataCount = 0;
 static volatile LONG s_traceHgStateCount = 0;
 static volatile LONG s_traceCharacterFlowCount = 0;
 static volatile LONG s_traceMaterialCommitCount = 0;
+static volatile LONG s_traceAvatarAssemblyCount = 0;
 
 // The manager often returns the same cached proxy repeatedly. Keep the first
 // sighting of each hash so completion records retain their own log budget.
@@ -145,8 +144,7 @@ static void *s_origCreateSmsGo = nullptr;
 static void *s_origCreateSmsPost = nullptr;
 static void *s_origAssignSkinPost = nullptr;
 // NPCAvatarCreatorUtils assigns the final Animator bone palette after the
-// renderer array has been created. Keep this as an observation boundary; Mesh
-// replacement must already have happened before this stage.
+// renderer array has been created. This remains observation-only.
 typedef void(__fastcall *TraceSetSmrRootBoneFn)(
     void *animator, void *renderers, void *rootBoneInfos, void *methodInfo);
 static void *s_origSetSmrRootBone = nullptr;
@@ -208,6 +206,22 @@ typedef void *(__fastcall *TraceModelManagerLoadHashFn)(void *self,
                                                          void *methodInfo);
 typedef void (__fastcall *TracePrefabInstantiateCompletedFn)(void *self,
                                                               void *methodInfo);
+typedef void (__fastcall *TracePrefabInstantiateLifecycleFn)(void *self,
+                                                              void *methodInfo);
+typedef void *(__fastcall *TraceUIModelLoaderLoadModelFn)(
+    void *self, void *path, void *parent, void *methodInfo);
+typedef int32_t (__fastcall *TraceUIModelLoaderLoadModelAsyncFn)(
+    void *self, void *path, void *parent, void *callback, void *methodInfo);
+typedef void (__fastcall *TraceUIModelLoaderUnloadModelFn)(void *self,
+                                                            void *model,
+                                                            void *methodInfo);
+typedef void (__fastcall *TraceUIModelLoaderLifecycleFn)(void *self,
+                                                          void *methodInfo);
+typedef void (__fastcall *TraceCharUIModelLifecycleFn)(void *self,
+                                                        void *methodInfo);
+typedef void (__fastcall *TraceCharUIModelSetVisibleFn)(void *self,
+                                                         bool visible,
+                                                         void *methodInfo);
 typedef void (__fastcall *TraceBaseModelLoadSyncFn)(void *self,
                                                      void *methodInfo);
 typedef void (__fastcall *TraceBaseModelLoadAsyncFn)(void *self,
@@ -235,7 +249,20 @@ static void *s_origModelManagerLoadAsyncString = nullptr;
 static void *s_origModelManagerGameObjectAllocate = nullptr;
 static void *s_origModelManagerLoadFromPersistentPool = nullptr;
 static void *s_origPrefabInstantiateCompleted = nullptr;
+static void *s_origPrefabInstantiateUnload = nullptr;
+static void *s_origPrefabInstantiateClear = nullptr;
+static void *s_origPrefabInstantiateDispose = nullptr;
 static void *s_prefabInstantiateGetGameObject = nullptr;
+static void *s_prefabInstantiateGetLogName = nullptr;
+static void *s_prefabInstantiateGetInstanceUid = nullptr;
+static void *s_origUIModelLoaderLoadModel = nullptr;
+static void *s_origUIModelLoaderLoadModelAsync = nullptr;
+static void *s_origUIModelLoaderUnloadModel = nullptr;
+static void *s_origUIModelLoaderClear = nullptr;
+static void *s_origUIModelLoaderDispose = nullptr;
+static void *s_origCharUIModelOnAwake = nullptr;
+static void *s_origCharUIModelSetVisible = nullptr;
+static void *s_origCharUIModelOnRelease = nullptr;
 static void *s_origBaseModelLoadSync = nullptr;
 static void *s_origBaseModelLoadAsync = nullptr;
 static void *s_origBaseModelFinish = nullptr;
@@ -246,6 +273,8 @@ static void *s_origBasePartLoadFinishCallback = nullptr;
 static void *s_origBasePartLoadFinishResult = nullptr;
 static void *s_origBasePartLoadUseHandleFinishCallback = nullptr;
 static void *s_origBasePartLoadUseHandleFinishResult = nullptr;
+static void *s_origBasePartReleaseModel = nullptr;
+static void *s_origBasePartOnRelease = nullptr;
 static int s_baseModelIdOffset = -1;
 static int s_baseModelPathOffset = -1;
 static int s_basePartModelOffset = -1;
@@ -254,7 +283,6 @@ static int s_basePartConfigPathOffset = -1;
 static int s_subMeshInfoMeshNameOffset = -1;
 static int s_subMeshInfoPathHashOffset = -1;
 static int s_lodMeshAssetNameOffset = -1;
-static thread_local bool s_eiemApplyingSubMeshAssignment = false;
 struct TraceLoadedModelPathEntry {
   void *model = nullptr;
   int64_t pathHash = 0;
@@ -297,6 +325,22 @@ static void *TraceModelManagerLoadFromPersistentPool(void *self,
                                                       int64_t pathHash,
                                                       void *methodInfo);
 static void TracePrefabInstantiateCompleted(void *self, void *methodInfo);
+static void TracePrefabInstantiateUnload(void *self, void *methodInfo);
+static void TracePrefabInstantiateClear(void *self, void *methodInfo);
+static void TracePrefabInstantiateDispose(void *self, void *methodInfo);
+static void *TraceUIModelLoaderLoadModel(void *self, void *path,
+                                         void *parent, void *methodInfo);
+static int32_t TraceUIModelLoaderLoadModelAsync(void *self, void *path,
+                                                void *parent, void *callback,
+                                                void *methodInfo);
+static void TraceUIModelLoaderUnloadModel(void *self, void *model,
+                                          void *methodInfo);
+static void TraceUIModelLoaderClear(void *self, void *methodInfo);
+static void TraceUIModelLoaderDispose(void *self, void *methodInfo);
+static void TraceCharUIModelOnAwake(void *self, void *methodInfo);
+static void TraceCharUIModelSetVisible(void *self, bool visible,
+                                       void *methodInfo);
+static void TraceCharUIModelOnRelease(void *self, void *methodInfo);
 static void TraceBaseModelLoadSync(void *self, void *methodInfo);
 static void TraceBaseModelLoadAsync(void *self, void *callback,
                                     void *methodInfo);
@@ -317,9 +361,37 @@ static void TraceBasePartLoadUseHandleFinishCallback(void *self, bool success,
 static bool TraceBasePartLoadUseHandleFinish(void *self, bool success,
                                              void *handle,
                                              void *methodInfo);
-static void TraceApplyLoadedModelRenderers(void *model, int64_t pathHash,
-                                           const char *stage,
-                                           const char *explicitPath = nullptr);
+static void TraceBasePartReleaseModel(void *self, void *methodInfo);
+static void TraceBasePartOnRelease(void *self, void *methodInfo);
+enum class EiemModelOwnerKind : uint8_t {
+  PrefabProxy,
+  UIModelLoader,
+  BaseModelPart,
+  CharUIModel,
+};
+static bool EiemRegisterAndApplyModelInstance(
+    EiemModelOwnerKind ownerKind, void *owner, void *model,
+    const char *prefabPath, uint32_t instanceUid, const char *stage);
+static bool EiemRegisterBaseModelViewPartInstance(void *part,
+                                                   const char *stage);
+static bool EiemRegisterCharUIModelInstance(void *component,
+                                             const char *stage);
+static bool EiemReapplyRegisteredModelInstance(void *model,
+                                                const char *stage);
+static bool EiemApplyStandaloneRenderRules(void *model, const char *stage);
+static bool EiemApplyStandaloneRenderRulesToRenderer(
+    void *meshOwner, void *drawRenderer, void *mesh,
+    const char *rendererType, void *methodInfo, const char *stage);
+static bool EiemBuildRelativeRendererPath(void *rootTransform, void *renderer,
+                                          char *out, size_t outSize);
+static bool EiemRenderRuleMatches(const EiemModRule &rule,
+                                  const char *relativePath, void *mesh,
+                                  const char *asset);
+static void EiemForgetModelOwner(EiemModelOwnerKind ownerKind, void *owner,
+                                 const char *stage);
+static void EiemForgetModelInstance(void *model, const char *stage);
+static void EiemQueueModReconcile(const char *reason);
+static void EiemRequestModUpdate(EiemModUpdate request, const char *reason);
 
 static bool EiemOnUnityThread() {
   const DWORD current = GetCurrentThreadId();
@@ -428,8 +500,17 @@ static void EiemReadLiveMeshShape(void *mesh, int32_t *vertices,
   }
 }
 
+// Set only while a matched Prefab declaration is applying its Render actions.
+// It associates every mutation with one concrete Prefab instance so unload
+// cleanup and hot reload never need a scene-wide identity guess.
+static thread_local uintptr_t s_eiemActivePrefabInstance = 0;
+
 struct EiemRenderOverrideState {
+  // `renderer` is the component that owns the Mesh: SkinnedMeshRenderer or
+  // MeshFilter. `drawRenderer` owns materials and enabled state. They are the
+  // same object for skinned meshes and sibling components for static meshes.
   void *renderer = nullptr;
+  void *drawRenderer = nullptr;
   void *originalMesh = nullptr;
   void *replacementMesh = nullptr;
   uint32_t originalMaterialsHandle = 0;
@@ -440,6 +521,9 @@ struct EiemRenderOverrideState {
   bool hasMaterials = false;
   bool hasSkinning = false;
   char rendererType[32] = {};
+  uintptr_t ownerPrefabInstance = 0;
+  char modPath[MAX_PATH] = {};
+  char renderSection[96] = {};
 };
 struct EiemBounds {
   Vector3 center;
@@ -447,115 +531,6 @@ struct EiemBounds {
 };
 static SRWLOCK s_eiemOverrideLock = SRWLOCK_INIT;
 static std::vector<EiemRenderOverrideState> s_eiemOverrides;
-static volatile LONG s_eiemAppliedModGeneration = -1;
-
-struct EiemSubMeshOverrideState {
-  void *info = nullptr;
-  uint32_t infoHandle = 0;
-  void *originalMesh = nullptr;
-  void *replacementMesh = nullptr;
-  bool originalWasNull = false;
-};
-static SRWLOCK s_eiemSubMeshOverrideLock = SRWLOCK_INIT;
-static std::vector<EiemSubMeshOverrideState> s_eiemSubMeshOverrides;
-
-static size_t EiemFindSubMeshOverrideLocked(void *info) {
-  for (size_t i = 0; i < s_eiemSubMeshOverrides.size(); ++i)
-    if (s_eiemSubMeshOverrides[i].info == info) return i;
-  return SIZE_MAX;
-}
-
-static void EiemRememberSubMeshReplacement(void *info, void *originalMesh,
-                                           void *replacementMesh) {
-  if (!info || !replacementMesh) return;
-  AcquireSRWLockExclusive(&s_eiemSubMeshOverrideLock);
-  size_t index = EiemFindSubMeshOverrideLocked(info);
-  if (index == SIZE_MAX) {
-    EiemSubMeshOverrideState state = {};
-    state.info = info;
-    state.infoHandle = il2cpp_gchandle_new ? il2cpp_gchandle_new(info, false) : 0;
-    state.originalMesh = originalMesh;
-    state.replacementMesh = replacementMesh;
-    state.originalWasNull = originalMesh == nullptr;
-    s_eiemSubMeshOverrides.push_back(state);
-  } else {
-    // A logical record can be observed first with mesh=null and later with
-    // the game's source Mesh. Preserve the source once it becomes available.
-    if (originalMesh && originalMesh != s_eiemSubMeshOverrides[index].replacementMesh) {
-      s_eiemSubMeshOverrides[index].originalMesh = originalMesh;
-      s_eiemSubMeshOverrides[index].originalWasNull = false;
-    }
-    s_eiemSubMeshOverrides[index].replacementMesh = replacementMesh;
-  }
-  ReleaseSRWLockExclusive(&s_eiemSubMeshOverrideLock);
-}
-
-static bool EiemRestoreOneSubMeshOverride(TraceSubMeshInfoSetMeshFn original,
-                                          void *info, void *mesh) {
-  if (!original || !info || !mesh) return false;
-  __try {
-    original(info, mesh, nullptr);
-    return true;
-  } __except (EXCEPTION_EXECUTE_HANDLER) {
-    Log("[MOD-SUBMESH] restore failed info=%p exception=0x%08lX", info,
-        GetExceptionCode());
-    return false;
-  }
-}
-
-static void EiemClearSubMeshInfoMesh(void *info) {
-  if (!info || s_subMeshInfoMeshOffset < 0) return;
-  __try { *(void **)((char *)info + s_subMeshInfoMeshOffset) = nullptr; }
-  __except (EXCEPTION_EXECUTE_HANDLER) {}
-}
-
-static void EiemRestoreSubMeshOverrides() {
-  std::vector<EiemSubMeshOverrideState> states;
-  AcquireSRWLockExclusive(&s_eiemSubMeshOverrideLock);
-  states.swap(s_eiemSubMeshOverrides);
-  ReleaseSRWLockExclusive(&s_eiemSubMeshOverrideLock);
-  auto original = (TraceSubMeshInfoSetMeshFn)s_origSubMeshInfoSetMesh;
-  if (!original) return;
-  for (const auto &state : states) {
-    void *info = state.infoHandle && il2cpp_gchandle_get_target
-                     ? il2cpp_gchandle_get_target(state.infoHandle)
-                     : state.info;
-    if (!info || (!state.originalMesh && !state.originalWasNull)) {
-      if (state.infoHandle && il2cpp_gchandle_free)
-        il2cpp_gchandle_free(state.infoHandle);
-      continue;
-    }
-    s_eiemApplyingSubMeshAssignment = true;
-    if (state.originalMesh) {
-      EiemRestoreOneSubMeshOverride(original, info, state.originalMesh);
-    } else {
-      EiemClearSubMeshInfoMesh(info);
-    }
-    s_eiemApplyingSubMeshAssignment = false;
-    if (state.infoHandle && il2cpp_gchandle_free)
-      il2cpp_gchandle_free(state.infoHandle);
-  }
-  if (!states.empty())
-    Log("[MOD-SUBMESH] restored %zu logical mesh assignment(s)", states.size());
-}
-
-// The logical SubMeshInfo hook can run before a Renderer exists. When that
-// Renderer is later constructed it already exposes the replacement Mesh, so
-// recover the source identity from the logical assignment table before
-// capturing reload state or resolving the Render rule.
-static void *EiemOriginalForLogicalReplacement(void *mesh) {
-  if (!mesh) return nullptr;
-  void *source = nullptr;
-  AcquireSRWLockShared(&s_eiemSubMeshOverrideLock);
-  for (const auto &state : s_eiemSubMeshOverrides) {
-    if (state.replacementMesh == mesh && state.originalMesh) {
-      source = state.originalMesh;
-      break;
-    }
-  }
-  ReleaseSRWLockShared(&s_eiemSubMeshOverrideLock);
-  return source;
-}
 
 static bool EiemReadRendererEnabled(void *renderer, bool *enabled) {
   if (enabled) *enabled = true;
@@ -640,17 +615,19 @@ static void EiemPrepareRenderInput(void *renderer, void *mesh,
   ReleaseSRWLockExclusive(&s_eiemOverrideLock);
 }
 
-static void EiemCaptureOriginal(void *renderer, void *mesh,
+static void EiemCaptureOriginal(void *renderer, void *drawRenderer, void *mesh,
                                 const char *rendererType) {
   if (!renderer || !mesh) return;
+  if (!drawRenderer) drawRenderer = renderer;
   AcquireSRWLockExclusive(&s_eiemOverrideLock);
   size_t index = EiemFindOverrideLocked(renderer);
   if (index == SIZE_MAX) {
     EiemRenderOverrideState state = {};
     state.renderer = renderer;
+    state.drawRenderer = drawRenderer;
     state.originalMesh = mesh;
     if (g_renderer_get_sharedMaterials && il2cpp_gchandle_new) {
-      void *materials = Invoke(g_renderer_get_sharedMaterials, renderer);
+      void *materials = Invoke(g_renderer_get_sharedMaterials, drawRenderer);
       if (materials) {
         state.originalMaterialsHandle = il2cpp_gchandle_new(materials, false);
         state.hasMaterials = state.originalMaterialsHandle != 0;
@@ -673,6 +650,7 @@ static void EiemCaptureOriginal(void *renderer, void *mesh,
     }
     strncpy_s(state.rendererType, sizeof(state.rendererType),
               rendererType ? rendererType : "Renderer", _TRUNCATE);
+    state.ownerPrefabInstance = s_eiemActivePrefabInstance;
     s_eiemOverrides.push_back(state);
   } else if (!s_eiemOverrides[index].replacementMesh) {
     // A game-side reassignment can arrive between reconcile passes. Preserve
@@ -680,6 +658,41 @@ static void EiemCaptureOriginal(void *renderer, void *mesh,
     s_eiemOverrides[index].originalMesh = mesh;
   }
   ReleaseSRWLockExclusive(&s_eiemOverrideLock);
+}
+
+static void EiemRememberRuleBinding(void *renderer,
+                                    const EiemModRule &rule) {
+  if (!renderer) return;
+  AcquireSRWLockExclusive(&s_eiemOverrideLock);
+  const size_t index = EiemFindOverrideLocked(renderer);
+  if (index != SIZE_MAX) {
+    auto &state = s_eiemOverrides[index];
+    // A later resource-assembly refresh has no completed Prefab owner. Do not
+    // erase an owner learned by the normal Prefab lifecycle adapter.
+    if (s_eiemActivePrefabInstance)
+      state.ownerPrefabInstance = s_eiemActivePrefabInstance;
+    strncpy_s(state.modPath, sizeof(state.modPath), rule.modPath, _TRUNCATE);
+    strncpy_s(state.renderSection, sizeof(state.renderSection), rule.section,
+              _TRUNCATE);
+  }
+  ReleaseSRWLockExclusive(&s_eiemOverrideLock);
+}
+
+static bool EiemFindBoundRenderRule(void *renderer, EiemModRule *out) {
+  if (!renderer || !out) return false;
+  char modPath[MAX_PATH] = {};
+  char section[96] = {};
+  AcquireSRWLockShared(&s_eiemOverrideLock);
+  const size_t index = EiemFindOverrideLocked(renderer);
+  if (index != SIZE_MAX) {
+    strncpy_s(modPath, sizeof(modPath), s_eiemOverrides[index].modPath,
+              _TRUNCATE);
+    strncpy_s(section, sizeof(section),
+              s_eiemOverrides[index].renderSection, _TRUNCATE);
+  }
+  ReleaseSRWLockShared(&s_eiemOverrideLock);
+  return modPath[0] && section[0] &&
+         EiemFindRenderRuleBySection(modPath, section, out);
 }
 
 static void EiemRememberReplacement(void *renderer, void *replacementMesh,
@@ -711,9 +724,11 @@ static void *EiemReplacementForSourceMesh(void *renderer, void *mesh) {
 // handling=skip directive changes it, and therefore only skip needs a value
 // restored on reload. LOD setup is free to toggle enabled while a mesh-only
 // rule is active.
-static void EiemCaptureEnabledForSkip(void *renderer) {
+static void EiemCaptureEnabledForSkip(void *renderer, void *drawRenderer) {
   bool enabled = true;
-  if (!renderer || !EiemReadRendererEnabled(renderer, &enabled)) return;
+  if (!renderer || !drawRenderer ||
+      !EiemReadRendererEnabled(drawRenderer, &enabled))
+    return;
   AcquireSRWLockExclusive(&s_eiemOverrideLock);
   const size_t index = EiemFindOverrideLocked(renderer);
   if (index != SIZE_MAX && !s_eiemOverrides[index].hasEnabled) {
@@ -721,20 +736,6 @@ static void EiemCaptureEnabledForSkip(void *renderer) {
     s_eiemOverrides[index].hasEnabled = true;
   }
   ReleaseSRWLockExclusive(&s_eiemOverrideLock);
-}
-
-static bool EiemGetOriginalEnabled(void *renderer, bool *enabled) {
-  if (enabled) *enabled = true;
-  if (!renderer || !enabled) return false;
-  AcquireSRWLockShared(&s_eiemOverrideLock);
-  const size_t index = EiemFindOverrideLocked(renderer);
-  if (index == SIZE_MAX || !s_eiemOverrides[index].hasEnabled) {
-    ReleaseSRWLockShared(&s_eiemOverrideLock);
-    return false;
-  }
-  *enabled = s_eiemOverrides[index].originalEnabled;
-  ReleaseSRWLockShared(&s_eiemOverrideLock);
-  return true;
 }
 
 static bool EiemSetRendererEnabled(void *renderer, bool enabled) {
@@ -768,18 +769,19 @@ static void EiemRestoreRenderOverrides() {
           state.renderer, restored, state.originalMesh,
           restored == state.originalMesh ? 1 : 0);
     }
-    if (state.renderer && state.hasMaterials && state.originalMaterialsHandle &&
+    if (state.drawRenderer && state.hasMaterials &&
+        state.originalMaterialsHandle &&
         s_eiemRendererSetSharedMaterials && il2cpp_gchandle_get_target) {
       void *materials = il2cpp_gchandle_get_target(state.originalMaterialsHandle);
       if (materials) {
         void *params[] = {materials};
-        Invoke(s_eiemRendererSetSharedMaterials, state.renderer, params);
+        Invoke(s_eiemRendererSetSharedMaterials, state.drawRenderer, params);
       }
     }
-    if (state.renderer && state.hasEnabled && g_renderer_set_enabled) {
+    if (state.drawRenderer && state.hasEnabled && g_renderer_set_enabled) {
       bool enabled = state.originalEnabled;
       void *params[] = {&enabled};
-      Invoke(g_renderer_set_enabled, state.renderer, params);
+      Invoke(g_renderer_set_enabled, state.drawRenderer, params);
     }
     if (state.renderer && state.hasSkinning &&
         il2cpp_gchandle_get_target) {
@@ -809,6 +811,37 @@ static void EiemRestoreRenderOverrides() {
     Log("[MOD] Restored %zu renderer override(s) before reload", states.size());
 }
 
+static void EiemReleaseOverrideHandles(const EiemRenderOverrideState &state) {
+  if (state.originalMaterialsHandle && il2cpp_gchandle_free)
+    il2cpp_gchandle_free(state.originalMaterialsHandle);
+  if (state.originalBonesHandle && il2cpp_gchandle_free)
+    il2cpp_gchandle_free(state.originalBonesHandle);
+  if (state.originalRootBoneHandle && il2cpp_gchandle_free)
+    il2cpp_gchandle_free(state.originalRootBoneHandle);
+}
+
+// The game is about to unload this Prefab. Its Renderer objects must not be
+// called while restoring: their native side may already be entering teardown.
+// Drop only EIEM bookkeeping and managed handles owned by this instance.
+static void EiemForgetRenderOverrides(uintptr_t ownerPrefabInstance) {
+  if (!ownerPrefabInstance) return;
+  std::vector<EiemRenderOverrideState> forgotten;
+  AcquireSRWLockExclusive(&s_eiemOverrideLock);
+  for (size_t index = 0; index < s_eiemOverrides.size();) {
+    if (s_eiemOverrides[index].ownerPrefabInstance != ownerPrefabInstance) {
+      ++index;
+      continue;
+    }
+    forgotten.push_back(s_eiemOverrides[index]);
+    s_eiemOverrides.erase(s_eiemOverrides.begin() + index);
+  }
+  ReleaseSRWLockExclusive(&s_eiemOverrideLock);
+  for (const auto &state : forgotten) EiemReleaseOverrideHandles(state);
+  if (!forgotten.empty())
+    Log("[MOD-PREFAB] forgot %zu Renderer override(s) for instance=%p",
+        forgotten.size(), (void *)ownerPrefabInstance);
+}
+
 struct EiemResolvedRenderRule {
   EiemModRule rule = {};
   char source[768] = {};
@@ -817,9 +850,11 @@ struct EiemResolvedRenderRule {
 
 struct EiemPartnerState {
   void *sourceRenderer = nullptr;
+  void *sourceDrawRenderer = nullptr;
   void *partnerObject = nullptr;
   void *partnerRenderer = nullptr;
   LONG generation = -1;
+  uintptr_t ownerPrefabInstance = 0;
   char section[96] = {};
 };
 static SRWLOCK s_eiemPartnerLock = SRWLOCK_INIT;
@@ -1092,7 +1127,8 @@ static void EiemDestroyPartnerObjects() {
   ReleaseSRWLockExclusive(&s_eiemPartnerLock);
   for (const auto &state : states) {
     if (state.partnerRenderer)
-      EiemSetPartnerLodMembership(state.sourceRenderer, state.partnerRenderer,
+      EiemSetPartnerLodMembership(state.sourceDrawRenderer,
+                                  state.partnerRenderer,
                                   false);
     if (state.partnerObject && g_object_destroy) {
       void *params[] = {state.partnerObject};
@@ -1101,6 +1137,31 @@ static void EiemDestroyPartnerObjects() {
   }
   if (!states.empty())
     Log("[MOD] Destroyed %zu partner Renderer(s) before reload", states.size());
+}
+
+static void EiemDestroyPartnerObjects(uintptr_t ownerPrefabInstance) {
+  if (!ownerPrefabInstance) return;
+  std::vector<EiemPartnerState> states;
+  AcquireSRWLockExclusive(&s_eiemPartnerLock);
+  for (size_t index = 0; index < s_eiemPartners.size();) {
+    if (s_eiemPartners[index].ownerPrefabInstance != ownerPrefabInstance) {
+      ++index;
+      continue;
+    }
+    states.push_back(s_eiemPartners[index]);
+    s_eiemPartners.erase(s_eiemPartners.begin() + index);
+  }
+  ReleaseSRWLockExclusive(&s_eiemPartnerLock);
+  for (const auto &state : states) {
+    if (state.partnerRenderer)
+      EiemSetPartnerLodMembership(state.sourceDrawRenderer,
+                                  state.partnerRenderer,
+                                  false);
+    if (state.partnerObject && g_object_destroy) {
+      void *params[] = {state.partnerObject};
+      Invoke(g_object_destroy, nullptr, params);
+    }
+  }
 }
 
 static void EiemCopyPartnerTransform(void *sourceTransform,
@@ -1132,12 +1193,14 @@ static void EiemCopyPartnerTransform(void *sourceTransform,
   }
 }
 
-static void *EiemCreatePartnerRenderer(void *sourceRenderer,
+static void *EiemCreatePartnerRenderer(void *sourceMeshOwner,
+                                       void *sourceDrawRenderer,
                                        const char *rendererType,
                                        const EiemModRule &partnerRule,
                                        void *sourceMesh, char *error,
                                        size_t errorSize) {
-  if (!sourceRenderer || !rendererType || !g_gameObjectClass ||
+  if (!sourceMeshOwner || !sourceDrawRenderer || !rendererType ||
+      !g_gameObjectClass ||
       (!g_gameObject_ctor && !g_gameObject_ctorDefault) ||
       !g_gameObject_AddComponent || !g_component_get_gameObject ||
       !g_component_get_transform || !il2cpp_class_get_type ||
@@ -1147,12 +1210,13 @@ static void *EiemCreatePartnerRenderer(void *sourceRenderer,
                          _TRUNCATE);
     return nullptr;
   }
-  void *sourceGo = Invoke(g_component_get_gameObject, sourceRenderer);
+  void *sourceGo = Invoke(g_component_get_gameObject, sourceDrawRenderer);
   if (!sourceGo) {
     if (error) strncpy_s(error, errorSize, "Source Renderer has no GameObject", _TRUNCATE);
     return nullptr;
   }
-  void *sourceTransform = Invoke(g_component_get_transform, sourceRenderer);
+  void *sourceTransform = Invoke(g_component_get_transform,
+                                 sourceDrawRenderer);
   if (!sourceTransform) {
     if (error) strncpy_s(error, errorSize, "Source Renderer has no Transform", _TRUNCATE);
     return nullptr;
@@ -1162,7 +1226,8 @@ static void *EiemCreatePartnerRenderer(void *sourceRenderer,
     if (error) strncpy_s(error, errorSize, "Unable to allocate partner GameObject", _TRUNCATE);
     return nullptr;
   }
-  void *partnerRenderer = nullptr;
+  void *partnerMeshOwner = nullptr;
+  void *partnerDrawRenderer = nullptr;
   auto cleanupPartner = [&]() {
     if (partnerGo && g_object_destroy) {
       void *params[] = {partnerGo};
@@ -1217,21 +1282,25 @@ static void *EiemCreatePartnerRenderer(void *sourceRenderer,
   if (g_transform_set_parent)
     Invoke(g_transform_set_parent, partnerTransform, parentParams);
 
-  void *rendererClass = EiemModEquals(rendererType, "SkinnedMeshRenderer")
-                            ? g_skinnedMeshRendererClass
-                            : g_meshFilterClass;
-  void *type = rendererClass ? il2cpp_class_get_type(rendererClass) : nullptr;
-  void *typeObject = type ? il2cpp_type_get_object(type) : nullptr;
-  if (!typeObject) {
-    if (error) strncpy_s(error, errorSize, "Partner Renderer type is unavailable", _TRUNCATE);
-    cleanupPartner();
-    return nullptr;
+  auto addComponent = [&](void *klass) -> void * {
+    void *type = klass ? il2cpp_class_get_type(klass) : nullptr;
+    void *typeObject = type ? il2cpp_type_get_object(type) : nullptr;
+    if (!typeObject) return nullptr;
+    void *componentParams[] = {typeObject};
+    return Invoke(g_gameObject_AddComponent, partnerGo, componentParams);
+  };
+  if (EiemModEquals(rendererType, "SkinnedMeshRenderer")) {
+    partnerMeshOwner = addComponent(g_skinnedMeshRendererClass);
+    partnerDrawRenderer = partnerMeshOwner;
+  } else {
+    partnerMeshOwner = addComponent(g_meshFilterClass);
+    partnerDrawRenderer = addComponent(g_meshRendererClass);
   }
-  void *componentParams[] = {typeObject};
-  partnerRenderer = Invoke(g_gameObject_AddComponent, partnerGo,
-                           componentParams);
-  if (!partnerRenderer) {
-    if (error) strncpy_s(error, errorSize, "GameObject.AddComponent returned null", _TRUNCATE);
+  if (!partnerMeshOwner || !partnerDrawRenderer) {
+    if (error)
+      strncpy_s(error, errorSize,
+                "Partner Mesh owner/Renderer components are unavailable",
+                _TRUNCATE);
     cleanupPartner();
     return nullptr;
   }
@@ -1240,12 +1309,16 @@ static void *EiemCreatePartnerRenderer(void *sourceRenderer,
   char buildError[256] = {};
   if (partnerRule.hasMesh &&
       !EiemBuildMeshResource(partnerRule, &assignedMesh, buildError,
-                             sizeof(buildError), sourceMesh, sourceRenderer)) {
+                             sizeof(buildError), sourceMesh,
+                             EiemModEquals(rendererType,
+                                           "SkinnedMeshRenderer")
+                                 ? sourceMeshOwner
+                                 : nullptr)) {
     if (error) strncpy_s(error, errorSize, buildError, _TRUNCATE);
     cleanupPartner();
     return nullptr;
   }
-  if (assignedMesh && !EiemSetSharedMesh(partnerRenderer, assignedMesh,
+  if (assignedMesh && !EiemSetSharedMesh(partnerMeshOwner, assignedMesh,
                                           rendererType, nullptr)) {
     if (error) strncpy_s(error, errorSize, "Partner mesh assignment failed", _TRUNCATE);
     cleanupPartner();
@@ -1253,22 +1326,22 @@ static void *EiemCreatePartnerRenderer(void *sourceRenderer,
   }
   if (EiemModEquals(rendererType, "SkinnedMeshRenderer")) {
     if (g_smr_get_bones && g_smr_set_bones) {
-      void *bones = Invoke(g_smr_get_bones, sourceRenderer);
-      if (bones) { void *params[] = {bones}; Invoke(g_smr_set_bones, partnerRenderer, params); }
+      void *bones = Invoke(g_smr_get_bones, sourceMeshOwner);
+      if (bones) { void *params[] = {bones}; Invoke(g_smr_set_bones, partnerMeshOwner, params); }
     }
     if (g_smr_get_rootBone && g_smr_set_rootBone) {
-      void *rootBone = Invoke(g_smr_get_rootBone, sourceRenderer);
-      if (rootBone) { void *params[] = {rootBone}; Invoke(g_smr_set_rootBone, partnerRenderer, params); }
+      void *rootBone = Invoke(g_smr_get_rootBone, sourceMeshOwner);
+      if (rootBone) { void *params[] = {rootBone}; Invoke(g_smr_set_rootBone, partnerMeshOwner, params); }
     }
     if (g_smr_get_localBounds && g_smr_set_localBounds) {
       // SkinnedMeshRenderer culling uses localBounds, which is independent of
       // Mesh.bounds. Copy the source bounds so the replacement is not culled
       // before its first skinning update.
-      void *boxedBounds = Invoke(g_smr_get_localBounds, sourceRenderer);
+      void *boxedBounds = Invoke(g_smr_get_localBounds, sourceMeshOwner);
       if (boxedBounds) {
         EiemBounds bounds = *(EiemBounds *)((char *)boxedBounds + 16);
         void *boundsParams[] = {&bounds};
-        Invoke(g_smr_set_localBounds, partnerRenderer, boundsParams);
+        Invoke(g_smr_set_localBounds, partnerMeshOwner, boundsParams);
       }
     }
   }
@@ -1277,16 +1350,19 @@ static void *EiemCreatePartnerRenderer(void *sourceRenderer,
     if (!EiemBuildRendererMaterials(partnerRule, &materials, buildError,
                                     sizeof(buildError)) ||
         !materials ||
-        !EiemAssignRendererMaterials(partnerRenderer, materials, buildError,
+        !EiemAssignRendererMaterials(partnerDrawRenderer, materials,
+                                     buildError,
                                      sizeof(buildError))) {
       if (error) strncpy_s(error, errorSize, buildError[0] ? buildError : "Partner materials failed", _TRUNCATE);
       cleanupPartner();
       return nullptr;
     }
   } else if (g_renderer_get_sharedMaterials && s_eiemRendererSetSharedMaterials) {
-    void *materials = Invoke(g_renderer_get_sharedMaterials, sourceRenderer);
+    void *materials = Invoke(g_renderer_get_sharedMaterials,
+                             sourceDrawRenderer);
     if (materials &&
-        !EiemAssignRendererMaterials(partnerRenderer, materials, buildError,
+        !EiemAssignRendererMaterials(partnerDrawRenderer, materials,
+                                     buildError,
                                      sizeof(buildError))) {
       if (error)
         strncpy_s(error, errorSize,
@@ -1298,53 +1374,64 @@ static void *EiemCreatePartnerRenderer(void *sourceRenderer,
     }
   }
   bool enabled = !EiemModEquals(partnerRule.handling, "skip");
-  if (g_renderer_set_enabled) { void *params[] = {&enabled}; Invoke(g_renderer_set_enabled, partnerRenderer, params); }
-  EiemSetPartnerLodMembership(sourceRenderer, partnerRenderer, true);
+  if (g_renderer_set_enabled) {
+    void *params[] = {&enabled};
+    Invoke(g_renderer_set_enabled, partnerDrawRenderer, params);
+  }
+  EiemSetPartnerLodMembership(sourceDrawRenderer, partnerDrawRenderer, true);
 
   bool sourceEnabled = true;
   bool partnerEnabled = true;
-  EiemReadRendererEnabled(sourceRenderer, &sourceEnabled);
-  EiemReadRendererEnabled(partnerRenderer, &partnerEnabled);
+  EiemReadRendererEnabled(sourceDrawRenderer, &sourceEnabled);
+  EiemReadRendererEnabled(partnerDrawRenderer, &partnerEnabled);
   int sourceMaterials = -1;
   int partnerMaterials = -1;
   if (g_renderer_get_sharedMaterials) {
-    void *sourceArray = Invoke(g_renderer_get_sharedMaterials, sourceRenderer);
-    void *partnerArray = Invoke(g_renderer_get_sharedMaterials, partnerRenderer);
+    void *sourceArray = Invoke(g_renderer_get_sharedMaterials,
+                               sourceDrawRenderer);
+    void *partnerArray = Invoke(g_renderer_get_sharedMaterials,
+                                partnerDrawRenderer);
     if (sourceArray) sourceMaterials = *(int *)((char *)sourceArray + 24);
     if (partnerArray) partnerMaterials = *(int *)((char *)partnerArray + 24);
   }
   Log("[DEBUG-partner] source=%p enabled=%d mesh=%p materials=%d partner=%p "
       "enabled=%d mesh=%p materials=%d",
-      sourceRenderer, sourceEnabled ? 1 : 0,
-      EiemReadSharedMesh(sourceRenderer, rendererType), sourceMaterials,
-      partnerRenderer, partnerEnabled ? 1 : 0,
-      EiemReadSharedMesh(partnerRenderer, rendererType), partnerMaterials);
+      sourceMeshOwner, sourceEnabled ? 1 : 0,
+      EiemReadSharedMesh(sourceMeshOwner, rendererType), sourceMaterials,
+      partnerDrawRenderer, partnerEnabled ? 1 : 0,
+      EiemReadSharedMesh(partnerMeshOwner, rendererType), partnerMaterials);
 
   EiemPartnerState state = {};
-  state.sourceRenderer = sourceRenderer;
+  state.sourceRenderer = sourceMeshOwner;
+  state.sourceDrawRenderer = sourceDrawRenderer;
   state.partnerObject = partnerGo;
-  state.partnerRenderer = partnerRenderer;
+  state.partnerRenderer = partnerDrawRenderer;
   state.generation = InterlockedCompareExchange(&s_eiemModGeneration, 0, 0);
+  state.ownerPrefabInstance = s_eiemActivePrefabInstance;
   strncpy_s(state.section, sizeof(state.section), partnerRule.section, _TRUNCATE);
   AcquireSRWLockExclusive(&s_eiemPartnerLock);
   s_eiemPartners.push_back(state);
   ReleaseSRWLockExclusive(&s_eiemPartnerLock);
   Log("[MOD] partner Renderer created: source=%p section=%s renderer=%p mesh=%s",
-      sourceRenderer, partnerRule.section, partnerRenderer,
+      sourceMeshOwner, partnerRule.section, partnerDrawRenderer,
       partnerRule.hasMesh ? partnerRule.mesh : "<source>");
-  return partnerRenderer;
+  return partnerDrawRenderer;
 }
 
-static void EiemApplyPartners(void *sourceRenderer, void *sourceMesh,
+static void EiemApplyPartners(void *sourceMeshOwner,
+                              void *sourceDrawRenderer, void *sourceMesh,
                               const char *rendererType,
                               const EiemModRule &sourceRule) {
-  if (!sourceRenderer || !sourceRule.partnerCount || s_eiemCreatingPartner) return;
+  if (!sourceMeshOwner || !sourceDrawRenderer || !sourceRule.partnerCount ||
+      s_eiemCreatingPartner)
+    return;
   const LONG generation = InterlockedCompareExchange(&s_eiemModGeneration, 0, 0);
   for (uint32_t index = 0; index < sourceRule.partnerCount; ++index) {
     const char *section = sourceRule.partners[index];
     if (!section[0]) continue;
     AcquireSRWLockShared(&s_eiemPartnerLock);
-    const bool exists = EiemFindPartnerLocked(sourceRenderer, section, generation) != SIZE_MAX;
+    const bool exists = EiemFindPartnerLocked(sourceMeshOwner, section,
+                                               generation) != SIZE_MAX;
     ReleaseSRWLockShared(&s_eiemPartnerLock);
     if (exists) continue;
     EiemModRule partner = {};
@@ -1355,8 +1442,9 @@ static void EiemApplyPartners(void *sourceRenderer, void *sourceMesh,
     }
     char error[256] = {};
     s_eiemCreatingPartner = true;
-    EiemCreatePartnerRenderer(sourceRenderer, rendererType, partner, sourceMesh,
-                              error, sizeof(error));
+    EiemCreatePartnerRenderer(sourceMeshOwner, sourceDrawRenderer,
+                              rendererType, partner, sourceMesh, error,
+                              sizeof(error));
     s_eiemCreatingPartner = false;
     if (error[0])
       Log("[MOD] partner creation failed: source=%s partner=%s error=%s",
@@ -1364,89 +1452,9 @@ static void EiemApplyPartners(void *sourceRenderer, void *sourceMesh,
   }
 }
 
-// Resolve a Mesh once, then apply its result to every Renderer that shares
-// that resource. This preserves the resource-level replacement model rather
-// than treating shadow, LOD, or instanced Renderers as separate targets.
-static bool EiemResolveRenderRule(void *mesh, EiemResolvedRenderRule *out) {
-  if (!mesh || !out) return false;
-  char source[768] = {}, asset[192] = {};
-  if (!EiemReadLiveMeshIdentity(mesh, source, sizeof(source), asset,
-                                sizeof(asset)))
-    return false;
-  if (!EiemHasResourceRenderRuleAsset(asset)) return false;
-  int32_t vertices = -1, indices = -1, subMeshes = -1;
-  EiemReadLiveMeshShape(mesh, &vertices, &indices, &subMeshes);
-  EiemModRule rule = {};
-  if (!EiemFindResourceRenderRule(source, asset, vertices, indices, subMeshes, &rule))
-    return false;
-  out->rule = rule;
-  strncpy_s(out->source, sizeof(out->source), source, _TRUNCATE);
-  strncpy_s(out->asset, sizeof(out->asset), asset, _TRUNCATE);
-  return true;
-}
-
-// Prefab-backed post-model meshes can be assigned before Unity has populated
-// the Mesh object's name/origin metadata.  The Renderer already carries the
-// serialized resource name at that point, so keep the same structural match
-// rules but resolve through that name as a narrowly-scoped fallback.  This is
-// used only on the early setter path, before the game's skin/GPU caches read
-// the renderer, and never guesses between rules with different shapes.
-static bool EiemResolveRenderRuleForAsset(void *mesh, const char *asset,
-                                          EiemResolvedRenderRule *out) {
-  if (!asset || !asset[0] || !out) return false;
-  int32_t vertices = -1, indices = -1, subMeshes = -1;
-  if (mesh) EiemReadLiveMeshShape(mesh, &vertices, &indices, &subMeshes);
-  EiemModRule rule = {};
-  if (!EiemFindResourceRenderRule(nullptr, asset, vertices, indices, subMeshes,
-                                  &rule))
-    return false;
-  out->rule = rule;
-  out->source[0] = '\0';
-  strncpy_s(out->asset, sizeof(out->asset), asset, _TRUNCATE);
-  return true;
-}
-
-// SubMeshInfo records are frequently materialized with mesh=null and the
-// actual Mesh is produced by get_mesh on demand.  Mutating a temporary array
-// returned by GetSubMeshInfo therefore cannot affect CreateSMSGO.  Resolve at
-// the getter itself so the game's own renderer/skin assembly receives the
-// generated Mesh as its source object.
 static void *TraceSubMeshInfoGetMesh(void *self, void *methodInfo) {
   auto original = (TraceSubMeshInfoGetMeshFn)s_origSubMeshInfoGetMesh;
-  void *sourceMesh = original ? original(self, methodInfo) : nullptr;
-  if (!self || s_eiemApplyingSubMeshAssignment || !EiemOnUnityThread())
-    return sourceMesh;
-  if (s_subMeshInfoMeshNameOffset < 0) return sourceMesh;
-
-  char assetName[192] = {};
-  __try {
-    void *name = *(void **)((char *)self + s_subMeshInfoMeshNameOffset);
-    if (name) ReadStrUtf8(name, assetName, sizeof(assetName));
-  } __except (EXCEPTION_EXECUTE_HANDLER) {
-    assetName[0] = '\0';
-  }
-  if (!assetName[0] && sourceMesh)
-    TraceReadUnityObjectName(sourceMesh, assetName, sizeof(assetName));
-  if (!assetName[0] || !EiemHasResourceRenderRuleAsset(assetName))
-    return sourceMesh;
-
-  EiemResolvedRenderRule resolved = {};
-  if (!EiemResolveRenderRuleForAsset(sourceMesh, assetName, &resolved) ||
-      !resolved.rule.hasMesh)
-    return sourceMesh;
-
-  void *replacement = nullptr;
-  char error[256] = {};
-  if (!EiemBuildMeshResource(resolved.rule, &replacement, error,
-                             sizeof(error), sourceMesh) || !replacement) {
-    Log("[MOD-LOGICAL-GET] build failed info=%p asset=%s error=%s", self,
-        assetName, error[0] ? error : "unknown");
-    return sourceMesh;
-  }
-  EiemRememberSubMeshReplacement(self, sourceMesh, replacement);
-  Log("[MOD-LOGICAL-GET] SubMeshInfo=%p asset=%s source=%p replacement=%p",
-      self, assetName, sourceMesh, replacement);
-  return replacement;
+  return original ? original(self, methodInfo) : nullptr;
 }
 
 static void TraceSubMeshInfoSetMesh(void *self, void *mesh, void *methodInfo) {
@@ -1466,7 +1474,7 @@ static void TraceSubMeshInfoSetMesh(void *self, void *mesh, void *methodInfo) {
     original(self, mesh, methodInfo);
     return;
   }
-  if (s_eiemApplyingSubMeshAssignment || !self || !mesh) {
+  if (!self || !mesh) {
     original(self, mesh, methodInfo);
     return;
   }
@@ -1498,39 +1506,6 @@ static void TraceSubMeshInfoSetMesh(void *self, void *mesh, void *methodInfo) {
         (long long)pathHash, meshText[0] ? meshText : "<none>");
   }
 
-  EiemResolvedRenderRule resolved = {};
-  bool matched = assetName[0] &&
-                 EiemHasResourceRenderRuleAsset(assetName) &&
-                 EiemResolveRenderRuleForAsset(mesh, assetName, &resolved);
-  if (!matched) {
-    // A path hash is still useful evidence for diagnostics, but it is not a
-    // replacement key by itself: the ini contract requires the asset name and
-    // optional shape checks, avoiding collisions between same-named subassets.
-    original(self, mesh, methodInfo);
-    return;
-  }
-
-  const bool safeThread = EiemOnUnityThread();
-  if (safeThread && resolved.rule.hasMesh) {
-    void *replacement = nullptr;
-    char error[256] = {};
-    if (EiemBuildMeshResource(resolved.rule, &replacement, error,
-                              sizeof(error), mesh, nullptr) && replacement) {
-      EiemRememberSubMeshReplacement(self, mesh, replacement);
-      original(self, replacement, methodInfo);
-      Log("[MOD-LOGICAL-MESH] SubMeshInfo=%p asset=%s source=%p replacement=%p",
-          self, assetName, mesh, replacement);
-      return;
-    }
-    Log("[MOD-LOGICAL-MESH] build failed info=%p asset=%s error=%s", self,
-        assetName, error[0] ? error : "unknown");
-  } else if (!safeThread) {
-    Log("[MOD-LOGICAL-MESH] deferred unsafe thread info=%p asset=%s tid=%lu unityTid=%lu",
-        self, assetName, (unsigned long)GetCurrentThreadId(),
-        (unsigned long)s_eiemUnityThreadId);
-  }
-  // The original assignment is always preserved if construction cannot happen
-  // at this boundary; the main-thread reconcile will retry the same rule.
   original(self, mesh, methodInfo);
 }
 
@@ -1592,92 +1567,11 @@ static void TraceLogSubMeshInfoArray(void *owner, int32_t lod, bool includeGpu,
   }
 }
 
-static size_t EiemApplyLogicalSubMeshInfoArray(void *array, int32_t lod,
-                                                bool includeGpu) {
-  if (!array || s_subMeshInfoMeshOffset < 0 || !EiemOnUnityThread()) return 0;
-  const size_t count = EiemManagedArrayLength(array);
-  if (!count || count > 128) return 0;
-  void **items = (void **)((char *)array + 32);
-  size_t applied = 0;
-  for (size_t index = 0; index < count; ++index) {
-    void *info = items[index];
-    if (!info) continue;
-    void *sourceMesh = nullptr;
-    char assetName[192] = {};
-    __try {
-      sourceMesh = *(void **)((char *)info + s_subMeshInfoMeshOffset);
-      if (s_subMeshInfoMeshNameOffset >= 0) {
-        void *name = *(void **)((char *)info + s_subMeshInfoMeshNameOffset);
-        if (name) ReadStrUtf8(name, assetName, sizeof(assetName));
-      }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-      sourceMesh = nullptr;
-      assetName[0] = '\0';
-    }
-    // Some post-model records leave meshName unset and only populate the
-    // Mesh reference.  The reference's Unity Object name is the same logical
-    // sub-asset identity used by Render matching; use it before giving up.
-    if (!assetName[0] && sourceMesh)
-      TraceReadUnityObjectName(sourceMesh, assetName, sizeof(assetName));
-    if (!assetName[0]) continue;
-    const bool configuredTarget = EiemHasResourceRenderRuleAsset(assetName);
-    if (configuredTarget) {
-      Log("[DEBUG-LOGICAL-MESH] GetSubMeshInfo lod=%d gpu=%d info=%p "
-          "source=%p asset=%s tid=%lu unityTid=%lu",
-          lod, includeGpu ? 1 : 0, info, sourceMesh, assetName,
-          (unsigned long)GetCurrentThreadId(),
-          (unsigned long)s_eiemUnityThreadId);
-    }
-    EiemResolvedRenderRule resolved = {};
-    if (!EiemResolveRenderRuleForAsset(sourceMesh, assetName, &resolved) ||
-        !resolved.rule.hasMesh)
-      continue;
-    void *replacement = nullptr;
-    char error[256] = {};
-    if (!EiemBuildMeshResource(resolved.rule, &replacement, error,
-                               sizeof(error), sourceMesh) || !replacement) {
-      if (configuredTarget)
-        Log("[DEBUG-LOGICAL-MESH] GetSubMeshInfo build failed lod=%d "
-            "info=%p asset=%s source=%p error=%s",
-            lod, info, assetName, sourceMesh,
-            error[0] ? error : "unknown");
-      continue;
-    }
-    if (sourceMesh == replacement) continue;
-    EiemRememberSubMeshReplacement(info, sourceMesh, replacement);
-    bool assigned = false;
-    if (s_origSubMeshInfoSetMesh && s_subMeshInfoSetMeshMethodInfo) {
-      s_eiemApplyingSubMeshAssignment = true;
-      ((TraceSubMeshInfoSetMeshFn)s_origSubMeshInfoSetMesh)(
-          info, replacement, s_subMeshInfoSetMeshMethodInfo);
-      s_eiemApplyingSubMeshAssignment = false;
-      assigned = true;
-    } else {
-      __try {
-        *(void **)((char *)info + s_subMeshInfoMeshOffset) = replacement;
-        assigned = true;
-      } __except (EXCEPTION_EXECUTE_HANDLER) {
-        assigned = false;
-      }
-    }
-    if (assigned) ++applied;
-    Log("[MOD-LOGICAL-MESH] GetSubMeshInfo lod=%d gpu=%d info=%p "
-        "asset=%s source=%p replacement=%p assigned=%d error=%s",
-        lod, includeGpu ? 1 : 0, info, assetName, sourceMesh, replacement,
-        assigned ? 1 : 0, error[0] ? error : "<none>");
-  }
-  return applied;
-}
-
 static void *TraceLodGetSubMeshInfo(void *self, int32_t lod, bool includeGpu,
                                     void *methodInfo) {
   auto original = (TraceLodGetSubMeshInfoFn)s_origLodGetSubMeshInfo;
   void *result = original ? original(self, lod, includeGpu, methodInfo) : nullptr;
   TraceLogSubMeshInfoArray(self, lod, includeGpu, result, "GetSubMeshInfo");
-  // Capture the thread only when it is verifiably the game's window thread;
-  // resource queries can also arrive from worker threads during startup.
-  EiemOnUnityThread();
-  EiemApplyLogicalSubMeshInfoArray(result, lod, includeGpu);
   return result;
 }
 
@@ -1688,75 +1582,7 @@ static void *TraceLodGetSubMeshInfo(void *self, int32_t lod, bool includeGpu,
 static void *TraceGetPartCpuMesh(void *meshAssets, int32_t lod,
                                  void *methodInfo) {
   auto original = (TraceGetPartCpuMeshFn)s_origGetPartCpuMesh;
-  void *result = original ? original(meshAssets, lod, methodInfo) : nullptr;
-  EiemOnUnityThread();
-  if (!result || s_subMeshInfoMeshOffset < 0 || !EiemOnUnityThread())
-    return result;
-  const size_t count = EiemManagedArrayLength(result);
-  if (!count || count > 128) return result;
-  void **items = (void **)((char *)result + 32);
-  for (size_t index = 0; index < count; ++index) {
-    void *info = items[index];
-    if (!info) continue;
-    void *sourceMesh = nullptr;
-    char assetName[192] = {};
-    __try {
-      sourceMesh = *(void **)((char *)info + s_subMeshInfoMeshOffset);
-      if (s_subMeshInfoMeshNameOffset >= 0) {
-        void *name = *(void **)((char *)info + s_subMeshInfoMeshNameOffset);
-        if (name) ReadStrUtf8(name, assetName, sizeof(assetName));
-      }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-      sourceMesh = nullptr;
-      assetName[0] = '\0';
-    }
-    if (!assetName[0] && sourceMesh)
-      TraceReadUnityObjectName(sourceMesh, assetName, sizeof(assetName));
-    // The game's logical record is commonly produced before the asset loader
-    // materializes its Unity Mesh.  `meshName` is the stable sub-asset
-    // identity at this boundary; requiring sourceMesh here silently skipped
-    // the only early replacement point for post-model parts.
-    if (!assetName[0]) continue;
-    const bool configuredTarget = EiemHasResourceRenderRuleAsset(assetName);
-    if (configuredTarget) {
-      Log("[DEBUG-LOGICAL-MESH] GetPartCPUMesh lod=%d info=%p source=%p "
-          "asset=%s tid=%lu unityTid=%lu",
-          lod, info, sourceMesh, assetName,
-          (unsigned long)GetCurrentThreadId(),
-          (unsigned long)s_eiemUnityThreadId);
-    }
-    EiemResolvedRenderRule resolved = {};
-    if (!EiemResolveRenderRuleForAsset(sourceMesh, assetName, &resolved) ||
-        !resolved.rule.hasMesh)
-      continue;
-    void *replacement = nullptr;
-    char error[256] = {};
-    if (!EiemBuildMeshResource(resolved.rule, &replacement, error,
-                               sizeof(error), sourceMesh) || !replacement) {
-      if (configuredTarget)
-        Log("[DEBUG-LOGICAL-MESH] build failed lod=%d info=%p asset=%s "
-            "source=%p error=%s",
-            lod, info, assetName, sourceMesh,
-            error[0] ? error : "unknown");
-      continue;
-    }
-    EiemRememberSubMeshReplacement(info, sourceMesh, replacement);
-    // Use the game's setter with its own MethodInfo so any side effects remain
-    // intact. The recursion guard prevents the shared thunk from re-entering
-    // replacement logic.
-    if (s_origSubMeshInfoSetMesh && s_subMeshInfoSetMeshMethodInfo) {
-      s_eiemApplyingSubMeshAssignment = true;
-      ((TraceSubMeshInfoSetMeshFn)s_origSubMeshInfoSetMesh)(
-          info, replacement, s_subMeshInfoSetMeshMethodInfo);
-      s_eiemApplyingSubMeshAssignment = false;
-    } else {
-      __try { *(void **)((char *)info + s_subMeshInfoMeshOffset) = replacement; }
-      __except (EXCEPTION_EXECUTE_HANDLER) {}
-    }
-    Log("[MOD-LOGICAL-MESH] GetPartCPUMesh lod=%d info=%p asset=%s source=%p replacement=%p",
-        lod, info, assetName, sourceMesh, replacement);
-  }
-  return result;
+  return original ? original(meshAssets, lod, methodInfo) : nullptr;
 }
 
 static void TraceReadStringField(void *object, int offset, char *out,
@@ -1891,20 +1717,147 @@ static int32_t TraceModelManagerLoadAsyncString(void *self, void *path,
   return result;
 }
 
-// Every gameplay/UI/NPC prefab created through BundleResourceManager reaches
-// this common completion boundary. Apply resource rules to the completed
-// object graph here instead of adding one hook for each consumer-specific
-// loader. The call remains idempotent: the same resolver and original-state
-// registry are used by live reconciliation and renderer setters.
+// PrefabInstantiateProxy is the normal world-model lifecycle adapter. Other
+// lifecycle owners below feed the same instance registry and Render path.
 static void TracePrefabInstantiateCompleted(void *self, void *methodInfo) {
+  // Capture identity before the game completion method is allowed to release
+  // or recycle its asset handle. The instantiated GameObject is read after
+  // completion, when the hierarchy is ready for Render actions.
+  char path[768] = {};
+  if (s_prefabInstantiateGetLogName)
+    TraceDescribeString(Invoke(s_prefabInstantiateGetLogName, self), path,
+                        sizeof(path));
+  uint32_t instanceUid = 0;
+  if (s_prefabInstantiateGetInstanceUid) {
+    void *boxed = Invoke(s_prefabInstantiateGetInstanceUid, self);
+    if (boxed) instanceUid = (uint32_t)EiemTraceUnboxInt(boxed);
+  }
   auto original = (TracePrefabInstantiateCompletedFn)
       s_origPrefabInstantiateCompleted;
   if (original) original(self, methodInfo);
   void *model = s_prefabInstantiateGetGameObject
                     ? Invoke(s_prefabInstantiateGetGameObject, self)
                     : nullptr;
-  if (model)
-    TraceApplyLoadedModelRenderers(model, 0, "post-prefab-completed");
+  std::vector<EiemModPrefab> prefabs;
+  EiemFindModPrefabs(path, &prefabs);
+  const bool configured = !prefabs.empty();
+  if (TraceTakeBudget(&s_tracePrefabIdentityCount, 160))
+    Log("[TRACE-PREFAB] completed proxy=%p uid=%u path=%s model=%p configured=%d declarations=%zu",
+        self, instanceUid, path[0] ? path : "<none>", model,
+        configured ? 1 : 0, prefabs.size());
+  const bool applied =
+      EiemRegisterAndApplyModelInstance(
+          EiemModelOwnerKind::PrefabProxy, self, model, path, instanceUid,
+          "PrefabInstantiateProxy.OnCompleted");
+  if (configured && !applied) EiemQueueModReconcile("Prefab completed");
+  if (configured)
+    Log("[MOD-PREFAB] completed proxy=%p uid=%u path=%s model=%p applied=%d",
+        self, instanceUid, path, model, applied ? 1 : 0);
+}
+
+static void TracePrefabInstantiateUnload(void *self, void *methodInfo) {
+  EiemForgetModelOwner(EiemModelOwnerKind::PrefabProxy, self,
+                       "PrefabInstantiateProxy.Unload");
+  auto original = (TracePrefabInstantiateLifecycleFn)s_origPrefabInstantiateUnload;
+  if (original) original(self, methodInfo);
+}
+
+static void TracePrefabInstantiateClear(void *self, void *methodInfo) {
+  EiemForgetModelOwner(EiemModelOwnerKind::PrefabProxy, self,
+                       "PrefabInstantiateProxy.Clear");
+  auto original = (TracePrefabInstantiateLifecycleFn)s_origPrefabInstantiateClear;
+  if (original) original(self, methodInfo);
+}
+
+static void TracePrefabInstantiateDispose(void *self, void *methodInfo) {
+  EiemForgetModelOwner(EiemModelOwnerKind::PrefabProxy, self,
+                       "PrefabInstantiateProxy.Dispose");
+  auto original = (TracePrefabInstantiateLifecycleFn)s_origPrefabInstantiateDispose;
+  if (original) original(self, methodInfo);
+}
+
+static void *TraceUIModelLoaderLoadModel(void *self, void *path,
+                                         void *parent, void *methodInfo) {
+  char pathText[768] = {};
+  TraceDescribeString(path, pathText, sizeof(pathText));
+  auto original =
+      (TraceUIModelLoaderLoadModelFn)s_origUIModelLoaderLoadModel;
+  void *model = original ? original(self, path, parent, methodInfo) : nullptr;
+  const bool applied = EiemRegisterAndApplyModelInstance(
+      EiemModelOwnerKind::UIModelLoader, self, model, pathText, 0,
+      "UIModelLoader.LoadModel");
+  if (pathText[0]) {
+    std::vector<EiemModPrefab> prefabs;
+    EiemFindModPrefabs(pathText, &prefabs);
+    if (!prefabs.empty())
+      Log("[MOD-UI] sync completed loader=%p path=%s model=%p applied=%d",
+          self, pathText, model, applied ? 1 : 0);
+  }
+  return model;
+}
+
+static int32_t TraceUIModelLoaderLoadModelAsync(
+    void *self, void *path, void *parent, void *callback, void *methodInfo) {
+  // Preserve the game's managed delegate, including its metadata and lifetime.
+  // The removed native-address Action wrapper crashed at the game's invoke_impl
+  // call before our completion ran (v29, GameAssembly+0x440d5d8). Completion is
+  // observed through PrefabInstantiateProxy/CharUIModelMono instead; request IDs
+  // are not GameObjects and are never submitted to the renderer executor.
+  auto original =
+      (TraceUIModelLoaderLoadModelAsyncFn)s_origUIModelLoaderLoadModelAsync;
+  const int32_t requestId =
+      original ? original(self, path, parent, callback, methodInfo) : -1;
+  char pathText[768] = {};
+  TraceDescribeString(path, pathText, sizeof(pathText));
+  Log("[MOD-UI] async request: loader=%p path=%s request=%d callback=%p completion=game-owned",
+      self, pathText, requestId, callback);
+  return requestId;
+}
+
+static void TraceUIModelLoaderUnloadModel(void *self, void *model,
+                                          void *methodInfo) {
+  EiemForgetModelInstance(model, "UIModelLoader.UnloadModel");
+  auto original =
+      (TraceUIModelLoaderUnloadModelFn)s_origUIModelLoaderUnloadModel;
+  if (original) original(self, model, methodInfo);
+}
+
+static void TraceUIModelLoaderClear(void *self, void *methodInfo) {
+  EiemForgetModelOwner(EiemModelOwnerKind::UIModelLoader, self,
+                       "UIModelLoader._Clear");
+  auto original = (TraceUIModelLoaderLifecycleFn)s_origUIModelLoaderClear;
+  if (original) original(self, methodInfo);
+}
+
+static void TraceUIModelLoaderDispose(void *self, void *methodInfo) {
+  EiemForgetModelOwner(EiemModelOwnerKind::UIModelLoader, self,
+                       "UIModelLoader.Dispose");
+  auto original = (TraceUIModelLoaderLifecycleFn)s_origUIModelLoaderDispose;
+  if (original) original(self, methodInfo);
+}
+
+static void TraceCharUIModelOnAwake(void *self, void *methodInfo) {
+  auto original =
+      (TraceCharUIModelLifecycleFn)s_origCharUIModelOnAwake;
+  if (original) original(self, methodInfo);
+  EiemRegisterCharUIModelInstance(self, "CharUIModelMono.OnAwake");
+}
+
+static void TraceCharUIModelSetVisible(void *self, bool visible,
+                                       void *methodInfo) {
+  auto original =
+      (TraceCharUIModelSetVisibleFn)s_origCharUIModelSetVisible;
+  if (original) original(self, visible, methodInfo);
+  if (visible)
+    EiemRegisterCharUIModelInstance(self, "CharUIModelMono.SetVisible");
+}
+
+static void TraceCharUIModelOnRelease(void *self, void *methodInfo) {
+  EiemForgetModelOwner(EiemModelOwnerKind::CharUIModel, self,
+                       "CharUIModelMono.OnRelease");
+  auto original =
+      (TraceCharUIModelLifecycleFn)s_origCharUIModelOnRelease;
+  if (original) original(self, methodInfo);
 }
 
 // ModelManager calls this for both freshly instantiated and cached models.
@@ -1916,11 +1869,14 @@ static void TraceModelManagerGameObjectAllocate(void *self, void *model,
   auto original = (TraceModelManagerGameObjectFn)
       s_origModelManagerGameObjectAllocate;
   if (original) original(self, model, methodInfo);
-  TraceApplyLoadedModelRenderers(model, 0, "post-gameobject-allocate");
+  EiemReapplyRegisteredModelInstance(
+      model, "ModelManager._OnGameObjectAllocate");
 }
 
-// Persistent-pool loads return an already constructed GameObject. Remember
-// the logical path and re-apply the resource rule before the borrower uses it.
+// Persistent-pool loads return an already constructed GameObject. They may
+// re-activate a PFB instance previously registered by OnCompleted, but they do
+// not discover new replacement ownership. New ownership comes only from the
+// an explicit model owner such as PFB, BaseModelViewPart or CharUIModelMono.
 static void *TraceModelManagerLoadFromPersistentPool(void *self,
                                                       int64_t pathHash,
                                                       void *methodInfo) {
@@ -1929,8 +1885,8 @@ static void *TraceModelManagerLoadFromPersistentPool(void *self,
   void *model = original ? original(self, pathHash, methodInfo) : nullptr;
   if (model) {
     TraceRememberLoadedModelPath(model, pathHash);
-    TraceApplyLoadedModelRenderers(model, pathHash,
-                                   "post-load-from-persistent-pool");
+    EiemReapplyRegisteredModelInstance(
+        model, "ModelManager.LoadFromPersistentPool");
   }
   return model;
 }
@@ -1963,17 +1919,9 @@ static void TraceBasePartFinish(void *self, bool success, void *methodInfo) {
   if (original) original(self, success, methodInfo);
   TraceLogCharacterFlow("BaseModelViewPart.OnLoadFinish", self,
                         "BaseModelViewPart", nullptr, success ? 1 : 0);
-  if (success) {
-    void *model = TraceReadObjectField(self, s_basePartModelOffset);
-    char path[768] = {};
-    const int configPathOffset =
-        (s_basePartConfigOffset >= 0 && s_basePartConfigPathOffset >= 0)
-            ? s_basePartConfigOffset + s_basePartConfigPathOffset
-            : -1;
-    TraceReadStringField(self, configPathOffset, path, sizeof(path));
-    if (!path[0]) TraceLookupLoadedModelPath(model, path, sizeof(path));
-    TraceApplyLoadedModelRenderers(model, 0, "post-on-load-finish", path);
-  }
+  if (success)
+    EiemRegisterBaseModelViewPartInstance(
+        self, "BaseModelViewPart.OnLoadFinish");
 }
 
 static void TraceBasePartPostDeal(void *self, void *methodInfo) {
@@ -1981,15 +1929,6 @@ static void TraceBasePartPostDeal(void *self, void *methodInfo) {
   if (original) original(self, methodInfo);
   TraceLogCharacterFlow("BaseModelViewPart.PostDealLoadedModel", self,
                         "BaseModelViewPart");
-  void *model = TraceReadObjectField(self, s_basePartModelOffset);
-  char path[768] = {};
-  const int configPathOffset =
-      (s_basePartConfigOffset >= 0 && s_basePartConfigPathOffset >= 0)
-          ? s_basePartConfigOffset + s_basePartConfigPathOffset
-          : -1;
-  TraceReadStringField(self, configPathOffset, path, sizeof(path));
-  if (!path[0]) TraceLookupLoadedModelPath(model, path, sizeof(path));
-  TraceApplyLoadedModelRenderers(model, 0, "post-base-post-deal", path);
 }
 
 static void TraceComplexPartPostDeal(void *self, void *methodInfo) {
@@ -1997,43 +1936,26 @@ static void TraceComplexPartPostDeal(void *self, void *methodInfo) {
   if (original) original(self, methodInfo);
   TraceLogCharacterFlow("ComplexModelViewPart.PostDealLoadedModel", self,
                         "ComplexModelViewPart");
-  void *model = TraceReadObjectField(self, s_basePartModelOffset);
-  char path[768] = {};
-  const int configPathOffset =
-      (s_basePartConfigOffset >= 0 && s_basePartConfigPathOffset >= 0)
-          ? s_basePartConfigOffset + s_basePartConfigPathOffset
-          : -1;
-  TraceReadStringField(self, configPathOffset, path, sizeof(path));
-  if (!path[0]) TraceLookupLoadedModelPath(model, path, sizeof(path));
-  TraceApplyLoadedModelRenderers(model, 0, "post-complex-post-deal", path);
 }
 
-// The callback receives the fully instantiated prefab GameObject. Apply the
-// replacement before and after the game's own completion method: before lets
-// the game's renderer/skin cache observe the generated Mesh, while the second
-// pass catches renderers created by the completion method itself.
 static void TraceBasePartLoadFinishCallback(void *self, int32_t requestId,
                                             int64_t pathHash, void *model,
                                             void *methodInfo) {
   TraceRememberLoadedModelPath(model, pathHash);
-  TraceApplyLoadedModelRenderers(model, pathHash, "pre-load-finish-callback");
   auto original =
       (TraceBasePartLoadFinishCallbackFn)s_origBasePartLoadFinishCallback;
   if (original) original(self, requestId, pathHash, model, methodInfo);
-  TraceApplyLoadedModelRenderers(model, pathHash, "post-load-finish-callback");
 }
 
 static bool TraceBasePartLoadFinishResult(void *self, int32_t requestId,
                                           int64_t pathHash, void *model,
                                           void *methodInfo) {
   TraceRememberLoadedModelPath(model, pathHash);
-  TraceApplyLoadedModelRenderers(model, pathHash, "pre-load-finish-result");
   auto original =
       (TraceBasePartLoadFinishResultFn)s_origBasePartLoadFinishResult;
   const bool result = original ? original(self, requestId, pathHash, model,
                                            methodInfo)
                                : false;
-  TraceApplyLoadedModelRenderers(model, pathHash, "post-load-finish-result");
   return result;
 }
 
@@ -2047,17 +1969,9 @@ static void TraceBasePartLoadUseHandleFinishCallback(void *self, bool success,
   auto original = (TraceBasePartLoadUseHandleFinishCallbackFn)
       s_origBasePartLoadUseHandleFinishCallback;
   if (original) original(self, success, handle, methodInfo);
-  if (!success) return;
-  void *model = TraceReadObjectField(self, s_basePartModelOffset);
-  char path[768] = {};
-  const int configPathOffset =
-      (s_basePartConfigOffset >= 0 && s_basePartConfigPathOffset >= 0)
-          ? s_basePartConfigOffset + s_basePartConfigPathOffset
-          : -1;
-  TraceReadStringField(self, configPathOffset, path, sizeof(path));
-  if (!path[0]) TraceLookupLoadedModelPath(model, path, sizeof(path));
-  TraceApplyLoadedModelRenderers(model, 0,
-                                 "post-load-use-handle-callback", path);
+  if (success)
+    EiemRegisterBaseModelViewPartInstance(
+        self, "BaseModelViewPart._OnLoadUseHandleFinishCallback");
 }
 
 static bool TraceBasePartLoadUseHandleFinish(void *self, bool success,
@@ -2067,17 +1981,25 @@ static bool TraceBasePartLoadUseHandleFinish(void *self, bool success,
       s_origBasePartLoadUseHandleFinishResult;
   const bool result = original ? original(self, success, handle, methodInfo)
                                : false;
-  if (!result) return result;
-  void *model = TraceReadObjectField(self, s_basePartModelOffset);
-  char path[768] = {};
-  const int configPathOffset =
-      (s_basePartConfigOffset >= 0 && s_basePartConfigPathOffset >= 0)
-          ? s_basePartConfigOffset + s_basePartConfigPathOffset
-          : -1;
-  TraceReadStringField(self, configPathOffset, path, sizeof(path));
-  if (!path[0]) TraceLookupLoadedModelPath(model, path, sizeof(path));
-  TraceApplyLoadedModelRenderers(model, 0, "post-load-use-handle", path);
+  if (result)
+    EiemRegisterBaseModelViewPartInstance(
+        self, "BaseModelViewPart._OnLoadUseHandleFinish");
   return result;
+}
+
+static void TraceBasePartReleaseModel(void *self, void *methodInfo) {
+  EiemForgetModelOwner(EiemModelOwnerKind::BaseModelPart, self,
+                       "BaseModelViewPart.ReleaseModel");
+  auto original =
+      (TraceBasePartPostDealFn)s_origBasePartReleaseModel;
+  if (original) original(self, methodInfo);
+}
+
+static void TraceBasePartOnRelease(void *self, void *methodInfo) {
+  EiemForgetModelOwner(EiemModelOwnerKind::BaseModelPart, self,
+                       "BaseModelViewPart.OnRelease");
+  auto original = (TraceBasePartPostDealFn)s_origBasePartOnRelease;
+  if (original) original(self, methodInfo);
 }
 
 static void *FindMethodWithFirstParamType(void *klass, const char *methodName,
@@ -2182,13 +2104,15 @@ static void TraceHgStateSetVisible(void *self, bool visible, void *methodInfo) {
         self, visible ? 1 : 0);
 }
 
-static bool EiemApplyResolvedRenderRule(void *renderer, void *mesh,
+static bool EiemApplyResolvedRenderRule(void *renderer, void *drawRenderer,
+                                        void *mesh,
                                         const char *rendererType,
                                         void *methodInfo,
                                         const EiemResolvedRenderRule &resolved,
                                         bool allowMeshReplacement = true) {
   (void)methodInfo;
   if (!renderer || !mesh) return false;
+  if (!drawRenderer) drawRenderer = renderer;
   const EiemModRule &rule = resolved.rule;
   const char *source = resolved.source[0] ? resolved.source : "<unknown>";
   const char *asset = resolved.asset[0] ? resolved.asset : "<unknown>";
@@ -2202,15 +2126,16 @@ static bool EiemApplyResolvedRenderRule(void *renderer, void *mesh,
       !(allowMeshReplacement && rule.partnerCount))
     return false;
 
-  EiemCaptureOriginal(renderer, mesh, rendererType);
+  EiemCaptureOriginal(renderer, drawRenderer, mesh, rendererType);
+  EiemRememberRuleBinding(renderer, rule);
 
   // `handling=skip` owns only the source Renderer state. It is intentionally
   // independent from every resource mount below.
   if (skipOriginal) {
-    EiemCaptureEnabledForSkip(renderer);
+    EiemCaptureEnabledForSkip(renderer, drawRenderer);
     EiemRememberReplacement(renderer, nullptr, rendererType);
     if (g_renderer_set_enabled)
-      EiemSetRendererEnabled(renderer, false);
+      EiemSetRendererEnabled(drawRenderer, false);
     Log("[MOD] %s resource skip applied: source=%s asset=%s", rendererType,
         source, asset);
   }
@@ -2248,7 +2173,8 @@ static bool EiemApplyResolvedRenderRule(void *renderer, void *mesh,
   char error[256] = {};
   if (rule.materialCount) {
     void *materials = nullptr;
-    if (!EiemBuildRendererMaterialsForSource(rule, renderer, &materials, error,
+    if (!EiemBuildRendererMaterialsForSource(rule, drawRenderer, &materials,
+                                             error,
                                              sizeof(error))) {
       Log("[MOD] %s material resource failed: source=%s asset=%s section=%s error=%s",
           rendererType, source, asset, rule.section,
@@ -2256,7 +2182,7 @@ static bool EiemApplyResolvedRenderRule(void *renderer, void *mesh,
       // Keep skip and mesh decisions intact even when a material block fails.
       return true;
     } else if (materials &&
-               !EiemAssignRendererMaterials(renderer, materials, error,
+               !EiemAssignRendererMaterials(drawRenderer, materials, error,
                                             sizeof(error))) {
       Log("[MOD] %s material assignment failed: source=%s asset=%s section=%s error=%s",
           rendererType, source, asset, rule.section,
@@ -2264,12 +2190,14 @@ static bool EiemApplyResolvedRenderRule(void *renderer, void *mesh,
     }
   }
   bool currentEnabled = true;
-  const bool readEnabled = EiemReadRendererEnabled(renderer, &currentEnabled);
+  const bool readEnabled = EiemReadRendererEnabled(drawRenderer,
+                                                   &currentEnabled);
   bool currentVisible = false;
-  const bool readVisible = EiemReadRendererVisible(renderer, &currentVisible);
-  const int32_t materialCount = EiemReadRendererMaterialCount(renderer);
+  const bool readVisible = EiemReadRendererVisible(drawRenderer,
+                                                   &currentVisible);
+  const int32_t materialCount = EiemReadRendererMaterialCount(drawRenderer);
   char rendererDescription[512] = {};
-  TraceDescribeObject(renderer, rendererDescription,
+  TraceDescribeObject(drawRenderer, rendererDescription,
                       sizeof(rendererDescription));
   Log("[MOD] %s resource rule applied: source=%s asset=%s mesh=%s materials=%u skip=%s enabled=%s",
       rendererType, source, asset,
@@ -2284,152 +2212,446 @@ static bool EiemApplyResolvedRenderRule(void *renderer, void *mesh,
         readVisible ? (currentVisible ? "true" : "false") : "unknown");
   }
   if (allowMeshReplacement)
-    EiemApplyPartners(renderer, mesh, rendererType, rule);
+    EiemApplyPartners(renderer, drawRenderer, mesh, rendererType, rule);
   return true;
 }
 
-// The generic character path receives a fully instantiated prefab before its
-// ComplexModelViewPart builds the game's renderer/skin caches. Walk that
-// object graph and apply only explicit Render rules to its SkinnedMeshRenderers
-// while the original mesh is still available.
-static void TraceApplyLoadedModelRenderers(void *model, int64_t pathHash,
-                                           const char *stage,
-                                           const char *explicitPath) {
-  if (!model || !g_gameObject_get_transform || !g_transform_get_childCount ||
-      !g_transform_GetChild || !g_component_get_gameObject ||
-      !g_gameObject_GetComponent || !g_skinnedMeshRendererClass ||
-      !g_smr_get_sharedMesh)
-    return;
+static void *EiemFindMeshFilterDrawRenderer(void *meshFilter) {
+  if (!meshFilter || !g_rendererClass || !g_component_get_gameObject ||
+      !g_gameObject_GetComponent || !il2cpp_class_get_type ||
+      !il2cpp_type_get_object)
+    return nullptr;
+  __try {
+    void *gameObject = Invoke(g_component_get_gameObject, meshFilter);
+    void *type = il2cpp_class_get_type(g_rendererClass);
+    void *typeObject = type ? il2cpp_type_get_object(type) : nullptr;
+    if (!gameObject || !typeObject) return nullptr;
+    void *params[] = {typeObject};
+    return Invoke(g_gameObject_GetComponent, gameObject, params);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return nullptr;
+  }
+}
 
-  char pathText[768] = {};
-  if (explicitPath && explicitPath[0])
-    strncpy_s(pathText, sizeof(pathText), explicitPath, _TRUNCATE);
-  else
-    TraceLookupHashPath(pathHash, pathText, sizeof(pathText));
-  if (!pathText[0])
-    TraceResolveStringPathHashPath(pathHash, pathText, sizeof(pathText));
+static bool EiemApplyRenderRuleSetToRenderer(
+    void *rootTransform, void *meshOwner, void *drawRenderer, void *mesh,
+    const char *rendererType, void *methodInfo,
+    const std::vector<EiemModRule> &rules, const char *sourceLabel,
+    bool *referenced = nullptr) {
+  if (!meshOwner || !drawRenderer || !mesh || !rendererType) return false;
+  void *identityMesh = mesh;
+  EiemPrepareRenderInput(meshOwner, mesh, rendererType, &identityMesh);
+  if (!identityMesh) return false;
 
-  void *smrType = il2cpp_class_get_type(g_skinnedMeshRendererClass);
-  if (!smrType || !il2cpp_type_get_object) return;
-  void *smrTypeObject = il2cpp_type_get_object(smrType);
-  if (!smrTypeObject) return;
+  char source[768] = {};
+  char asset[192] = {};
+  if (!EiemReadLiveMeshIdentity(identityMesh, source, sizeof(source), asset,
+                                sizeof(asset)))
+    return false;
 
-  void *root = Invoke(g_gameObject_get_transform, model);
-  if (!root) return;
-  uint32_t visited = 0;
-  uint32_t renderers = 0;
-  uint32_t matched = 0;
-  uint32_t configured = 0;
-  const bool safeThread = EiemOnUnityThread();
-
-  auto inspectRenderer = [&](void *renderer) {
-    if (!renderer) return;
-    ++renderers;
-    void *sourceMesh = EiemReadSharedMesh(renderer, "SkinnedMeshRenderer");
-    char rendererText[512] = {};
-    char rendererName[192] = {};
-    char meshText[512] = {};
-    TraceDescribeObject(renderer, rendererText, sizeof(rendererText));
-    EiemExtractObjectName(rendererText, rendererName, sizeof(rendererName));
-    TraceDescribeObject(sourceMesh, meshText, sizeof(meshText));
-    char meshName[192] = {};
-    EiemExtractObjectName(meshText, meshName, sizeof(meshName));
-    const char *identity = meshName[0] ? meshName : rendererName;
-    const bool configuredTarget =
-        identity[0] && EiemHasResourceRenderRuleAsset(identity);
-    if (configuredTarget) ++configured;
+  char relativePath[768] = {};
+  bool relativePathAttempted = false;
+  bool relativePathResolved = false;
+  for (size_t ruleIndex = 0; ruleIndex < rules.size(); ++ruleIndex) {
+    const EiemModRule &rule = rules[ruleIndex];
+    if (rule.path[0]) {
+      if (!relativePathAttempted) {
+        relativePathAttempted = true;
+        relativePathResolved =
+            rootTransform && EiemBuildRelativeRendererPath(
+                                 rootTransform, drawRenderer, relativePath,
+                                 sizeof(relativePath));
+      }
+      if (!relativePathResolved) continue;
+    }
+    if (!EiemRenderRuleMatches(rule, relativePath, identityMesh, asset))
+      continue;
+    if (referenced) referenced[ruleIndex] = true;
     EiemResolvedRenderRule resolved = {};
-    const bool hasRule = sourceMesh && identity[0] &&
-                         EiemResolveRenderRuleForAsset(sourceMesh, identity,
-                                                       &resolved);
-    if (hasRule) ++matched;
-    // Configured targets are never hidden behind a global trace budget. A
-    // target that reaches this lifecycle boundary but fails its full match is
-    // precisely the diagnostic needed to distinguish identity from timing.
-    if (configuredTarget || hasRule)
-      Log("[TRACE-CHAR-RENDER] stage=%s path=%s renderer=%s mesh=%s "
-          "source=%p configured=%d matched=%d safe=%d",
-          stage ? stage : "unknown", pathText[0] ? pathText : "<unresolved>",
-          rendererName[0] ? rendererName : "<unnamed>",
-          meshName[0] ? meshName : "<unnamed>", sourceMesh,
-          configuredTarget ? 1 : 0, hasRule ? 1 : 0,
-          safeThread ? 1 : 0);
-    const bool hasAction =
-        resolved.rule.hasMesh ||
-        EiemModEquals(resolved.rule.handling, "skip") ||
-        resolved.rule.materialCount || resolved.rule.partnerCount;
-    if (hasRule && safeThread && hasAction) {
-      const bool applied = EiemApplyResolvedRenderRule(
-          renderer, sourceMesh, "SkinnedMeshRenderer", nullptr, resolved, true);
-      Log("[TRACE-CHAR-RENDER-APPLY] stage=%s renderer=%p source=%p applied=%d",
-          stage ? stage : "unknown", renderer, sourceMesh, applied ? 1 : 0);
+    resolved.rule = rule;
+    strncpy_s(resolved.source, sizeof(resolved.source),
+              source[0] ? source : (sourceLabel ? sourceLabel : "<mesh>"),
+              _TRUNCATE);
+    strncpy_s(resolved.asset, sizeof(resolved.asset), asset, _TRUNCATE);
+    return EiemApplyResolvedRenderRule(meshOwner, drawRenderer, identityMesh,
+                                       rendererType, methodInfo, resolved,
+                                       true);
+  }
+  return false;
+}
+
+static bool EiemApplyRenderRuleSet(void *model,
+                                   const std::vector<EiemModRule> &rules,
+                                   const char *sourceLabel,
+                                   const char *stage, bool *referenced = nullptr) {
+  if (!model || rules.empty() || !EiemOnUnityThread() ||
+      !g_gameObject_GetComponentsInChildren || !il2cpp_class_get_type ||
+      !il2cpp_type_get_object)
+    return false;
+
+  void *root = g_gameObject_get_transform
+                   ? Invoke(g_gameObject_get_transform, model)
+                   : nullptr;
+  uint32_t applied = 0;
+  size_t visited = 0;
+  const uintptr_t previousOwner = s_eiemActivePrefabInstance;
+  s_eiemActivePrefabInstance = (uintptr_t)model;
+
+  auto visitType = [&](void *componentClass, const char *rendererType) {
+    if (!componentClass) return;
+    void *type = il2cpp_class_get_type(componentClass);
+    void *typeObject = type ? il2cpp_type_get_object(type) : nullptr;
+    if (!typeObject) return;
+    bool includeInactive = true;
+    void *params[] = {typeObject, &includeInactive};
+    void *array = Invoke(g_gameObject_GetComponentsInChildren, model, params);
+    const size_t count = EiemManagedArrayLength(array);
+    if (!array || count > 8192) return;
+    visited += count;
+    void **items = (void **)((char *)array + IL2CPP_ARRAY_DATA);
+    for (size_t index = 0; index < count; ++index) {
+      void *meshOwner = items[index];
+      if (!meshOwner) continue;
+      void *drawRenderer = EiemModEquals(rendererType, "SkinnedMeshRenderer")
+                               ? meshOwner
+                               : EiemFindMeshFilterDrawRenderer(meshOwner);
+      if (!drawRenderer) continue;
+      void *mesh = EiemReadSharedMesh(meshOwner, rendererType);
+      if (mesh && EiemApplyRenderRuleSetToRenderer(
+                      root, meshOwner, drawRenderer, mesh, rendererType,
+                      nullptr, rules, sourceLabel, referenced))
+        ++applied;
     }
   };
 
-  if (g_gameObject_GetComponentsInChildren) {
-    bool includeInactive = true;
-    void *params[] = {smrTypeObject, &includeInactive};
-    void *rendererArray = Invoke(g_gameObject_GetComponentsInChildren, model,
-                                 params);
-    const size_t count = EiemManagedArrayLength(rendererArray);
-    if (rendererArray && count <= 8192) {
-      void **items = (void **)((char *)rendererArray + IL2CPP_ARRAY_DATA);
-      for (size_t index = 0; index < count; ++index) inspectRenderer(items[index]);
-      if (configured || matched)
-        Log("[TRACE-CHAR-RENDER-SUMMARY] stage=%s path=%s visited=%zu "
-            "renderers=%u configured=%u matched=%u safe=%d "
-            "source=GetComponentsInChildren",
-            stage ? stage : "unknown",
-            pathText[0] ? pathText : "<unresolved>", count, renderers,
-            configured, matched,
-            safeThread ? 1 : 0);
-      return;
-    }
-  }
-
-  void *stack[4096] = {};
-  size_t stackCount = 1;
-  stack[0] = root;
-  while (stackCount && visited < _countof(stack)) {
-    void *transform = stack[--stackCount];
-    if (!transform) continue;
-    ++visited;
-    void *go = Invoke(g_component_get_gameObject, transform);
-    if (go) {
-      void *params[] = {smrTypeObject};
-      inspectRenderer(Invoke(g_gameObject_GetComponent, go, params));
-    }
-    const int childCount = EiemTraceUnboxInt(
-        Invoke(g_transform_get_childCount, transform));
-    if (childCount <= 0) continue;
-    const int bounded = childCount > 256 ? 256 : childCount;
-    for (int index = 0; index < bounded && stackCount < _countof(stack);
-         ++index) {
-      void *params[] = {&index};
-      void *child = Invoke(g_transform_GetChild, transform, params);
-      if (child) stack[stackCount++] = child;
-    }
-  }
-  if (configured || matched)
-    Log("[TRACE-CHAR-RENDER-SUMMARY] stage=%s path=%s visited=%u renderers=%u "
-        "configured=%u matched=%u safe=%d",
-        stage ? stage : "unknown",
-        pathText[0] ? pathText : "<unresolved>", visited, renderers,
-        configured, matched,
-        safeThread ? 1 : 0);
+  visitType(g_skinnedMeshRendererClass, "SkinnedMeshRenderer");
+  visitType(g_meshFilterClass, "MeshFilter");
+  s_eiemActivePrefabInstance = previousOwner;
+  Log("[MOD-MESH] applied model=%p components=%zu actions=%u stage=%s",
+      model, visited, applied, stage ? stage : "unknown");
+  return applied != 0;
 }
 
-// Render sections organize a resource replacement, but their match key is the
-// source Mesh resource. Consequently one rule applies to every Renderer that
-// references that Mesh (including shadow and LOD instances).
-static bool EiemApplyRenderRules(void *renderer, void *mesh,
-                                 const char *rendererType, void *methodInfo) {
-  void *identityMesh = mesh;
-  EiemPrepareRenderInput(renderer, mesh, rendererType, &identityMesh);
-  EiemResolvedRenderRule resolved = {};
-  return EiemResolveRenderRule(identityMesh, &resolved) &&
-         EiemApplyResolvedRenderRule(renderer, mesh, rendererType, methodInfo,
-                                     resolved);
+static bool EiemApplyStandaloneRenderRules(void *model, const char *stage) {
+  std::vector<EiemModRule> rules;
+  EiemFindStandaloneRenderRules(&rules);
+  return EiemApplyRenderRuleSet(model, rules, "<mesh identity>", stage);
+}
+
+static bool EiemApplyStandaloneRenderRulesToRenderer(
+    void *meshOwner, void *drawRenderer, void *mesh,
+    const char *rendererType, void *methodInfo, const char *stage) {
+  (void)stage;
+  if (!EiemOnUnityThread()) return false;
+  std::vector<EiemModRule> rules;
+  EiemFindStandaloneRenderRules(&rules);
+  return EiemApplyRenderRuleSetToRenderer(
+      nullptr, meshOwner, drawRenderer, mesh, rendererType, methodInfo, rules,
+      "<mesh setter>");
+}
+
+struct EiemModelOwnerRef {
+  EiemModelOwnerKind kind = EiemModelOwnerKind::PrefabProxy;
+  void *owner = nullptr;
+};
+
+struct EiemModelInstanceState {
+  void *model = nullptr;
+  uint32_t instanceUid = 0;
+  char path[768] = {};
+  EiemModelOwnerRef owners[4] = {};
+  uint32_t ownerCount = 0;
+};
+static SRWLOCK s_eiemModelInstanceLock = SRWLOCK_INIT;
+static std::vector<EiemModelInstanceState> s_eiemModelInstances;
+
+static bool EiemSameRelativePath(const char *left, const char *right) {
+  const bool leftEmpty = !left || !left[0];
+  const bool rightEmpty = !right || !right[0];
+  return leftEmpty || rightEmpty ? leftEmpty == rightEmpty
+                                 : EiemModSameLogicalPath(left, right);
+}
+
+static bool EiemBuildRelativeRendererPath(void *rootTransform, void *renderer,
+                                          char *out, size_t outSize) {
+  if (!rootTransform || !renderer || !out || !outSize ||
+      !g_component_get_transform || !g_transform_get_parent ||
+      !g_object_get_name)
+    return false;
+  out[0] = '\0';
+  char names[64][96] = {};
+  size_t count = 0;
+  void *transform = Invoke(g_component_get_transform, renderer);
+  while (transform && transform != rootTransform && count < _countof(names)) {
+    void *name = Invoke(g_object_get_name, transform);
+    if (name) ReadStrUtf8(name, names[count], sizeof(names[count]));
+    if (!names[count][0]) return false;
+    ++count;
+    transform = Invoke(g_transform_get_parent, transform);
+  }
+  if (transform != rootTransform) return false;
+  size_t used = 0;
+  for (size_t index = count; index > 0; --index) {
+    const char *name = names[index - 1];
+    const size_t length = strlen(name);
+    if (used + (used ? 1 : 0) + length + 1 > outSize) return false;
+    if (used) out[used++] = '/';
+    memcpy(out + used, name, length);
+    used += length;
+    out[used] = '\0';
+  }
+  return true;
+}
+
+static bool EiemRenderRuleMatches(const EiemModRule &rule,
+                                  const char *relativePath, void *mesh,
+                                  const char *asset) {
+  // A source Render must identify a node path, a Mesh sub-asset, or both.
+  // Selector-free Render sections are valid only as partner declarations.
+  if (!rule.path[0] && !rule.asset[0]) return false;
+  if (rule.path[0] && !EiemSameRelativePath(rule.path, relativePath))
+    return false;
+  if (rule.asset[0] && (!asset || !EiemModEquals(rule.asset, asset)))
+    return false;
+  if (rule.matchVertices >= 0 || rule.matchIndices >= 0 ||
+      rule.matchSubMeshes >= 0) {
+    int32_t vertices = -1, indices = -1, subMeshes = -1;
+    EiemReadLiveMeshShape(mesh, &vertices, &indices, &subMeshes);
+    if (rule.matchVertices >= 0 && rule.matchVertices != vertices) return false;
+    if (rule.matchIndices >= 0 && rule.matchIndices != indices) return false;
+    if (rule.matchSubMeshes >= 0 && rule.matchSubMeshes != subMeshes)
+      return false;
+  }
+  return true;
+}
+
+static bool EiemApplyPrefabRules(void *model, const EiemModPrefab &prefab,
+                                 const char *stage) {
+  // A PFB only scopes a rule set. Static and skinned consumers must execute
+  // through the same code as standalone Mesh-identity actions.
+  std::vector<EiemModRule> rules;
+  for (uint32_t ref = 0; ref < prefab.renderCount; ++ref) {
+    if (!prefab.renders[ref][0]) continue;
+    EiemModRule rule = {};
+    if (EiemFindRenderRuleBySection(prefab.modPath, prefab.renders[ref], &rule))
+      rules.push_back(rule);
+    else
+      Log("[MOD-PREFAB] Render declaration not found: prefab=%s render=%s",
+          prefab.path, prefab.renders[ref]);
+  }
+  bool referenced[_countof(prefab.renders)] = {};
+  const bool applied = EiemApplyRenderRuleSet(model, rules, prefab.path, stage, referenced);
+  for (size_t index = 0; index < rules.size(); ++index)
+    if (!referenced[index])
+      Log("[MOD-PREFAB] Render target not found: prefab=%s render=%s stage=%s",
+          prefab.path, rules[index].section, stage ? stage : "unknown");
+  return applied;
+}
+
+static bool EiemRegisterAndApplyModelInstance(
+    EiemModelOwnerKind ownerKind, void *owner, void *model,
+    const char *prefabPath, uint32_t instanceUid, const char *stage) {
+  if (!model) return false;
+  std::vector<EiemModPrefab> prefabs;
+  if (prefabPath && prefabPath[0]) EiemFindModPrefabs(prefabPath, &prefabs);
+  const bool hasStandaloneRules = EiemHasStandaloneRenderRules();
+  if (prefabs.empty() && !hasStandaloneRules) return false;
+
+  bool applied = false;
+  if (hasStandaloneRules)
+    applied = EiemApplyStandaloneRenderRules(model, stage) || applied;
+  for (const auto &prefab : prefabs)
+    applied = EiemApplyPrefabRules(model, prefab, stage) || applied;
+  // Standalone rules register only instances they actually matched. A scoped
+  // Prefab declaration is retained even before its target Renderer appears so
+  // F10 can replay it after deferred hierarchy construction.
+  if (!applied && prefabs.empty()) return false;
+
+  std::vector<uintptr_t> releasedModels;
+  AcquireSRWLockExclusive(&s_eiemModelInstanceLock);
+  // A PrefabInstantiateProxy or BaseModelViewPart owns one live result at a
+  // time. UIModelLoader is intentionally different: one loader can own many
+  // preview instances.
+  if (owner && ownerKind != EiemModelOwnerKind::UIModelLoader) {
+    for (size_t stateIndex = 0; stateIndex < s_eiemModelInstances.size();) {
+      auto &entry = s_eiemModelInstances[stateIndex];
+      if (entry.model == model) {
+        ++stateIndex;
+        continue;
+      }
+      for (uint32_t ownerIndex = 0; ownerIndex < entry.ownerCount;
+           ++ownerIndex) {
+        if (entry.owners[ownerIndex].kind != ownerKind ||
+            entry.owners[ownerIndex].owner != owner)
+          continue;
+        for (uint32_t move = ownerIndex + 1; move < entry.ownerCount; ++move)
+          entry.owners[move - 1] = entry.owners[move];
+        --entry.ownerCount;
+        break;
+      }
+      if (entry.ownerCount == 0) {
+        releasedModels.push_back((uintptr_t)entry.model);
+        s_eiemModelInstances.erase(s_eiemModelInstances.begin() + stateIndex);
+      } else {
+        ++stateIndex;
+      }
+    }
+  }
+  size_t slot = SIZE_MAX;
+  for (size_t index = 0; index < s_eiemModelInstances.size(); ++index) {
+    if (s_eiemModelInstances[index].model == model) {
+      slot = index;
+      break;
+    }
+  }
+  if (slot == SIZE_MAX) {
+    EiemModelInstanceState state = {};
+    state.model = model;
+    s_eiemModelInstances.push_back(state);
+    slot = s_eiemModelInstances.size() - 1;
+  }
+  auto &state = s_eiemModelInstances[slot];
+  if (instanceUid) state.instanceUid = instanceUid;
+  if (prefabPath && prefabPath[0])
+    strncpy_s(state.path, sizeof(state.path), prefabPath, _TRUNCATE);
+  if (owner) {
+    bool knownOwner = false;
+    for (uint32_t index = 0; index < state.ownerCount; ++index) {
+      if (state.owners[index].kind == ownerKind &&
+          state.owners[index].owner == owner) {
+        knownOwner = true;
+        break;
+      }
+    }
+    if (!knownOwner && state.ownerCount < _countof(state.owners)) {
+      state.owners[state.ownerCount].kind = ownerKind;
+      state.owners[state.ownerCount].owner = owner;
+      ++state.ownerCount;
+    }
+  }
+  ReleaseSRWLockExclusive(&s_eiemModelInstanceLock);
+  for (uintptr_t released : releasedModels) {
+    EiemDestroyPartnerObjects(released);
+    EiemForgetRenderOverrides(released);
+  }
+  return applied;
+}
+
+// BaseModelViewPart is the game's confirmed character-model completion owner.
+// In particular, its handle path reuses an already loaded model without
+// creating another PrefabInstantiateProxy. Read the exact model and logical
+// path held by that part; never infer identity from a scene-wide Mesh scan.
+static bool EiemRegisterBaseModelViewPartInstance(void *part,
+                                                   const char *stage) {
+  if (!part) return false;
+  void *model = TraceReadObjectField(part, s_basePartModelOffset);
+  if (!model) return false;
+
+  char path[768] = {};
+  const int configPathOffset =
+      (s_basePartConfigOffset >= 0 && s_basePartConfigPathOffset >= 0)
+          ? s_basePartConfigOffset + s_basePartConfigPathOffset
+          : -1;
+  TraceReadStringField(part, configPathOffset, path, sizeof(path));
+  if (!path[0]) TraceLookupLoadedModelPath(model, path, sizeof(path));
+
+  const bool applied = EiemRegisterAndApplyModelInstance(
+      EiemModelOwnerKind::BaseModelPart, part, model,
+      path[0] ? path : nullptr, 0, stage);
+  Log("[MOD-MODEL-PART] completed part=%p path=%s model=%p applied=%d stage=%s",
+      part, path, model, applied ? 1 : 0, stage ? stage : "unknown");
+  return applied;
+}
+
+// CharUIModelMono is attached directly to the UI presentation hierarchy. Its
+// own GameObject is therefore a sufficient lifecycle root for Mesh-identity
+// rules; no PFB name inference or scene-wide search is needed.
+static bool EiemRegisterCharUIModelInstance(void *component,
+                                             const char *stage) {
+  if (!component || !g_component_get_gameObject)
+    return false;
+  void *model = Invoke(g_component_get_gameObject, component);
+  const bool applied = EiemRegisterAndApplyModelInstance(
+      EiemModelOwnerKind::CharUIModel, component, model, nullptr, 0, stage);
+  Log("[MOD-CHAR-UI] completed component=%p model=%p applied=%d stage=%s",
+      component, model, applied ? 1 : 0, stage ? stage : "unknown");
+  return applied;
+}
+
+static bool EiemReapplyRegisteredModelInstance(void *model,
+                                                const char *stage) {
+  if (!model) return false;
+  EiemModelInstanceState state = {};
+  bool found = false;
+  AcquireSRWLockShared(&s_eiemModelInstanceLock);
+  for (const auto &entry : s_eiemModelInstances) {
+    if (entry.model == model) {
+      state = entry;
+      found = true;
+      break;
+    }
+  }
+  ReleaseSRWLockShared(&s_eiemModelInstanceLock);
+  if (!found) return false;
+  std::vector<EiemModPrefab> prefabs;
+  EiemFindModPrefabs(state.path, &prefabs);
+  bool applied = EiemApplyStandaloneRenderRules(model, stage);
+  for (const auto &prefab : prefabs)
+    applied = EiemApplyPrefabRules(model, prefab, stage) || applied;
+  return applied;
+}
+
+static void EiemForgetModelOwner(EiemModelOwnerKind ownerKind, void *owner,
+                                 const char *stage) {
+  if (!owner) return;
+  std::vector<uintptr_t> releasedModels;
+  AcquireSRWLockExclusive(&s_eiemModelInstanceLock);
+  for (size_t stateIndex = 0; stateIndex < s_eiemModelInstances.size();) {
+    auto &state = s_eiemModelInstances[stateIndex];
+    for (uint32_t ownerIndex = 0; ownerIndex < state.ownerCount;
+         ++ownerIndex) {
+      if (state.owners[ownerIndex].kind != ownerKind ||
+          state.owners[ownerIndex].owner != owner)
+        continue;
+      for (uint32_t move = ownerIndex + 1; move < state.ownerCount; ++move)
+        state.owners[move - 1] = state.owners[move];
+      --state.ownerCount;
+      break;
+    }
+    if (state.ownerCount == 0) {
+      releasedModels.push_back((uintptr_t)state.model);
+      s_eiemModelInstances.erase(s_eiemModelInstances.begin() + stateIndex);
+    } else {
+      ++stateIndex;
+    }
+  }
+  ReleaseSRWLockExclusive(&s_eiemModelInstanceLock);
+  for (uintptr_t modelOwner : releasedModels) {
+    EiemDestroyPartnerObjects(modelOwner);
+    EiemForgetRenderOverrides(modelOwner);
+  }
+  if (!releasedModels.empty())
+    Log("[MOD-LIFECYCLE] released owner=%p instances=%zu stage=%s", owner,
+        releasedModels.size(), stage ? stage : "unknown");
+}
+
+static void EiemForgetModelInstance(void *model, const char *stage) {
+  if (!model) return;
+  bool removed = false;
+  AcquireSRWLockExclusive(&s_eiemModelInstanceLock);
+  for (size_t index = 0; index < s_eiemModelInstances.size(); ++index) {
+    if (s_eiemModelInstances[index].model != model) continue;
+    s_eiemModelInstances.erase(s_eiemModelInstances.begin() + index);
+    removed = true;
+    break;
+  }
+  ReleaseSRWLockExclusive(&s_eiemModelInstanceLock);
+  if (!removed) return;
+  const uintptr_t modelOwner = (uintptr_t)model;
+  EiemDestroyPartnerObjects(modelOwner);
+  EiemForgetRenderOverrides(modelOwner);
+  Log("[MOD-LIFECYCLE] released model=%p stage=%s", model,
+      stage ? stage : "unknown");
 }
 
 // Endfield owns source/replacement material arrays in
@@ -2459,14 +2681,14 @@ static bool EiemReapplyRendererMaterialsAfterCommit(void *renderer,
 
   void *mesh = EiemReadSharedMesh(renderer, "SkinnedMeshRenderer");
   if (!mesh) return false;
-  void *identityMesh = mesh;
-  EiemPrepareRenderInput(renderer, mesh, "SkinnedMeshRenderer", &identityMesh);
   EiemResolvedRenderRule resolved = {};
-  if (!EiemResolveRenderRule(identityMesh, &resolved) ||
+  if (!EiemFindBoundRenderRule(renderer, &resolved.rule) ||
       !resolved.rule.materialCount)
     return false;
+  TraceReadUnityObjectName(mesh, resolved.asset, sizeof(resolved.asset));
 
-  EiemCaptureOriginal(renderer, mesh, "SkinnedMeshRenderer");
+  EiemCaptureOriginal(renderer, renderer, mesh, "SkinnedMeshRenderer");
+  EiemRememberRuleBinding(renderer, resolved.rule);
   char error[256] = {};
   void *materials = nullptr;
   if (!EiemBuildRendererMaterialsForSource(resolved.rule, renderer, &materials,
@@ -2542,25 +2764,27 @@ static bool TraceRendererInfoTryReplaceSharedMaterials(void *self,
   return result;
 }
 
-// Endfield initializes its custom skinning/GPU renderer state inside
-// NPCAvatarCreatorUtils.AssignSkin. Replacing sharedMesh after that point is
-// too late even when the Unity Mesh arrays are valid. Mount mesh resources
-// immediately before the game consumes the renderer array, then let the
-// original function initialize every game-owned cache from that Mesh.
+// These methods expose the separate NPC avatar construction order for
+// diagnostics. Character model replacement is owned by the model/PFB
+// lifecycle above; NPC activity alone is not evidence that a UI character
+// presentation uses this pipeline.
 static void TraceAssignSkinPost(int32_t lod, void *renderers,
                                 void *rootBones, void *closure,
                                 void *methodInfo) {
   auto original = (TraceAssignSkinPostFn)s_origAssignSkinPost;
   if (original)
     original(lod, renderers, rootBones, closure, methodInfo);
-  Log("[TRACE-ASSIGN-SKIN-BOUNDARY] lod=%d array=%p", lod, renderers);
+  if (TraceTakeBudget(&s_traceAvatarAssemblyCount, 160))
+    Log("[TRACE-ASSIGN-SKIN-BOUNDARY] lod=%d array=%p", lod, renderers);
 }
 
 static void TraceSetSmrRootBone(void *animator, void *renderers,
                                 void *rootBoneInfos, void *methodInfo) {
   auto original = (TraceSetSmrRootBoneFn)s_origSetSmrRootBone;
   if (original) original(animator, renderers, rootBoneInfos, methodInfo);
-  Log("[TRACE-ROOT-BONE-BOUNDARY] animator=%p array=%p", animator, renderers);
+  if (TraceTakeBudget(&s_traceAvatarAssemblyCount, 160))
+    Log("[TRACE-ROOT-BONE-BOUNDARY] animator=%p array=%p count=%zu",
+        animator, renderers, EiemManagedArrayLength(renderers));
 }
 
 static void TraceCreateSmsGo(void *assetLoader, void *meshAssets, int32_t lod,
@@ -2569,22 +2793,6 @@ static void TraceCreateSmsGo(void *assetLoader, void *meshAssets, int32_t lod,
                              void **rootBones, bool flag, void *handleMap,
                              bool deferred, void *methodInfo) {
   auto original = (TraceCreateSmsGoFn)s_origCreateSmsGo;
-  // CreateSMSGO consumes the logical SubMeshInfo records while constructing
-  // its renderers. Apply the declared resource before entering that function;
-  // a post-return Renderer assignment is too late for the game's skin/GPU
-  // caches. This call uses the original method directly to avoid re-entering
-  // the observation detour, then applies the same mutation routine used by
-  // GetSubMeshInfo.
-  if (meshAssets && s_origLodGetSubMeshInfo &&
-      s_lodGetSubMeshInfoMethodInfo && EiemOnUnityThread()) {
-    void *infos = ((TraceLodGetSubMeshInfoFn)s_origLodGetSubMeshInfo)(
-        meshAssets, lod, false, s_lodGetSubMeshInfoMethodInfo);
-    const size_t logicalApplied =
-        EiemApplyLogicalSubMeshInfoArray(infos, lod, false);
-    if (logicalApplied)
-      Log("[MOD-LOGICAL-PRECREATE] CreateSMSGO lod=%d meshAssets=%p applied=%zu",
-          lod, meshAssets, logicalApplied);
-  }
   if (original)
     original(assetLoader, meshAssets, lod, goPool, parent, stringList,
              intList, renderers, rootBones, flag, handleMap, deferred,
@@ -2603,7 +2811,8 @@ static void TraceCreateSmsGo(void *assetLoader, void *meshAssets, int32_t lod,
         (unsigned long long)readWord(array, 16),
         (unsigned long long)readWord(array, 24));
   }
-  Log("[TRACE-SMS-BOUNDARY] CreateSMSGO lod=%d array=%p", lod, array);
+  if (TraceTakeBudget(&s_traceAvatarAssemblyCount, 160))
+    Log("[TRACE-SMS-BOUNDARY] CreateSMSGO lod=%d array=%p", lod, array);
 }
 
 static void TraceCreateSmsPost(void *meshAssets, int32_t lod, void *goPool,
@@ -2611,22 +2820,6 @@ static void TraceCreateSmsPost(void *meshAssets, int32_t lod, void *goPool,
                                void **renderers, void **rootBones, bool flag,
                                void *methodInfo) {
   auto original = (TraceCreateSmsPostFn)s_origCreateSmsPost;
-  // Post-model construction consumes SubMeshInfo inside the original
-  // function. Mutating the returned Renderer array is too late: AssignSkin
-  // has already built its skin/GPU state from the source Mesh.  Resolve the
-  // same logical records before entering the game implementation, just as
-  // the CreateSMSGO path does.
-  if (meshAssets && s_origLodGetSubMeshInfo &&
-      s_lodGetSubMeshInfoMethodInfo && EiemOnUnityThread()) {
-    void *infos = ((TraceLodGetSubMeshInfoFn)s_origLodGetSubMeshInfo)(
-        meshAssets, lod, false, s_lodGetSubMeshInfoMethodInfo);
-    const size_t logicalApplied =
-        EiemApplyLogicalSubMeshInfoArray(infos, lod, false);
-    if (logicalApplied)
-      Log("[MOD-LOGICAL-PREPOST] CreateSMSInfoForPostModel lod=%d "
-          "meshAssets=%p applied=%zu",
-          lod, meshAssets, logicalApplied);
-  }
   if (original)
     original(meshAssets, lod, goPool, parent, stringList, intList, renderers,
              rootBones, flag, methodInfo);
@@ -2644,8 +2837,9 @@ static void TraceCreateSmsPost(void *meshAssets, int32_t lod, void *goPool,
         (unsigned long long)readWord(array, 16),
         (unsigned long long)readWord(array, 24));
   }
-  Log("[TRACE-SMS-BOUNDARY] CreateSMSInfoForPostModel lod=%d array=%p",
-      lod, array);
+  if (TraceTakeBudget(&s_traceAvatarAssemblyCount, 160))
+    Log("[TRACE-SMS-BOUNDARY] CreateSMSInfoForPostModel lod=%d array=%p",
+        lod, array);
 }
 
 // Mesh observations are fixed-size metadata records. They intentionally keep
@@ -2844,67 +3038,17 @@ static void TraceRefreshMeshObservations() {
   TraceEnumerateRendererType(g_meshFilterClass, "MeshFilter");
 }
 
-struct EiemModReconcileStats {
-  uint32_t renderers = 0;
-  uint32_t meshes = 0;
-  uint32_t uniqueMeshes = 0;
-  uint32_t matchedMeshes = 0;
-  uint32_t appliedRenderers = 0;
-};
+static EiemModUpdateQueue s_eiemModUpdates;
 
-struct EiemModReconcileContext {
-  EiemModReconcileStats stats = {};
-  // Mesh address -> matching entry, or -1 for a known non-match. This keeps
-  // one identity/shape lookup per source resource during a full scene pass.
-  std::unordered_map<void *, int> resolvedMeshes;
-  std::vector<EiemResolvedRenderRule> matches;
-};
-
-static void EiemReconcileRendererVisitor(void *renderer, void *mesh,
-                                         const char *rendererType,
-                                         void *context) {
-  auto *reconcile = (EiemModReconcileContext *)context;
-  if (!reconcile || !renderer) return;
-  ++reconcile->stats.renderers;
-  if (!mesh) return;
-  ++reconcile->stats.meshes;
-  void *identityMesh = mesh;
-  EiemPrepareRenderInput(renderer, mesh, rendererType, &identityMesh);
-  int resolvedIndex = -1;
-  const auto known = reconcile->resolvedMeshes.find(identityMesh);
-  if (known != reconcile->resolvedMeshes.end()) {
-    resolvedIndex = known->second;
-  } else {
-    ++reconcile->stats.uniqueMeshes;
-    EiemResolvedRenderRule resolved = {};
-    if (EiemResolveRenderRule(identityMesh, &resolved)) {
-      resolvedIndex = (int)reconcile->matches.size();
-      reconcile->matches.push_back(resolved);
-      ++reconcile->stats.matchedMeshes;
-    }
-    reconcile->resolvedMeshes.emplace(identityMesh, resolvedIndex);
-  }
-  if (resolvedIndex >= 0 &&
-      EiemApplyResolvedRenderRule(renderer, mesh, rendererType, nullptr,
-                                  reconcile->matches[(size_t)resolvedIndex],
-                                  true)) {
-    ++reconcile->stats.appliedRenderers;
-  }
-}
-
-static volatile LONG s_eiemModReconcileQueued = 0;
-static volatile LONG s_eiemLifecycleRetryRemaining = 0;
-static volatile LONG64 s_eiemLifecycleRetryDueMs = 0;
-
-static void EiemQueueModReconcile(const char *reason) {
+static void EiemRequestModUpdate(EiemModUpdate request, const char *reason) {
   if (g_shutdownRequested || !g_gameHwnd || !IsWindow(g_gameHwnd)) {
     Log("[MOD] Reconcile not queued (%s): game window is unavailable",
         reason ? reason : "unknown");
     return;
   }
-  if (InterlockedCompareExchange(&s_eiemModReconcileQueued, 1, 0) != 0) return;
+  if (!s_eiemModUpdates.Request(request)) return;
   if (!PostMessageW(g_gameHwnd, WM_EIEM_MOD_RECONCILE, 0, 0)) {
-    InterlockedExchange(&s_eiemModReconcileQueued, 0);
+    s_eiemModUpdates.Take();
     Log("[MOD] Reconcile post failed (%s): err=%lu",
         reason ? reason : "unknown", GetLastError());
     return;
@@ -2912,78 +3056,52 @@ static void EiemQueueModReconcile(const char *reason) {
   Log("[MOD] Reconcile queued: %s", reason ? reason : "unknown");
 }
 
-// Character construction continues for several frames after
-// SetMainCharacter returns. Serialized non-Mesh Renderer fields can be
-// assigned without calling their setters, so schedule a short event-bound
-// window of scene reconciles instead of polling for the lifetime of the
-// process. The pass may mount a Mesh through the same assignment function;
-// unchanged generated resources are cached, so this does not rebuild them.
-static void EiemScheduleLifecycleReconcile(const char *reason) {
-  InterlockedExchange(&s_eiemLifecycleRetryRemaining, 8);
-  InterlockedExchange64(&s_eiemLifecycleRetryDueMs,
-                        (LONG64)(GetTickCount64() + 250));
-  Log("[MOD] Lifecycle reconcile window scheduled: %s",
-      reason ? reason : "unknown");
+static void EiemQueueModReconcile(const char *reason) {
+  EiemRequestModUpdate(EiemModUpdate::Reconcile, reason);
 }
 
-static void EiemPumpLifecycleReconcile() {
-  if (InterlockedCompareExchange(&s_eiemLifecycleRetryRemaining, 0, 0) <= 0)
-    return;
-  const ULONGLONG now = GetTickCount64();
-  const LONG64 due = InterlockedCompareExchange64(
-      &s_eiemLifecycleRetryDueMs, 0, 0);
-  if ((LONG64)now < due) return;
-  if (InterlockedCompareExchange64(&s_eiemLifecycleRetryDueMs,
-                                   (LONG64)(now + 500), due) != due)
-    return;
-  InterlockedDecrement(&s_eiemLifecycleRetryRemaining);
-  EiemQueueModReconcile("character construction settle");
-}
-
-// Runs only from MmdWndProc. It enumerates actual scene Renderers once after
-// lifecycle events and after F10. Construction hooks remain the earliest path,
-// while this pass is also allowed to re-apply Mesh resources to already-live
-// renderers after a configuration or payload change.
+// Runs only from MmdWndProc. F10 restores the previous generation, then
+// replays configuration against instances registered by either supported
+// model lifecycle adapter. No scene-wide Mesh scan exists.
 static void EiemRunModReconcile() {
-  InterlockedExchange(&s_eiemModReconcileQueued, 0);
+  const uint32_t requests = s_eiemModUpdates.Take();
   if (g_shutdownRequested) return;
   // This function is dispatched from the game's window procedure, which is
   // the safe Unity thread for creating generated Mesh/Material/Texture
   // objects. Startup hooks may run on the plugin worker thread instead.
   if (!s_eiemUnityThreadId) s_eiemUnityThreadId = GetCurrentThreadId();
-  Log("[DEBUG-thread] reconcile tid=%lu recordedUnityTid=%lu",
-      (unsigned long)GetCurrentThreadId(), (unsigned long)s_eiemUnityThreadId);
-  if (!g_smr_get_sharedMesh || !g_meshFilter_get_sharedMesh) {
+  if (!g_gameObject_GetComponentsInChildren) {
     Log("[MOD] Reconcile skipped: renderer APIs are not ready");
     return;
   }
-  const LONG generation = InterlockedCompareExchange(&s_eiemModGeneration, 0, 0);
-  if (generation != s_eiemAppliedModGeneration) {
-    Log("[MOD] Generation transition: %ld -> %ld",
-        s_eiemAppliedModGeneration, generation);
+  EiemDispatchModUpdate(requests, [] {
     EiemDestroyPartnerObjects();
-    // Restore the game's logical SubMeshInfo values before restoring live
-    // Renderers. Otherwise a later character rebuild can copy an old mod Mesh
-    // back into a fresh Renderer even when the ini no longer references it.
-    EiemRestoreSubMeshOverrides();
     EiemRestoreRenderOverrides();
     // Configuration reload must not release Unity Mesh objects that may still
     // be referenced by a Renderer. The resource backend reuses unchanged files
     // and creates a new rooted object only when the file stamp changes.
-    s_eiemAppliedModGeneration = generation;
-  }
+  }, [] { EiemReloadMods(); }, [] {
   const ULONGLONG started = GetTickCount64();
-  EiemModReconcileContext reconcile = {};
-  TraceVisitRendererType(g_skinnedMeshRendererClass, "SkinnedMeshRenderer",
-                         EiemReconcileRendererVisitor, &reconcile);
-  TraceVisitRendererType(g_meshFilterClass, "MeshFilter",
-                         EiemReconcileRendererVisitor, &reconcile);
+  std::vector<EiemModelInstanceState> instances;
+  AcquireSRWLockShared(&s_eiemModelInstanceLock);
+  instances = s_eiemModelInstances;
+  ReleaseSRWLockShared(&s_eiemModelInstanceLock);
+  uint32_t matched = 0;
+  for (const auto &instance : instances) {
+    if (!instance.model) continue;
+    std::vector<EiemModPrefab> prefabs;
+    EiemFindModPrefabs(instance.path, &prefabs);
+    bool applied = EiemApplyStandaloneRenderRules(instance.model,
+                                                   "F10 reload");
+    for (const auto &prefab : prefabs)
+      applied = EiemApplyPrefabRules(instance.model, prefab, "F10 reload") ||
+                applied;
+    if (applied) ++matched;
+  }
   const ULONGLONG elapsed = GetTickCount64() - started;
-  Log("[MOD] Reconcile complete: renderers=%u meshes=%u unique=%u matched=%u "
-      "applied=%u elapsed=%llums",
-      reconcile.stats.renderers, reconcile.stats.meshes,
-      reconcile.stats.uniqueMeshes, reconcile.stats.matchedMeshes,
-      reconcile.stats.appliedRenderers, elapsed);
+  Log("[MOD] Reconcile complete: registeredModels=%zu matchedModels=%u elapsed=%llums",
+      instances.size(), matched, elapsed);
+  });
 }
 
 static void *s_origAssetBundleLoadAsset1 = nullptr;
@@ -3023,8 +3141,6 @@ static void *s_origVfsGetAssetStream = nullptr;
 static void *s_origVfsGetAssetStreamHash = nullptr;
 static void *s_origVfsFileRead = nullptr;
 static void *s_origVfsFileReadSpan = nullptr;
-static void *s_assetBundleLoadFromFile = nullptr;
-static void *s_assetBundleLoadFromFileAsync = nullptr;
 static SRWLOCK s_seenStreamLock = SRWLOCK_INIT;
 static void *s_seenStreams[128] = {};
 static char s_seenStreamPaths[128][768] = {};
@@ -3113,75 +3229,6 @@ static void TraceReadUnityObjectName(void *object, char *out, int outSize) {
   } __except (1) {
     out[0] = '\0';
   }
-}
-
-static const char *TraceGlobalResourceKind(void *object) {
-  if (!object || !il2cpp_object_get_class || !il2cpp_class_get_name)
-    return nullptr;
-  void *klass = il2cpp_object_get_class(object);
-  const char *name = klass ? il2cpp_class_get_name(klass) : nullptr;
-  if (!name) return nullptr;
-  if (_stricmp(name, "Mesh") == 0) return "Mesh";
-  if (_stricmp(name, "Material") == 0) return "Material";
-  if (_stricmp(name, "Texture2D") == 0 || _stricmp(name, "Texture") == 0)
-    return "Texture";
-  return nullptr;
-}
-
-// Resource declarations with target.path opt into this path. It is executed
-// immediately after the original proxy resolves the logical resource and
-// before the caller can build a Renderer. The original VFS/decryption chain
-// remains authoritative for identity and timing; only the returned Unity
-// object is redirected. The generated replacement is cached and shared by
-// every later proxy/Renderer consumer.
-static void *TraceTryGlobalResourceRedirect(void *originalObject,
-                                            const char *logicalPath) {
-  if (!originalObject || s_traceBuildingGlobalResource)
-    return originalObject;
-  const char *kind = TraceGlobalResourceKind(originalObject);
-  if (!kind) return originalObject;
-  char assetName[256] = {};
-  TraceReadUnityObjectName(originalObject, assetName, sizeof(assetName));
-  EiemModResource resource = {};
-  bool found = logicalPath && logicalPath[0] &&
-               EiemFindGlobalResource(logicalPath, assetName, kind, &resource);
-  if (!found && assetName[0])
-    found = EiemFindGlobalResourceByAsset(assetName, kind, &resource);
-  if (assetName[0] && EiemHasResourceRenderRuleAsset(assetName)) {
-    Log("[DEBUG-RESOURCE-ROUTE] kind=%s path=%s asset=%s found=%d tid=%lu",
-        kind ? kind : "?", logicalPath && logicalPath[0] ? logicalPath : "<none>",
-        assetName, found ? 1 : 0, (unsigned long)GetCurrentThreadId());
-  }
-  if (!found) return originalObject;
-  const char *resolvedPath = logicalPath && logicalPath[0]
-                                 ? logicalPath
-                                 : resource.targetPath;
-  if (!EiemOnUnityThread()) {
-    Log("[RES-REDIRECT] matched but unsafe thread kind=%s target=%s asset=%s "
-        "tid=%lu unityTid=%lu",
-        kind, resolvedPath, assetName[0] ? assetName : "<any>",
-        (unsigned long)GetCurrentThreadId(),
-        (unsigned long)s_eiemUnityThreadId);
-    return originalObject;
-  }
-
-  void *replacement = nullptr;
-  char error[256] = {};
-  s_traceBuildingGlobalResource = true;
-  const bool built = EiemBuildGlobalResource(resource, originalObject,
-                                             &replacement, error,
-                                             sizeof(error));
-  s_traceBuildingGlobalResource = false;
-  if (!built || !replacement) {
-    Log("[RES-REDIRECT] failed kind=%s target=%s asset=%s error=%s", kind,
-        resolvedPath, assetName[0] ? assetName : "<any>",
-        error[0] ? error : "unknown");
-    return originalObject;
-  }
-  TraceRememberAssetOrigin(replacement, 0, resolvedPath);
-  Log("[RES-REDIRECT] applied kind=%s target=%s asset=%s replacement=%p",
-      kind, resolvedPath, assetName[0] ? assetName : "<any>", replacement);
-  return replacement;
 }
 
 static void TraceRememberBundlePathText(const char *pathText) {
@@ -3826,78 +3873,6 @@ static bool TraceStringPathHashGetMapping(void *self, int64_t pathHash,
   return result;
 }
 
-static bool TraceFindVfsOverride(void *path, char *overridePath,
-                                 int overridePathSize) {
-  if (!path || !overridePath || overridePathSize <= 0) return false;
-  char pathText[768] = {};
-  TraceDescribeString(path, pathText, sizeof(pathText));
-  if (!pathText[0] || pathText[0] == '?' || pathText[0] == '\\' ||
-      pathText[0] == '/' || strstr(pathText, ".."))
-    return false;
-
-  for (char *p = pathText; *p; ++p)
-    if (*p == '/') *p = '\\';
-
-  int written = snprintf(overridePath, overridePathSize,
-                         "plugin\\mods\\override\\%s", pathText);
-  if (written <= 0 || written >= overridePathSize) return false;
-  DWORD attr = GetFileAttributesA(overridePath);
-  return attr != INVALID_FILE_ATTRIBUTES &&
-         !(attr & FILE_ATTRIBUTE_DIRECTORY);
-}
-
-static void *TraceCreateManagedPath(const char *pathText) {
-  if (!pathText || !il2cpp_string_new || !il2cpp_domain_get ||
-      !il2cpp_thread_attach)
-    return nullptr;
-  if (!s_vfsThreadAttached) {
-    void *domain = il2cpp_domain_get();
-    if (!domain) return nullptr;
-    void *thread = il2cpp_thread_attach(domain);
-    if (!thread) return nullptr;
-    s_vfsThreadAttached = true;
-  }
-  __try {
-    return il2cpp_string_new(pathText);
-  } __except (1) {
-    return nullptr;
-  }
-}
-
-// Replacement bundles are plaintext Unity bundles in the mod directory. They
-// bypass the encrypted VFS and are loaded by Unity; the original VFS call is
-// retained as the fallback on any failure.
-static void *TraceLoadPlaintextBundle(const char *replacementPath,
-                                      bool asynchronous) {
-  if (!replacementPath || !replacementPath[0] ||
-      !il2cpp_runtime_invoke || !il2cpp_string_new)
-    return nullptr;
-  void *method = asynchronous ? s_assetBundleLoadFromFileAsync
-                              : s_assetBundleLoadFromFile;
-  if (!method) return nullptr;
-  void *managedPath = TraceCreateManagedPath(replacementPath);
-  if (!managedPath) return nullptr;
-  void *params[] = {managedPath};
-  return Invoke(method, nullptr, params);
-}
-
-static void *TraceTryBundleOverride(void *path, bool asynchronous) {
-  char overridePath[1024] = {};
-  if (!TraceFindVfsOverride(path, overridePath, sizeof(overridePath)))
-    return nullptr;
-  void *replacement = TraceLoadPlaintextBundle(overridePath, asynchronous);
-  if (replacement) {
-    if (TraceTakeBudget(&s_traceVfsPathCount, 300))
-      Log("[VFS-OVERRIDE] bundle %s loaded plaintext path=%s",
-          asynchronous ? "async" : "sync", overridePath);
-    return replacement;
-  }
-  if (TraceTakeBudget(&s_traceVfsPathCount, 300))
-    Log("[VFS-OVERRIDE] bundle %s failed, falling back path=%s",
-        asynchronous ? "async" : "sync", overridePath);
-  return nullptr;
-}
-
 static void TraceReadAssetName(void *loader, char *out, int outSize) {
   if (!out || outSize <= 0) return;
   out[0] = '\0';
@@ -3982,14 +3957,6 @@ static void *TraceAssetProxyHandleGet(void *self, void *methodInfo) {
   if ((!pathText[0] || pathText[0] == '<') && pathHash &&
       EiemOnUnityThread())
     TraceResolveStringPathHashPath(pathHash, pathText, sizeof(pathText));
-  // A resolved proxy may expose only an asset name (its logical path is
-  // available on another internal handle).  The redirect routine deliberately
-  // supports an empty path and falls back to a unique asset declaration.
-  if (result) {
-    void *redirected = TraceTryGlobalResourceRedirect(
-        result, (pathText[0] && pathText[0] != '<') ? pathText : nullptr);
-    if (redirected != result) result = redirected;
-  }
   if (result) {
     if (!TraceBindAssetFromProxy(self, result)) {
       if (pathText[0] && pathText[0] != '<')
@@ -4053,11 +4020,6 @@ static void *TraceAssetProxyUntrackedGet(void *self, void *methodInfo) {
       EiemOnUnityThread())
     TraceResolveStringPathHashPath(pathHash, pathText, sizeof(pathText));
   if (result) {
-    void *redirected = TraceTryGlobalResourceRedirect(
-        result, (pathText[0] && pathText[0] != '<') ? pathText : nullptr);
-    if (redirected != result) result = redirected;
-  }
-  if (result) {
     // Untracked handles do not expose the tracked proxy's origin table. Their
     // path getter is still a managed, read-only identity source, so bind it
     // before the object reaches a Renderer.
@@ -4083,10 +4045,6 @@ static void *TraceVfsLoadBundleFromFile(void *self, void *path,
                                         void *methodInfo) {
   auto original = (TraceVfsPathFn)s_origVfsLoadBundleFromFile;
   TraceRememberBundlePath(path);
-  if (void *replacement = TraceTryBundleOverride(path, false)) {
-    TraceRememberActiveBundle(replacement, path);
-    return replacement;
-  }
   void *result = original ? original(self, path, methodInfo) : nullptr;
   if (result) TraceRememberActiveBundle(result, path);
   if (!s_traceReentrant && TraceTakeBudget(&s_traceVfsPathCount, 300)) {
@@ -4104,10 +4062,6 @@ static void *TraceVfsLoadBundleFromFileAsync(void *self, void *path,
                                               void *methodInfo) {
   auto original = (TraceVfsPathFn)s_origVfsLoadBundleFromFileAsync;
   TraceRememberBundlePath(path);
-  if (void *replacement = TraceTryBundleOverride(path, true)) {
-    TraceRememberPendingBundleRequest(replacement, path);
-    return replacement;
-  }
   void *result = original ? original(self, path, methodInfo) : nullptr;
   if (result) TraceRememberPendingBundleRequest(result, path);
   if (!s_traceReentrant && TraceTakeBudget(&s_traceVfsPathCount, 300)) {
@@ -4126,10 +4080,6 @@ static void *TraceVfsLoadBundleFromFilePos(void *self, void *path,
                                             void *methodInfo) {
   auto original = (TraceVfsPathPosFn)s_origVfsLoadBundleFromFilePos;
   TraceRememberBundlePath(path);
-  if (void *replacement = TraceTryBundleOverride(path, false)) {
-    TraceRememberActiveBundle(replacement, path);
-    return replacement;
-  }
   void *result = original ? original(self, path, loaderPos, crc, methodInfo)
                           : nullptr;
   if (result) TraceRememberActiveBundle(result, path);
@@ -4141,10 +4091,6 @@ static void *TraceVfsLoadBundleFromFileAsyncPos(void *self, void *path,
                                                  void *methodInfo) {
   auto original = (TraceVfsPathPosFn)s_origVfsLoadBundleFromFileAsyncPos;
   TraceRememberBundlePath(path);
-  if (void *replacement = TraceTryBundleOverride(path, true)) {
-    TraceRememberPendingBundleRequest(replacement, path);
-    return replacement;
-  }
   void *result = original ? original(self, path, loaderPos, crc, methodInfo)
                           : nullptr;
   if (result) TraceRememberPendingBundleRequest(result, path);
@@ -4384,26 +4330,35 @@ static void *TraceAssetGetAssetName(void *self, void *methodInfo) {
 static void TraceAssetFinishWithAsset(void *self, void *asset,
                                       void *methodInfo) {
   auto original = (TraceAssetFinishFn)s_origAssetFinishWithAsset;
-  if (original) original(self, asset, methodInfo);
-  if (asset) {
-    char assetName[768] = {};
-    const int64_t pathHash = TraceReadLoadableHash(self);
-    if (pathHash)
-      TraceLookupHashPath(pathHash, assetName, sizeof(assetName));
-    if (!assetName[0]) TraceReadAssetName(self, assetName, sizeof(assetName));
-    TraceRememberAssetOrigin(asset, pathHash, assetName);
+  const int64_t pathHash = TraceReadLoadableHash(self);
+  char logicalPath[768] = {};
+  if (pathHash) {
+    TraceLookupHashPath(pathHash, logicalPath, sizeof(logicalPath));
+    if (!logicalPath[0] && EiemOnUnityThread())
+      TraceResolveStringPathHashPath(pathHash, logicalPath,
+                                     sizeof(logicalPath));
   }
+
+  if (asset) {
+    TraceRememberAssetOrigin(
+        asset, pathHash,
+        logicalPath[0] && logicalPath[0] != '<' ? logicalPath : nullptr);
+  }
+  // Completion hooks observe identity only. Resource declarations do not
+  // replace cached Unity objects; Render rules own all live mutations.
+  if (original) original(self, asset, methodInfo);
+
   if (!s_traceReentrant &&
       TraceTakeBudget(&s_traceAssetCompleteCount, 600)) {
     s_traceReentrant = true;
-    char assetText[512] = {};
+    char sourceText[512] = {};
     char assetName[768] = {};
-    int64_t pathHash = TraceReadLoadableHash(self);
     TraceReadAssetName(self, assetName, sizeof(assetName));
-    TraceDescribeObject(asset, assetText, sizeof(assetText));
+    TraceDescribeObject(asset, sourceText, sizeof(sourceText));
     Log("[RES-TRACE] Asset._FinishWithAsset: hash=%lld loader=%p "
-        "assetName=\"%s\" asset=%s",
-        (long long)pathHash, self, assetName[0] ? assetName : "?", assetText);
+        "path=\"%s\" assetName=\"%s\" asset=%s",
+        (long long)pathHash, self, logicalPath[0] ? logicalPath : "?",
+        assetName[0] ? assetName : "?", sourceText);
     s_traceReentrant = false;
   }
 }
@@ -4504,13 +4459,6 @@ static void *TraceAssetBundleLoadAsset1(void *self, void *path,
                                         void *methodInfo) {
   auto original = (TraceLoadAsset1Fn)s_origAssetBundleLoadAsset1;
   void *result = original ? original(self, path, methodInfo) : nullptr;
-  char redirectPath[768] = {};
-  TraceDescribeString(path, redirectPath, sizeof(redirectPath));
-  if (result) {
-    void *redirected = TraceTryGlobalResourceRedirect(
-        result, redirectPath[0] ? redirectPath : nullptr);
-    if (redirected != result) result = redirected;
-  }
   if (!s_traceReentrant && TraceTakeBudget(&s_traceLoadAssetCount, 300)) {
     s_traceReentrant = true;
     char pathText[512] = {};
@@ -4528,13 +4476,6 @@ static void *TraceAssetBundleLoadAsset2(void *self, void *path, void *type,
                                         void *methodInfo) {
   auto original = (TraceLoadAsset2Fn)s_origAssetBundleLoadAsset2;
   void *result = original ? original(self, path, type, methodInfo) : nullptr;
-  char redirectPath[768] = {};
-  TraceDescribeString(path, redirectPath, sizeof(redirectPath));
-  if (result) {
-    void *redirected = TraceTryGlobalResourceRedirect(
-        result, redirectPath[0] ? redirectPath : nullptr);
-    if (redirected != result) result = redirected;
-  }
   if (!s_traceReentrant && TraceTakeBudget(&s_traceLoadAssetCount, 300)) {
     s_traceReentrant = true;
     char pathText[512] = {};
@@ -4603,74 +4544,16 @@ static void TraceSkinnedMeshSetSharedMesh(void *self, void *mesh,
         (unsigned long)GetCurrentThreadId(), (unsigned long)s_eiemUnityThreadId);
   TraceRememberMeshObservation(self, mesh, "SkinnedMeshRenderer");
   void *sourceMesh = mesh;
-  // Some game paths bypass FAssetProxyHandle.Get and assign the resolved Mesh
-  // directly. Use the origin table populated by the resource hooks as a
-  // second global-redirection boundary before applying per-Renderer rules.
-  char meshPath[768] = {};
-  if (TraceLookupAssetOrigin(mesh, nullptr, meshPath, sizeof(meshPath))) {
-    void *redirected = TraceTryGlobalResourceRedirect(mesh, meshPath);
-    if (redirected != mesh) mesh = redirected;
-  }
-  // Setter callbacks can run on asset-loader threads. The resource redirect
-  // above is the preferred path and runs before this setter when the proxy
-  // exposes a logical path. This block only handles direct assignments that
-  // bypass the proxy, and only on the Unity thread.
-  char assetName[192] = {};
-  bool hasModRule =
-      EiemReadLiveMeshIdentity(mesh, nullptr, 0, assetName, sizeof(assetName)) &&
-      EiemHasResourceRenderRuleAsset(assetName);
-  // A prefab can assign an embedded Mesh before Object.name is initialized.
-  // In that short window the Renderer name is the only stable logical asset
-  // identity available. It is still constrained by the same explicit rule
-  // asset and shape checks below; this is not a name-only global redirect.
-  if (!hasModRule) {
-    char rendererText[512] = {};
-    char rendererName[192] = {};
-    TraceDescribeObject(self, rendererText, sizeof(rendererText));
-    EiemExtractObjectName(rendererText, rendererName, sizeof(rendererName));
-    if (rendererName[0] && EiemHasResourceRenderRuleAsset(rendererName)) {
-      strncpy_s(assetName, sizeof(assetName), rendererName, _TRUNCATE);
-      hasModRule = true;
-      Log("[MOD-EARLY-IDENTITY] renderer=%p asset=%s mesh=%p",
-          self, assetName, mesh);
-    }
-  }
-  bool earlyApplied = false;
-  bool hasMeshDirective = false;
-  const bool safeThread = EiemOnUnityThread();
-  if (hasModRule && safeThread) {
-    void *identityMesh = sourceMesh;
-    EiemPrepareRenderInput(self, mesh, "SkinnedMeshRenderer", &identityMesh);
-    EiemResolvedRenderRule resolved = {};
-    bool resolvedRule = EiemResolveRenderRule(identityMesh, &resolved);
-    if (!resolvedRule && assetName[0])
-      resolvedRule = EiemResolveRenderRuleForAsset(identityMesh, assetName,
-                                                   &resolved);
-    if (resolvedRule) {
-      hasMeshDirective = resolved.rule.hasMesh;
-      const bool globalAlreadyApplied = mesh != sourceMesh;
-      const bool hasRenderAction = resolved.rule.hasMesh ||
-                                   EiemModEquals(resolved.rule.handling, "skip") ||
-                                   resolved.rule.materialCount ||
-                                   resolved.rule.partnerCount;
-      if (hasRenderAction) {
-        EiemApplyResolvedRenderRule(
-            self, globalAlreadyApplied ? sourceMesh : mesh,
-            "SkinnedMeshRenderer", methodInfo, resolved,
-            !globalAlreadyApplied);
-        void *currentMesh = EiemReadSharedMesh(self, "SkinnedMeshRenderer");
-        earlyApplied = globalAlreadyApplied ||
-                       (currentMesh && currentMesh != sourceMesh);
-        Log("[MOD-EARLY-SETTER] renderer=%p source=%p current=%p global=%d applied=%d",
-            self, sourceMesh, currentMesh, globalAlreadyApplied ? 1 : 0,
-            earlyApplied ? 1 : 0);
-      }
-    }
-  }
-  if (!earlyApplied && original) original(self, mesh, methodInfo);
-  if (hasMeshDirective && !earlyApplied)
-    Log("[MOD-EARLY-SETTER] mesh directive was not applied before setter renderer=%p source=%p",
-        self, sourceMesh);
+  // A later game-side LOD/skin refresh may assign the original Mesh again.
+  // Preserve an existing binding; otherwise this assignment is also a precise
+  // lifecycle event at which standalone Mesh-identity rules can be evaluated.
+  void *retained = EiemReplacementForSourceMesh(self, sourceMesh);
+  if (retained) mesh = retained;
+  if (original) original(self, mesh, methodInfo);
+  if (!retained && sourceMesh)
+    EiemApplyStandaloneRenderRulesToRenderer(
+        self, self, sourceMesh, "SkinnedMeshRenderer", methodInfo,
+        "SkinnedMeshRenderer.set_sharedMesh");
   if (!s_traceReentrant && TraceTakeBudget(&s_traceSharedMeshCount, 500)) {
     s_traceReentrant = true;
     char rendererText[512] = {};
@@ -4692,26 +4575,16 @@ static void TraceMeshFilterSetSharedMesh(void *self, void *mesh,
     return;
   }
   TraceRememberMeshObservation(self, mesh, "MeshFilter");
-  char meshPath[768] = {};
-  if (TraceLookupAssetOrigin(mesh, nullptr, meshPath, sizeof(meshPath))) {
-    void *redirected = TraceTryGlobalResourceRedirect(mesh, meshPath);
-    if (redirected != mesh) mesh = redirected;
-  }
-  char assetName[192] = {};
-  const bool hasModRule =
-      EiemReadLiveMeshIdentity(mesh, nullptr, 0, assetName, sizeof(assetName)) &&
-      EiemHasResourceRenderRuleAsset(assetName);
+  void *sourceMesh = mesh;
+  void *retained = EiemReplacementForSourceMesh(self, sourceMesh);
+  if (retained) mesh = retained;
   if (original) original(self, mesh, methodInfo);
-  // Mesh replacement is completed at the resource boundary. Only non-mesh
-  // Render directives still need a main-thread reconcile after direct
-  // MeshFilter assignments.
-  if (hasModRule) {
-    EiemResolvedRenderRule resolved = {};
-    if (EiemResolveRenderRule(mesh, &resolved) &&
-        !resolved.rule.hasMesh &&
-        (EiemModEquals(resolved.rule.handling, "skip") ||
-         resolved.rule.materialCount))
-      EiemQueueModReconcile("MeshFilter non-mesh directive");
+  if (!retained && sourceMesh) {
+    void *drawRenderer = EiemFindMeshFilterDrawRenderer(self);
+    if (drawRenderer)
+      EiemApplyStandaloneRenderRulesToRenderer(
+          self, drawRenderer, sourceMesh, "MeshFilter", methodInfo,
+          "MeshFilter.set_sharedMesh");
   }
   if (!s_traceReentrant && TraceTakeBudget(&s_traceMeshFilterCount, 300)) {
     s_traceReentrant = true;
@@ -4976,19 +4849,106 @@ static void InitIl2CppResourceTrace(void **assemblies, size_t assemblyCount) {
     s_prefabInstantiateGetGameObject = FindMethodWithReturnType(
         prefabInstantiateClass, "get_gameObject", "UnityEngine.GameObject",
         0);
+    s_prefabInstantiateGetLogName = FindMethodWithReturnType(
+        prefabInstantiateClass, "GetLogName", "System.String", 0);
+    s_prefabInstantiateGetInstanceUid = FindMethodWithReturnType(
+        prefabInstantiateClass, "get_instanceUid", "System.UInt32", 0);
     void *completed = FindMethodWithReturnType(
         prefabInstantiateClass, "OnCompleted", "System.Void", 0);
     if (completed &&
         Hook(completed, "PrefabInstantiateProxy.OnCompleted",
              (void *)TracePrefabInstantiateCompleted,
              &s_origPrefabInstantiateCompleted)) {
-      Log("[RES-TRACE] PrefabInstantiateProxy.OnCompleted replacement hook installed; getGameObject=%p",
-          s_prefabInstantiateGetGameObject);
+      Log("[RES-TRACE] PrefabInstantiateProxy lifecycle anchor installed; gameObject=%p logName=%p instanceUid=%p",
+          s_prefabInstantiateGetGameObject, s_prefabInstantiateGetLogName,
+          s_prefabInstantiateGetInstanceUid);
     } else {
       Log("[RES-TRACE] PrefabInstantiateProxy.OnCompleted hook failed/not found");
     }
+    HookTraceMethod(prefabInstantiateClass, "Unload", 0,
+                    "PrefabInstantiateProxy.Unload",
+                    (void *)TracePrefabInstantiateUnload,
+                    &s_origPrefabInstantiateUnload);
+    HookTraceMethod(prefabInstantiateClass, "Clear", 0,
+                    "PrefabInstantiateProxy.Clear",
+                    (void *)TracePrefabInstantiateClear,
+                    &s_origPrefabInstantiateClear);
+    HookTraceMethod(prefabInstantiateClass, "Dispose", 0,
+                    "PrefabInstantiateProxy.Dispose",
+                    (void *)TracePrefabInstantiateDispose,
+                    &s_origPrefabInstantiateDispose);
   } else {
     Log("[RES-TRACE] Beyond.Resource.Runtime.PrefabInstantiateProxy class not found");
+  }
+
+  void *uiModelLoaderClass = FindClass(
+      "Beyond.UI", "UIModelLoader", assemblies, assemblyCount);
+  if (uiModelLoaderClass) {
+    static const char *const uiLoadTypes[] = {
+        "System.String", "UnityEngine.Transform"};
+    void *loadModel = FindMethodWithParamTypesAndReturnType(
+        uiModelLoaderClass, "LoadModel", uiLoadTypes, 2,
+        "UnityEngine.GameObject");
+    if (loadModel &&
+        Hook(loadModel, "UIModelLoader.LoadModel",
+             (void *)TraceUIModelLoaderLoadModel,
+             &s_origUIModelLoaderLoadModel))
+      Log("[RES-TRACE] UIModelLoader synchronous lifecycle adapter installed");
+    else
+      Log("[RES-TRACE] UIModelLoader.LoadModel hook failed/not found");
+
+    static const char *const uiLoadAsyncTypes[] = {
+        "System.String", "UnityEngine.Transform",
+        "System.Action<UnityEngine.GameObject>"};
+    void *loadModelAsync = FindMethodWithParamTypesAndReturnType(
+        uiModelLoaderClass, "LoadModelAsync", uiLoadAsyncTypes, 3,
+        "System.Int32");
+    if (loadModelAsync &&
+        Hook(loadModelAsync, "UIModelLoader.LoadModelAsync",
+             (void *)TraceUIModelLoaderLoadModelAsync,
+             &s_origUIModelLoaderLoadModelAsync))
+      Log("[RES-TRACE] UIModelLoader async passthrough installed (game callback unchanged)");
+    else
+      Log("[RES-TRACE] UIModelLoader.LoadModelAsync hook failed/not found");
+
+    static const char *const uiUnloadTypes[] = {"UnityEngine.GameObject"};
+    HookTraceMethodWithParamTypes(
+        uiModelLoaderClass, "UnloadModel", uiUnloadTypes, 1,
+        "UIModelLoader.UnloadModel", (void *)TraceUIModelLoaderUnloadModel,
+        &s_origUIModelLoaderUnloadModel);
+    HookTraceMethod(uiModelLoaderClass, "_Clear", 0,
+                    "UIModelLoader._Clear",
+                    (void *)TraceUIModelLoaderClear,
+                    &s_origUIModelLoaderClear);
+    HookTraceMethod(uiModelLoaderClass, "Dispose", 0,
+                    "UIModelLoader.Dispose",
+                    (void *)TraceUIModelLoaderDispose,
+                    &s_origUIModelLoaderDispose);
+  } else {
+    Log("[RES-TRACE] Beyond.UI.UIModelLoader class not found");
+  }
+
+  // Both UIModelLoader and CharUIModelMono ran in the v29 crash trace. Observe
+  // the completed model's own lifecycle without replacing managed callbacks.
+  // SetVisible also covers known models reactivated from a persistent pool.
+  void *charUIModelClass = FindClass(
+      "Beyond.Gameplay.View", "CharUIModelMono", assemblies, assemblyCount);
+  if (charUIModelClass) {
+    HookTraceMethod(charUIModelClass, "OnAwake", 0,
+                    "CharUIModelMono.OnAwake",
+                    (void *)TraceCharUIModelOnAwake,
+                    &s_origCharUIModelOnAwake);
+    static const char *const visibleTypes[] = {"System.Boolean"};
+    HookTraceMethodWithParamTypes(
+        charUIModelClass, "SetVisible", visibleTypes, 1,
+        "CharUIModelMono.SetVisible", (void *)TraceCharUIModelSetVisible,
+        &s_origCharUIModelSetVisible);
+    HookTraceMethod(charUIModelClass, "OnRelease", 0,
+                    "CharUIModelMono.OnRelease",
+                    (void *)TraceCharUIModelOnRelease,
+                    &s_origCharUIModelOnRelease);
+  } else {
+    Log("[RES-TRACE] Beyond.Gameplay.View.CharUIModelMono class not found");
   }
 
   void *meshFilterClass =
@@ -4998,9 +4958,8 @@ static void InitIl2CppResourceTrace(void **assemblies, size_t assemblyCount) {
                   (void *)TraceMeshFilterSetSharedMesh,
                   &s_origMeshFilterSetSharedMesh);
 
-  // Generic character/model lifecycle observation. NPC Avatar has a separate
-  // construction path below; these hooks identify the path used by player and
-  // other BaseModelComponent-backed models without changing any render state.
+  // Generic character/model lifecycle. BaseModelViewPart is also the explicit
+  // completion owner for cached/handle-reused character models.
   void *modelManagerClass = FindClass("Beyond.Gameplay.View", "ModelManager",
                                      assemblies, assemblyCount);
   if (modelManagerClass) {
@@ -5105,7 +5064,7 @@ static void InitIl2CppResourceTrace(void **assemblies, size_t assemblyCount) {
         Hook(loadFinishCallback, "BaseModelViewPart._OnLoadModelFinishCallback",
              (void *)TraceBasePartLoadFinishCallback,
              &s_origBasePartLoadFinishCallback))
-      Log("[RES-TRACE] BaseModelViewPart._OnLoadModelFinishCallback early replacement hook installed");
+      Log("[RES-TRACE] BaseModelViewPart._OnLoadModelFinishCallback path hook installed");
     else
       Log("[RES-TRACE] BaseModelViewPart._OnLoadModelFinishCallback hook failed/not found");
 
@@ -5116,7 +5075,7 @@ static void InitIl2CppResourceTrace(void **assemblies, size_t assemblyCount) {
         Hook(loadFinishResult, "BaseModelViewPart._OnLoadModelFinish",
              (void *)TraceBasePartLoadFinishResult,
              &s_origBasePartLoadFinishResult))
-      Log("[RES-TRACE] BaseModelViewPart._OnLoadModelFinish early replacement hook installed");
+      Log("[RES-TRACE] BaseModelViewPart._OnLoadModelFinish path hook installed");
     else
       Log("[RES-TRACE] BaseModelViewPart._OnLoadModelFinish hook failed/not found");
 
@@ -5144,6 +5103,15 @@ static void InitIl2CppResourceTrace(void **assemblies, size_t assemblyCount) {
       Log("[RES-TRACE] BaseModelViewPart._OnLoadUseHandleFinish replacement hook installed");
     else
       Log("[RES-TRACE] BaseModelViewPart._OnLoadUseHandleFinish hook failed/not found");
+
+    HookTraceMethod(basePartClass, "ReleaseModel", 0,
+                    "BaseModelViewPart.ReleaseModel",
+                    (void *)TraceBasePartReleaseModel,
+                    &s_origBasePartReleaseModel);
+    HookTraceMethod(basePartClass, "OnRelease", 0,
+                    "BaseModelViewPart.OnRelease",
+                    (void *)TraceBasePartOnRelease,
+                    &s_origBasePartOnRelease);
 
     void *complexPartClass = FindClass("Beyond.Gameplay.View",
                                        "ComplexModelViewPart", assemblies,
@@ -5324,13 +5292,6 @@ static void InitIl2CppResourceTrace(void **assemblies, size_t assemblyCount) {
 
   void *vfsClass =
       FindClass("Beyond.VFS", "VirtualFileSystem", assemblies, assemblyCount);
-  if (assetBundleClass) {
-    s_assetBundleLoadFromFile = FindMethod(assetBundleClass, "LoadFromFile", 1);
-    s_assetBundleLoadFromFileAsync =
-        FindMethod(assetBundleClass, "LoadFromFileAsync", 1);
-    Log("[RES-TRACE] Unity AssetBundle plaintext loaders: sync=%p async=%p",
-        s_assetBundleLoadFromFile, s_assetBundleLoadFromFileAsync);
-  }
   if (vfsClass) {
     static const char *const vfsStringType[] = {"System.String"};
     HookTraceMethodWithParamTypes(
@@ -5525,5 +5486,5 @@ static void InitIl2CppResourceTrace(void **assemblies, size_t assemblyCount) {
                   "Beyond.Resource.Runtime.Asset.OnComplete",
                   (void *)TraceAssetOnComplete, &s_origAssetOnComplete);
 
-  Log("[RES-TRACE] Observation hooks ready; VFS path override probe enabled");
+  Log("[RES-TRACE] Observation hooks ready; original VFS loading preserved");
 }

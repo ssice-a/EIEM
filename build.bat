@@ -54,7 +54,7 @@ echo [1/4] Compiling version resource ...
 rc /nologo /fo bin\version.res src\version.rc
 
 echo [2/4] Building eiem.dll ...
-cl /nologo /utf-8 /O2 /MD /LD /EHsc /std:c++17 ^
+cl /nologo /utf-8 /O2 /Zi /Fd"bin\eiem_compile.pdb" /MD /LD /EHsc /std:c++17 ^
     /Ideps\minhook_lib\include ^
     /Ideps\imgui ^
     src\eiem.cpp ^
@@ -76,7 +76,7 @@ cl /nologo /utf-8 /O2 /MD /LD /EHsc /std:c++17 ^
     ole32.lib ^
     winhttp.lib ^
     /Fe"bin\eiem.dll" ^
-    /link /DLL
+    /link /DLL /DEBUG /OPT:REF /OPT:ICF /INCREMENTAL:NO /PDB:"bin\eiem.pdb"
 
 if %errorlevel% neq 0 (
     echo [ERROR] eiem.dll build failed!

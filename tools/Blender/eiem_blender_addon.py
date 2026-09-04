@@ -1,7 +1,7 @@
 bl_info = {
     "name": "EIEM Resource Package",
     "author": "EIEM",
-    "version": (0, 4, 0),
+    "version": (0, 4, 2),
     "blender": (3, 0, 0),
     "location": "File > Import/Export > EIEM package",
     "category": "Import-Export",
@@ -675,6 +675,23 @@ def import_package(root, clean=False):
         for image in [item for item in bpy.data.images if item.get("eiem_section")]:
             bpy.data.images.remove(image, do_unlink=True)
     resources = {section: dict(parser.items(section)) for section in parser.sections()}
+    render_owners = {}
+    for section, values in resources.items():
+        if not section.lower().startswith("prefab"):
+            continue
+        prefab_path = values.get("path", "").strip()
+        if not prefab_path:
+            raise ValueError("%s has no game Prefab path" % section)
+        for key, render_section in values.items():
+            if not key.lower().startswith("render."):
+                continue
+            if render_section not in resources or not render_section.lower().startswith("render"):
+                raise ValueError("%s references missing Render section %s" %
+                                 (section, render_section))
+            if render_section in render_owners:
+                raise ValueError("Render section %s belongs to more than one Prefab" %
+                                 render_section)
+            render_owners[render_section] = (section, prefab_path)
     textures = {}
     for section, values in resources.items():
         if not section.lower().startswith("texture") or not values.get("path"):
@@ -701,15 +718,16 @@ def import_package(root, clean=False):
         if section.lower().startswith("material") and values.get("path"):
             material_values = read_flat_properties(safe_path(root, values["path"]))
             # The Material file owns shader properties. The resource section
-            # owns package location and optional global target identity.
+            # owns package location and preserves original-game identity as
+            # authoring metadata; live replacement is always a Render action.
             material_values["path"] = values["path"]
-            # `source` identifies the game Material that will be cloned.
-            # It is not a global replacement target.  Only preserve a global
-            # target when the resource declaration explicitly contains one;
-            # otherwise a normal Render material.N binding must remain local
-            # to the matched renderer.
-            material_values["target.path"] = values.get("target.path", "")
-            material_values["target.asset"] = values.get("target.asset", "")
+            # Preserve offline identity as authoring metadata. A Material
+            # declaration never applies itself: exported Render material slots
+            # decide which consumers receive the edited clone.
+            material_values["target.path"] = values.get(
+                "target.path", material_values.get("source", ""))
+            material_values["target.asset"] = values.get(
+                "target.asset", material_values.get("name", ""))
             materials[section] = load_material(
                 root, section, material_values, textures)
     # A package can contain many renderer-specific Skeleton sections exported
@@ -729,14 +747,9 @@ def import_package(root, clean=False):
             if armature is None:
                 armature = make_armature(section, payload, collection)
                 armature["eiem_source"] = values.get("source", "")
-                armature["eiem_target_path"] = values.get("target.path", values.get("source", ""))
+                armature["eiem_target_path"] = values.get("target.path", "")
                 armature["eiem_target_asset"] = values.get("target.asset", "")
-                armature["eiem_section_aliases_json"] = json.dumps([section], separators=(",", ":"))
                 armatures_by_hierarchy[hierarchy] = armature
-            else:
-                aliases = json.loads(armature.get("eiem_section_aliases_json", "[]"))
-                aliases.append(section)
-                armature["eiem_section_aliases_json"] = json.dumps(aliases, separators=(",", ":"))
             skeletons[section] = armature
             skeleton_payloads[section] = payload
     meshes = {}
@@ -746,8 +759,12 @@ def import_package(root, clean=False):
             continue
         payload = read_mesh(safe_path(root, values["path"]))
         mesh = make_mesh(section, payload)
-        mesh["eiem_target_path"] = values.get("target.path", payload["source"])
-        mesh["eiem_target_asset"] = values.get("target.asset", payload["name"])
+        # Preserve offline identity for authoring and for the generated Render
+        # selector. Resource declarations do not apply replacements themselves.
+        mesh["eiem_target_path"] = values.get(
+            "target.path", payload.get("source", ""))
+        mesh["eiem_target_asset"] = values.get(
+            "target.asset", payload.get("name", ""))
         obj = bpy.data.objects.new(section, mesh)
         mesh_resource_collection(collection, section, payload).objects.link(obj)
         meshes[section] = obj
@@ -766,6 +783,10 @@ def import_package(root, clean=False):
         obj = meshes.get(values["mesh"])
         if not obj:
             continue
+        if section in render_owners:
+            prefab_section, prefab_path = render_owners[section]
+            obj["eiem_prefab_section"] = prefab_section
+            obj["eiem_prefab_path"] = prefab_path
         obj["eiem_render_section"] = section
         obj["eiem_render_path"] = values.get("path", "")
         obj["eiem_render_asset"] = values.get("asset", "")
@@ -1009,8 +1030,10 @@ def write_mesh(path, obj):
             triangle = (triangle[0], triangle[2], triangle[1])
         submesh_indices.setdefault(submesh, []).extend(triangle)
     submeshes = []
-    for submesh in sorted(submesh_indices):
-        values = submesh_indices[submesh]
+    # A submesh's position is its material slot. Keep empty slots before an
+    # occupied slot instead of renumbering faces after the user deletes them.
+    for submesh in range(max(submesh_indices, default=-1) + 1):
+        values = submesh_indices.get(submesh, [])
         start = len(indices)
         indices.extend(values)
         used_vertices = set(values)
@@ -1360,6 +1383,7 @@ def export_package(root, mesh_objects=None, armatures=None):
 
     resource_lines = ["; Generated by EIEM Blender add-on", ""]
     render_lines = []
+    seen_render_sections = set()
     exported_armatures = {}
     if armatures:
         (root / "skeletons").mkdir(exist_ok=True)
@@ -1368,12 +1392,18 @@ def export_package(root, mesh_objects=None, armatures=None):
         exported_armatures[section] = armature
         filename = "skeletons/" + section + ".skeleton"
         write_skeleton(root / filename, armature)
-        resource_lines.extend([
+        declaration = [
             "[" + section + "]", "path=" + filename,
-            "target.path=" + str(armature.get(
-                "eiem_target_path", armature.get("eiem_source", ""))),
-            "target.asset=" + str(armature.get("eiem_target_asset", "")), "",
-        ])
+            "source=" + str(armature.get("eiem_source", "")),
+        ]
+        target_path = str(armature.get("eiem_target_path", "")).strip()
+        if target_path:
+            declaration.extend([
+                "target.path=" + target_path,
+                "target.asset=" + str(armature.get("eiem_target_asset", "")),
+            ])
+        declaration.append("")
+        resource_lines.extend(declaration)
 
     (root / "meshes").mkdir(exist_ok=True)
     seen_mesh_sections = set()
@@ -1384,22 +1414,40 @@ def export_package(root, mesh_objects=None, armatures=None):
         seen_mesh_sections.add(section)
         filename = "meshes/" + section + ".mesh"
         write_mesh(root / filename, obj)
-        resource_lines.extend([
+        declaration = [
             "[" + section + "]", "path=" + filename,
-            "target.path=" + str(obj.data.get(
-                "eiem_target_path", obj.data.get("eiem_source", ""))),
-            "target.asset=" + str(obj.data.get(
-                "eiem_target_asset", obj.data.get("eiem_asset", obj.name))), "",
-        ])
-        render = str(obj.get("eiem_render_section", "Render" + obj.name))
-        render_lines.extend([
-            "[" + render + "]",
-            "path=" + str(obj.get(
-                "eiem_render_path", obj.data.get("eiem_source", ""))),
-            "asset=" + str(obj.get(
-                "eiem_render_asset", obj.data.get("eiem_asset", obj.name))),
-            "mesh=" + section,
-        ])
+            "source=" + str(obj.data.get("eiem_source", "")),
+            "asset=" + str(obj.data.get("eiem_asset", obj.name)),
+        ]
+        target_path = str(obj.data.get("eiem_target_path", "")).strip()
+        if target_path:
+            declaration.extend([
+                "target.path=" + target_path,
+                "target.asset=" + str(obj.data.get("eiem_target_asset", "")),
+            ])
+        declaration.append("")
+        resource_lines.extend(declaration)
+
+        render = str(obj.get("eiem_render_section", "")).strip()
+        if not render:
+            render = ("Render" + section[4:]) if section.lower().startswith("mesh") else ("Render" + section)
+        # Standalone Render rules are shared-Mesh identity actions. Legacy
+        # packages used `path` for both a logical asset path and a hierarchy
+        # path, which made matching context-dependent. Export only the stable
+        # Mesh sub-asset name; an explicitly scoped authoring mode can add a
+        # hierarchy selector later without overloading this field again.
+        render_asset = str(obj.get("eiem_render_asset", "")).strip()
+        if not render_asset:
+            render_asset = str(obj.data.get(
+                "eiem_target_asset", obj.data.get("eiem_asset", ""))).strip()
+        if not render_asset:
+            raise ValueError("Render %s has no Mesh asset selector" % render)
+        if render in seen_render_sections:
+            raise ValueError("Render section selected more than once: " + render)
+        seen_render_sections.add(render)
+        render_lines.append("[" + render + "]")
+        render_lines.append("asset=" + render_asset)
+        render_lines.append("mesh=" + section)
         skeleton = str(obj.get("eiem_skeleton", ""))
         if skeleton in exported_armatures:
             render_lines.append("skeleton=" + skeleton)
@@ -1459,7 +1507,250 @@ def export_package(root, mesh_objects=None, armatures=None):
     return {
         "meshes": len(mesh_objects), "skeletons": len(exported_armatures),
         "materials": len(material_payloads), "textures": len(referenced_images),
+        "prefabs": 0,
     }
+
+
+EIEM_INTERNAL_MATERIAL_PROPERTIES = {
+    "eiem_baseline_json",
+    "eiem_texture_sections_json",
+}
+
+
+def eiem_id_property_path(key):
+    escaped = str(key).replace("\\", "\\\\").replace('"', '\\"')
+    return '["%s"]' % escaped
+
+
+def draw_eiem_property(layout, owner, key, label, factor=0.24):
+    """Draw one editable ID property with a consistently left-aligned label."""
+    if owner is None or key not in owner:
+        return False
+    row = layout.row(align=True)
+    split = row.split(factor=factor, align=True)
+    label_column = split.column(align=True)
+    label_column.alignment = "LEFT"
+    label_column.label(text=label)
+    value_column = split.column(align=True)
+    value_column.prop(owner, eiem_id_property_path(key), text="")
+    return True
+
+
+def draw_eiem_rna_property(layout, owner, key, label, factor=0.24):
+    row = layout.row(align=True)
+    split = row.split(factor=factor, align=True)
+    label_column = split.column(align=True)
+    label_column.alignment = "LEFT"
+    label_column.label(text=label)
+    value_column = split.column(align=True)
+    value_column.prop(owner, key, text="")
+
+
+def material_property_groups(material):
+    """Return stable, user-facing groups without exposing bookkeeping JSON."""
+    keys = [key for key in material.keys()
+            if key.startswith("eiem_") and
+            key not in EIEM_INTERNAL_MATERIAL_PROPERTIES]
+    texture_paths = [key for key in keys if key.startswith("eiem_texture.")]
+    texture_transforms = [
+        key for key in keys
+        if key.startswith(("eiem_texture_scale.", "eiem_texture_offset."))
+    ]
+    identity = {
+        "eiem_section", "eiem_name", "eiem_shader", "eiem_format",
+        "eiem_version", "eiem_target_path", "eiem_target_asset",
+    }
+    parameters = [
+        key for key in keys
+        if key not in identity and key != "eiem_source" and
+        key not in texture_paths and key not in texture_transforms
+    ]
+    resource = [key for key in (
+        "eiem_section", "eiem_name", "eiem_shader", "eiem_version",
+        "eiem_format", "eiem_target_path", "eiem_target_asset",
+    ) if key in material]
+    return texture_paths, texture_transforms, parameters, resource
+
+
+def material_property_label(key):
+    value = key[5:] if key.startswith("eiem_") else key
+    for prefix, suffix in (
+        ("texture_scale.", " 缩放"),
+        ("texture_offset.", " 偏移"),
+        ("texture.", ""),
+        ("float.", ""),
+        ("int.", ""),
+        ("value4.", ""),
+    ):
+        if value.startswith(prefix):
+            return value[len(prefix):] + suffix
+    return value
+
+
+class EIEM_PT_material_properties(bpy.types.Panel):
+    bl_label = "EIEM 材质"
+    bl_idname = "MATERIAL_PT_eiem_properties"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "material"
+
+    @classmethod
+    def poll(cls, context):
+        material = getattr(context, "material", None)
+        return material is not None and bool(material.get("eiem_section"))
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = False
+        layout.use_property_decorate = False
+        material = context.material
+        texture_paths, texture_transforms, parameters, resource = \
+            material_property_groups(material)
+
+        # Texture paths are the most common edit and deliberately occupy the
+        # first block. The short label is the real shader property name.
+        box = layout.box()
+        heading = box.row()
+        heading.alignment = "LEFT"
+        heading.label(text="贴图路径")
+        if texture_paths:
+            for key in texture_paths:
+                draw_eiem_property(box, material, key,
+                                   material_property_label(key))
+        else:
+            row = box.row()
+            row.alignment = "LEFT"
+            row.label(text="该材质没有贴图参数")
+
+        draw_eiem_property(layout, material, "eiem_source", "源材质")
+
+        if texture_transforms:
+            box = layout.box()
+            heading = box.row()
+            heading.alignment = "LEFT"
+            heading.label(text="贴图变换")
+            for key in texture_transforms:
+                draw_eiem_property(box, material, key,
+                                   material_property_label(key))
+
+        if parameters:
+            box = layout.box()
+            heading = box.row()
+            heading.alignment = "LEFT"
+            heading.label(text="材质参数")
+            for key in parameters:
+                draw_eiem_property(box, material, key,
+                                   material_property_label(key))
+
+        if resource:
+            box = layout.box()
+            heading = box.row()
+            heading.alignment = "LEFT"
+            heading.label(text="资源信息")
+            labels = {
+                "eiem_section": "资源段",
+                "eiem_name": "材质名",
+                "eiem_shader": "Shader",
+                "eiem_version": "格式版本",
+                "eiem_format": "格式",
+                "eiem_target_path": "原材质路径",
+                "eiem_target_asset": "原材质名称",
+            }
+            for key in resource:
+                draw_eiem_property(box, material, key,
+                                   labels.get(key, material_property_label(key)))
+
+
+class EIEM_PT_mesh_properties(bpy.types.Panel):
+    bl_label = "EIEM 网格"
+    bl_idname = "DATA_PT_eiem_properties"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "data"
+
+    @classmethod
+    def poll(cls, context):
+        obj = getattr(context, "object", None)
+        return (obj is not None and obj.type == "MESH" and
+                bool(obj.data.get("eiem_section")))
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = False
+        layout.use_property_decorate = False
+        obj = context.object
+        mesh = obj.data
+
+        # Logical paths and selectors are placed first because they are the
+        # only identity fields an author is expected to inspect or change.
+        draw_eiem_property(layout, obj, "eiem_render_asset", "命中 Mesh")
+        draw_eiem_property(layout, mesh, "eiem_source", "源 Mesh 路径")
+        draw_eiem_property(layout, mesh, "eiem_asset", "Mesh 名称")
+
+        box = layout.box()
+        heading = box.row()
+        heading.alignment = "LEFT"
+        heading.label(text="资源信息")
+        for owner, key, label in (
+            (mesh, "eiem_section", "Mesh 资源段"),
+            (obj, "eiem_prefab_path", "旧版 PFB 路径"),
+            (obj, "eiem_prefab_section", "PFB 资源段"),
+            (obj, "eiem_render_section", "Render 资源段"),
+            (obj, "eiem_render_path", "旧版 Render 路径"),
+            (obj, "eiem_skeleton", "骨架资源段"),
+            (mesh, "eiem_coordinate_space", "坐标空间"),
+            (mesh, "eiem_target_path", "原 Mesh 路径"),
+            (mesh, "eiem_target_asset", "原 Mesh 名称"),
+        ):
+            draw_eiem_property(box, owner, key, label)
+
+
+class EIEM_PT_image_properties(bpy.types.Panel):
+    bl_label = "EIEM 贴图"
+    bl_idname = "IMAGE_PT_eiem_properties"
+    bl_space_type = "IMAGE_EDITOR"
+    bl_region_type = "UI"
+    bl_category = "EIEM"
+
+    @classmethod
+    def poll(cls, context):
+        image = getattr(getattr(context, "space_data", None), "image", None)
+        return image is not None and bool(image.get("eiem_section"))
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = False
+        layout.use_property_decorate = False
+        image = context.space_data.image
+        draw_eiem_rna_property(layout, image, "filepath", "本地贴图路径")
+        draw_eiem_property(layout, image, "eiem_source", "源贴图路径")
+        draw_eiem_property(layout, image, "eiem_target_path", "原贴图路径")
+        draw_eiem_property(layout, image, "eiem_target_asset", "原贴图名称")
+
+        box = layout.box()
+        heading = box.row()
+        heading.alignment = "LEFT"
+        heading.label(text="采样参数")
+        for key, label in (
+            ("eiem_linear", "Linear"),
+            ("eiem_mipmaps", "Mipmaps"),
+            ("eiem_filter", "Filter"),
+            ("eiem_wrap", "Wrap"),
+            ("eiem_aniso", "Aniso"),
+            ("eiem_mip_bias", "Mip Bias"),
+        ):
+            draw_eiem_property(box, image, key, label)
+
+        box = layout.box()
+        heading = box.row()
+        heading.alignment = "LEFT"
+        heading.label(text="资源信息")
+        for key, label in (
+            ("eiem_section", "资源段"),
+            ("eiem_name", "贴图名"),
+            ("eiem_relative_path", "包内路径"),
+        ):
+            draw_eiem_property(box, image, key, label)
 
 
 class EIEM_OT_import(ImportHelper, bpy.types.Operator):
@@ -1506,7 +1797,13 @@ def menu_export(self, context):
     self.layout.operator(EIEM_OT_export.bl_idname, text="EIEM package")
 
 
-classes = (EIEM_OT_import, EIEM_OT_export)
+classes = (
+    EIEM_OT_import,
+    EIEM_OT_export,
+    EIEM_PT_material_properties,
+    EIEM_PT_mesh_properties,
+    EIEM_PT_image_properties,
+)
 
 
 def register():

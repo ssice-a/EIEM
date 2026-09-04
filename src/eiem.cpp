@@ -85,8 +85,7 @@ APPLEPIE_PLUGIN_EXPORT bool AP_PluginDisable() {
 
 APPLEPIE_PLUGIN_EXPORT bool AP_ReloadConfig() {
   LoadEiemConfig();
-  EiemReloadMods();
-  EiemQueueModReconcile("ApplePie config reload");
+  EiemRequestModUpdate(EiemModUpdate::Reload, "ApplePie config reload");
   s_apHotkeys[0].currentVK = g_guiToggleVK;
   s_apHotkeys[1].currentVK = g_modReloadVK;
   Log("[AP] Config reloaded: gui_toggle_key=%d (%s)", g_guiToggleVK,
