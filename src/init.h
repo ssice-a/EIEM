@@ -179,83 +179,86 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
     Log("[WARN] Failed to subclass game window (err=%lu)", GetLastError());
   }
 
-  // Prefer thread hotkeys over GetAsyncKeyState. Endfield's input stack can
-  // consume keyboard state in a way that leaves asynchronous polling blind,
-  // while RegisterHotKey delivers an explicit WM_HOTKEY to this thread.
-  constexpr int kGuiHotkeyId = 0xE1E0;
-  constexpr int kModReloadHotkeyId = 0xE1E1;
-  MSG hotkeyMsg = {};
-  PeekMessageW(&hotkeyMsg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
-  const bool guiHotkeyRegistered =
-      RegisterHotKey(nullptr, kGuiHotkeyId, MOD_NOREPEAT, g_guiToggleVK) != FALSE;
-  const bool modReloadHotkeyRegistered =
-      RegisterHotKey(nullptr, kModReloadHotkeyId, MOD_NOREPEAT, g_modReloadVK) != FALSE;
-  const DWORD guiRegisterError =
-      guiHotkeyRegistered ? ERROR_SUCCESS : GetLastError();
-  Log("[HOTKEY] registered: GUI=%d err=%lu vk=%d (%s), ModReload=%d vk=%d (%s)",
-      guiHotkeyRegistered ? 1 : 0, guiRegisterError, g_guiToggleVK,
-      EiemVKToString(g_guiToggleVK), modReloadHotkeyRegistered ? 1 : 0,
-      g_modReloadVK, EiemVKToString(g_modReloadVK));
-
-  DWORD lastHotkeyDiag = GetTickCount();
+  // Key edges only. Registration and foreground gating are shared by global
+  // controls and mod cycles; no polling fallback or repeat-driven toggles.
+  enum class KeyAction { Gui, Reload, Cycle };
+  struct Binding { int id; EiemKeyChord chord; KeyAction action; LONG generation; };
+  std::vector<Binding> registered;
+  LONG boundModGeneration = -1, boundConfigGeneration = -1;
+  HWND boundForeground = nullptr;
+  MSG message = {};
+  PeekMessageW(&message, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+  auto clearBindings = [&] {
+    for (const auto &binding : registered) UnregisterHotKey(nullptr, binding.id);
+    registered.clear();
+  };
   while (g_guiRunning && !g_shutdownRequested && IsWindowAlive(hwnd)) {
-    bool guiHotkeyMessage = false;
-    bool modReloadHotkeyMessage = false;
-    while (PeekMessageW(&hotkeyMsg, nullptr, WM_HOTKEY, WM_HOTKEY,
-                        PM_REMOVE)) {
-      if ((int)hotkeyMsg.wParam == kGuiHotkeyId)
-        guiHotkeyMessage = true;
-      else if ((int)hotkeyMsg.wParam == kModReloadHotkeyId)
-        modReloadHotkeyMessage = true;
-    }
-
-    static bool togglePressed = false;
-    const bool guiPollingPressed =
-        !guiHotkeyRegistered &&
-        ((GetAsyncKeyState(g_guiToggleVK) & 0x8001) != 0);
-    if (g_pluginActive && (guiHotkeyMessage || guiPollingPressed)) {
-      if (!togglePressed) {
-        togglePressed = true;
-        ToggleGui();
-        Log("[HOTKEY] GUI toggle received via %s",
-            guiHotkeyMessage ? "WM_HOTKEY" : "GetAsyncKeyState fallback");
+    HWND foreground = GetForegroundWindow();
+    LONG modGeneration = InterlockedCompareExchange(&s_eiemModGeneration, 0, 0);
+    LONG configGeneration = InterlockedCompareExchange(&s_eiemGlobalConfigGeneration, 0, 0);
+    if (foreground != boundForeground || modGeneration != boundModGeneration ||
+        configGeneration != boundConfigGeneration) {
+      clearBindings();
+      // Discard messages from the old registration before reusing OS IDs.
+      while (PeekMessageW(&message, nullptr, WM_HOTKEY, WM_HOTKEY, PM_REMOVE)) {}
+      EiemGlobalConfig config = EiemGetGlobalConfig();
+      std::vector<EiemKeyChord> modKeys = EiemGetModKeyChords(&modGeneration);
+      const auto uiKeys = EiemGetUiKeyChords();
+      if (foreground != hwnd) modKeys.clear(); // don't cycle models while typing in a UI
+      for (const auto &key : uiKeys)
+        if (std::find(modKeys.begin(),modKeys.end(),key) == modKeys.end()) modKeys.push_back(key);
+      int nextId = 1;
+      auto bind = [&](EiemKeyChord chord, KeyAction action) {
+        int id = nextId++;
+        if (id > 0xBFFF || !RegisterHotKey(nullptr, id, chord.modifiers | MOD_NOREPEAT, chord.vk)) {
+          Log("[HOTKEY] registration failed vk=%u modifiers=%u err=%lu; change key in INI",
+              chord.vk, chord.modifiers, GetLastError());
+          return;
+        }
+        registered.push_back({id, chord, action, modGeneration});
+      };
+      const bool ownedForeground = foreground == hwnd || (g_guiHwnd && foreground == g_guiHwnd) ||
+                                  (g_modUiHwnd && foreground == g_modUiHwnd);
+      if (ownedForeground)
+        bind(config.gui, KeyAction::Gui);
+      if (ownedForeground) {
+        bind(config.reload, KeyAction::Reload);
+        for (const auto &chord : modKeys) {
+          if (chord == config.reload || chord == config.gui) {
+            Log("[HOTKEY] mod key conflicts with global shortcut vk=%u modifiers=%u; mod shortcut disabled",
+                chord.vk, chord.modifiers);
+            continue;
+          }
+          bind(chord, KeyAction::Cycle);
+        }
       }
-    } else {
-      togglePressed = false;
+      boundForeground = foreground;
+      boundModGeneration = modGeneration;
+      boundConfigGeneration = configGeneration;
+      Log("[HOTKEY] bindings updated count=%zu modGeneration=%ld configGeneration=%ld",
+          registered.size(), modGeneration, configGeneration);
     }
-
-    static bool reloadPressed = false;
-    const bool reloadPollingPressed =
-        !modReloadHotkeyRegistered &&
-        ((GetAsyncKeyState(g_modReloadVK) & 0x8001) != 0);
-    if (g_pluginActive && (modReloadHotkeyMessage || reloadPollingPressed)) {
-      if (!reloadPressed) {
-        reloadPressed = true;
-        EiemRequestModUpdate(EiemModUpdate::Reload, "mod reload hotkey");
-        Log("[HOTKEY] Mod reload received via %s",
-            modReloadHotkeyMessage ? "WM_HOTKEY" : "GetAsyncKeyState fallback");
+    while (PeekMessageW(&message, nullptr, WM_HOTKEY, WM_HOTKEY, PM_REMOVE)) {
+      if (!g_pluginActive) continue;
+      for (const auto &binding : registered) {
+        if (binding.id != (int)message.wParam) continue;
+        HWND currentForeground = GetForegroundWindow();
+        if (binding.action == KeyAction::Gui) {
+          if (currentForeground == hwnd || currentForeground == g_guiHwnd || currentForeground == g_modUiHwnd) ToggleGui();
+        } else if (currentForeground == hwnd || currentForeground == g_guiHwnd || currentForeground == g_modUiHwnd) {
+          if (binding.action == KeyAction::Reload)
+            EiemRequestModUpdate(EiemModUpdate::Reload, "global reload hotkey");
+          else if (!PostMessageW(hwnd, WM_EIEM_MOD_KEY,
+                                 MAKEWPARAM(binding.chord.vk, binding.chord.modifiers),
+                                 binding.generation))
+            Log("[HOTKEY] could not queue mod key err=%lu", GetLastError());
+        }
+        break;
       }
-    } else {
-      reloadPressed = false;
     }
-
-    // Keep a low-rate heartbeat so a failed hotkey loop is distinguishable
-    // from a key that the game or desktop consumed.
-    DWORD now = GetTickCount();
-    if (now - lastHotkeyDiag >= 5000) {
-      Log("[HOTKEY] polling heartbeat: active=%d gui_vk=%d gui_visible=%d",
-          g_pluginActive ? 1 : 0, g_guiToggleVK, g_guiVisible ? 1 : 0);
-      lastHotkeyDiag = now;
-    }
-
-
     Sleep(20);
   }
-
-  if (guiHotkeyRegistered)
-    UnregisterHotKey(nullptr, kGuiHotkeyId);
-  if (modReloadHotkeyRegistered)
-    UnregisterHotKey(nullptr, kModReloadHotkeyId);
+  clearBindings();
 
   // The game owns this window. Restore its original procedure before the
   // plugin thread exits so late close/destroy messages bypass EIEM.
@@ -571,7 +574,7 @@ static DWORD WINAPI InitThread(LPVOID) {
       CreateFileA("plugin\\eiem_log.txt", GENERIC_WRITE, FILE_SHARE_READ, NULL,
                   CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
   Log("=== EIEM Phase 1: Skeleton Discovery ===");
-  Log("[BUILD] resource-runtime-v31-architecture-cleanup dll=%s %s", __DATE__,
+  Log("[BUILD] resource-runtime-v37-lua-ui dll=%s %s", __DATE__,
       __TIME__);
 
   if (!Resolve()) {
@@ -613,6 +616,7 @@ static DWORD WINAPI InitThread(LPVOID) {
   // observed completion cannot commit an unmodified object due to startup
   // ordering. Later reload requests are dispatched on Unity's thread.
   LoadEiemConfig();
+  InitEiemCameraFade(asms, ac);
   EiemReloadMods();
 
   Log("[RES-TRACE] Installing startup resource hooks before metadata dump");

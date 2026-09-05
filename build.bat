@@ -49,6 +49,17 @@ echo.
 
 if not exist bin mkdir bin
 
+:: Build Lua as C++ so protected Lua errors unwind C++ binding locals safely.
+if not exist bin\lua mkdir bin\lua
+set "lua_sources="
+for %%f in (deps\lua\*.c) do (
+    if /I not "%%~nxf"=="lua.c" if /I not "%%~nxf"=="luac.c" set "lua_sources=!lua_sources! %%f"
+)
+cl /nologo /O2 /MD /EHsc /TP /c /Ideps\lua /Fo"bin\lua\\" !lua_sources!
+if errorlevel 1 exit /b 1
+lib /nologo /out:bin\lua.lib bin\lua\*.obj
+if errorlevel 1 exit /b 1
+
 :: Build eiem.dll
 echo [1/4] Compiling version resource ...
 rc /nologo /fo bin\version.res src\version.rc
@@ -57,6 +68,7 @@ echo [2/4] Building eiem.dll ...
 cl /nologo /utf-8 /O2 /Zi /Fd"bin\eiem_compile.pdb" /MD /LD /EHsc /std:c++17 ^
     /Ideps\minhook_lib\include ^
     /Ideps\imgui ^
+    /Ideps\lua ^
     src\eiem.cpp ^
     deps\imgui\imgui.cpp ^
     deps\imgui\imgui_draw.cpp ^
@@ -65,6 +77,7 @@ cl /nologo /utf-8 /O2 /Zi /Fd"bin\eiem_compile.pdb" /MD /LD /EHsc /std:c++17 ^
     deps\imgui\imgui_impl_win32.cpp ^
     deps\imgui\imgui_impl_dx11.cpp ^
     bin\version.res ^
+    bin\lua.lib ^
     deps\minhook_lib\lib\libMinHook.x64.lib ^
     user32.lib ^
     gdi32.lib ^
@@ -115,6 +128,12 @@ if %errorlevel% neq 0 (
 echo [OK] vulkan-1.dll built successfully
 echo.
 
+:: Distribution template only; never overwrite the installed user's configuration.
+copy /y config\eiem.ini bin\eiem.ini >nul
+if %errorlevel% neq 0 exit /b 1
+copy /y deps\lua\LICENSE bin\LUA-LICENSE.txt >nul
+if %errorlevel% neq 0 exit /b 1
+
 :: Clean up intermediate files (CWD .obj + bin\ .exp/.lib)
 del /q eiem.obj 2>nul
 del /q imgui.obj 2>nul
@@ -140,5 +159,6 @@ echo Output files in bin\:
 echo   - eiem.dll               (EIEM plugin)
 echo   - d3dcompiler_47.dll     (DX proxy loader)
 echo   - vulkan-1.dll           (Vulkan proxy loader)
+echo   - eiem.ini              (global settings template)
 echo.
 

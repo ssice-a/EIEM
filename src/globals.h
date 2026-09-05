@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 
 #define EIEM_VERSION_MAJOR 0
 #define EIEM_VERSION_MINOR 2
@@ -11,6 +12,7 @@
 // Sent to the game's window procedure so Mod reconciliation always executes
 // on Unity's main thread. Keep this outside the game's WM_USER range.
 #define WM_EIEM_MOD_RECONCILE (WM_APP + 0x316)
+#define WM_EIEM_MOD_KEY (WM_APP + 0x317)
 
 static HANDLE g_logHandle = INVALID_HANDLE_VALUE;
 static CRITICAL_SECTION g_logLock;
@@ -236,7 +238,7 @@ static HWND g_gameHwnd = nullptr;
 
 static int g_guiToggleVK = VK_INSERT;
 static int g_modReloadVK = VK_F10;
-static bool g_pluginActive = true;
+static std::atomic_bool g_pluginActive{true};
 
 #define OFF_BIPEDIK_FIX_TRANSFORMS    0x18
 #define OFF_BIPEDIK_SOLVERS           0x40
@@ -306,6 +308,8 @@ static bool g_audioPendingStart = false;
 
 static volatile bool g_guiVisible = false;
 static HWND g_guiHwnd = nullptr;
+static HWND g_modUiHwnd = nullptr;
+static volatile bool g_modUiVisible = false;
 static volatile bool g_guiRunning = false;
 // Set when the host game begins shutdown. Hooks keep calling their original
 // methods, but worker threads stop touching Unity state as soon as possible.

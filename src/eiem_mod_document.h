@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <sstream>
 #include <cstdint>
 #include <cerrno>
 #include <climits>
@@ -14,6 +15,10 @@
 #include <string>
 #include <vector>
 #include <unordered_set>
+#include <unordered_map>
+#include <utility>
+#include "eiem_expression.h"
+#include "eiem_keys.h"
 
 // Authoring syntax -> typed resource declarations and Render actions. No
 // published configuration, Unity objects, hotkeys or lifecycle state live here.
@@ -37,6 +42,9 @@ struct EiemModRule {
   uint32_t submeshCount = 0;
   char partners[16][96] = {};
   uint32_t partnerCount = 0;
+  char shapeNames[64][192] = {};
+  float shapeWeights[64] = {}; // authoring units: 1 == Unity 100
+  uint32_t shapeCount = 0;
 };
 
 // A Prefab declaration groups the Render actions for one logical model. Each
@@ -118,241 +126,597 @@ static bool EiemModInteger(const std::string &text, int32_t *out,
   return true;
 }
 
-static bool EiemModParseStream(std::istream &input, const char *path,
-                                std::vector<EiemModPrefab> &outputPrefabs,
-                                std::vector<EiemModRule> &outputRules,
-                                std::vector<EiemModResource> &outputResources,
-                                std::string *error = nullptr) {
-  // A bad file must not publish half of its rules or broaden an invalid match.
+// A Render has immutable selectors and an ordered body. Evaluated rules remain
+// plain data, so existing hooks never need to interpret conditions.
+struct EiemModStatement {
+  size_t line = 0;
+  std::string key, value;
+  std::shared_ptr<EiemExpression> condition;
+  std::shared_ptr<EiemExpression> number;
+  std::vector<EiemModStatement> yes, no;
+};
+struct EiemRenderProgram {
+  EiemModRule selector;
+  size_t stateIndex = 0;
+  std::vector<EiemModStatement> statements;
+};
+struct EiemKeyAssignment {
+  std::string variable;
+  std::vector<double> values;
+};
+struct EiemModKey {
+  std::string section;
+  EiemKeyChord chord;
+  size_t line = 0;
+  std::vector<EiemKeyAssignment> assignments;
+};
+struct EiemModUi {
+  std::string section, path;
+  EiemKeyChord chord;
+  std::shared_ptr<EiemExpression> condition;
+};
+struct EiemModState {
+  std::string path;
+  EiemVariables defaults, variables;
+  std::vector<EiemModKey> keys;
+  std::vector<EiemModUi> uis;
+};
+struct EiemModProgram {
   std::vector<EiemModPrefab> prefabs;
-  std::vector<EiemModRule> out;
   std::vector<EiemModResource> resources;
-  std::unordered_set<std::string> sections;
+  std::vector<EiemRenderProgram> definitions;
+  std::vector<EiemModState> states;
+  std::vector<EiemModRule> rules;
+  std::vector<size_t> standaloneRules;
+};
+
+static bool EiemRenderSelectorKey(const std::string &key) {
+  return key == "path" || key == "asset" || key == "match.vertices" ||
+         key == "match.indices" || key == "match.submeshes";
+}
+
+static bool EiemSetRenderField(EiemModRule &rule, const std::string &key,
+                               const std::string &value, std::string &error,
+                               const double *number = nullptr) {
+  auto fail = [&] { error = "Invalid Render field: " + key + "=" + value; return false; };
+  auto copy = [&](auto &field) {
+    if (value.size() >= sizeof(field)) return false;
+    EiemModCopy(field, sizeof(field), value);
+    return true;
+  };
+  if (key == "path") return copy(rule.path) || fail();
+  if (key == "asset") return copy(rule.asset) || fail();
+  if (key == "match.vertices") return EiemModInteger(value, &rule.matchVertices) || fail();
+  if (key == "match.indices") return EiemModInteger(value, &rule.matchIndices) || fail();
+  if (key == "match.submeshes") return EiemModInteger(value, &rule.matchSubMeshes) || fail();
+  if (key == "handling") {
+    if (!value.empty() && !EiemModEquals(value.c_str(), "skip")) return fail();
+    return copy(rule.handling) || fail();
+  }
+  if (key == "mesh") { rule.hasMesh = !value.empty(); return copy(rule.mesh) || fail(); }
+  if (key == "skeleton") { rule.hasSkeleton = !value.empty(); return copy(rule.skeleton) || fail(); }
+  if (key.compare(0, 6, "shape.") == 0) {
+    const std::string name = key.substr(6);
+    if (name.empty() || name.size() >= sizeof(rule.shapeNames[0])) return fail();
+    uint32_t slot = 0;
+    while (slot < rule.shapeCount && name != rule.shapeNames[slot]) ++slot;
+    if (value.empty() && !number) {
+      if (slot < rule.shapeCount) {
+        for (uint32_t i = slot + 1; i < rule.shapeCount; ++i) {
+          memcpy(rule.shapeNames[i - 1], rule.shapeNames[i], sizeof(rule.shapeNames[i]));
+          rule.shapeWeights[i - 1] = rule.shapeWeights[i];
+        }
+        --rule.shapeCount;
+      }
+      return true;
+    }
+    double weight = 0;
+    if (number) weight = *number;
+    if (slot >= _countof(rule.shapeNames) || (!number && !EiemNumber(value, &weight)) ||
+        !std::isfinite((float)(weight * 100))) return fail();
+    EiemModCopy(rule.shapeNames[slot], sizeof(rule.shapeNames[slot]), name);
+    rule.shapeWeights[slot] = (float)weight;
+    if (slot == rule.shapeCount) ++rule.shapeCount;
+    return true;
+  }
+  int32_t index = 0;
+  if (key.compare(0, 9, "material.") == 0) {
+    if (!EiemModInteger(key.substr(9), &index, 0, _countof(rule.materialSlots) - 1)) return fail();
+    uint32_t slot = 0;
+    while (slot < rule.materialCount && rule.materialSlots[slot] != index) ++slot;
+    if (value.empty()) {
+      if (slot < rule.materialCount) {
+        for (uint32_t i = slot + 1; i < rule.materialCount; ++i) {
+          rule.materialSlots[i - 1] = rule.materialSlots[i];
+          memcpy(rule.materials[i - 1], rule.materials[i], sizeof(rule.materials[i]));
+        }
+        --rule.materialCount;
+      }
+      return true;
+    }
+    if (!copy(rule.materials[slot])) return fail();
+    if (slot == rule.materialCount) ++rule.materialCount;
+    rule.materialSlots[slot] = index;
+    return true;
+  }
+  if (key.compare(0, 8, "partner.") == 0) {
+    if (!EiemModInteger(key.substr(8), &index, 0, _countof(rule.partners) - 1) ||
+        !copy(rule.partners[index])) return fail();
+    rule.partnerCount = (std::max)(rule.partnerCount, (uint32_t)index + 1);
+    return true;
+  }
+  if (key.compare(0, 8, "submesh.") == 0) {
+    int32_t slot = -1;
+    if (!EiemModInteger(key.substr(8), &index, 0, _countof(rule.submeshSlots) - 1) ||
+        (!value.empty() && !EiemModInteger(value, &slot, 0, _countof(rule.materialSlots) - 1))) return fail();
+    rule.submeshSlots[index] = slot;
+    rule.submeshCount = (std::max)(rule.submeshCount, (uint32_t)index + 1);
+    return true;
+  }
+  return fail();
+}
+
+static void EiemEvaluateStatements(const std::vector<EiemModStatement> &statements,
+                                    const EiemVariables &variables, EiemModRule &rule) {
+  for (const auto &statement : statements) {
+    if (statement.condition)
+      EiemEvaluateStatements(statement.condition->Evaluate(variables) ? statement.yes : statement.no, variables, rule);
+    else {
+      std::string unused; // fields were validated before publication
+      const double number = statement.number ? statement.number->Evaluate(variables) : 0;
+      EiemSetRenderField(rule, statement.key, statement.value, unused,
+                         statement.number ? &number : nullptr);
+    }
+  }
+}
+
+static void EiemEvaluateModProgram(EiemModProgram &program) {
+  program.rules.clear();
+  for (const auto &definition : program.definitions) {
+    EiemModRule rule = definition.selector;
+    EiemEvaluateStatements(definition.statements, program.states[definition.stateIndex].variables, rule);
+    program.rules.push_back(rule);
+  }
+}
+
+template <typename Visitor>
+static void EiemVisitStatements(const std::vector<EiemModStatement> &statements, Visitor visit) {
+  for (const auto &statement : statements) {
+    visit(statement);
+    EiemVisitStatements(statement.yes, visit);
+    EiemVisitStatements(statement.no, visit);
+  }
+}
+
+static std::string EiemModIdentifier(const char *file, const char *section) {
+  std::string result = std::string(file) + '\n' + section;
+  std::transform(result.begin(), result.end(), result.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+  return result;
+}
+
+static void EiemCompileModProgram(EiemModProgram &program) {
+  program.standaloneRules.clear();
+  std::unordered_set<std::string> referenced;
+  for (const auto &prefab : program.prefabs)
+    for (uint32_t i = 0; i < prefab.renderCount; ++i)
+      if (prefab.renders[i][0]) referenced.insert(EiemModIdentifier(prefab.modPath, prefab.renders[i]));
+  // Inspect ALL branches: an inactive partner is still a template, not a
+  // standalone rule accidentally promoted when its condition becomes false.
+  for (const auto &definition : program.definitions)
+    EiemVisitStatements(definition.statements, [&](const EiemModStatement &statement) {
+      if (statement.key.compare(0, 8, "partner.") == 0 && !statement.value.empty())
+        referenced.insert(EiemModIdentifier(definition.selector.modPath, statement.value.c_str()));
+    });
+  for (size_t i = 0; i < program.definitions.size(); ++i) {
+    const auto &rule = program.definitions[i].selector;
+    if ((rule.path[0] || rule.asset[0]) && !referenced.count(EiemModIdentifier(rule.modPath, rule.section)))
+      program.standaloneRules.push_back(i);
+  }
+  EiemEvaluateModProgram(program);
+}
+
+// A file is validated in isolation before appending. References cannot silently
+// reach another mod; typoed references in inactive branches are errors too.
+static bool EiemValidShapeExpression(const EiemExpression &expression, const EiemModState &state) {
+  auto finiteWeight = [](double value) { return std::isfinite((float)(value * 100.0)); };
+  if (expression.op == EiemExpression::Number) return finiteWeight(expression.number);
+  if (expression.op == EiemExpression::Negative) return EiemValidShapeExpression(*expression.left, state);
+  if (expression.op != EiemExpression::Variable) return true; // comparisons/logical results are 0 or 1
+  if (!finiteWeight(state.defaults.at(expression.variable))) return false;
+  for (const auto &key : state.keys) for (const auto &assignment : key.assignments)
+    if (assignment.variable == expression.variable)
+      for (double value : assignment.values) if (!finiteWeight(value)) return false;
+  return true;
+}
+
+// Validate a complete UI transaction before publishing anything. Lua cannot add
+// variables or publish a value that overflows a Render's native shape weights.
+static bool EiemValidateUiValues(const EiemModProgram &program, size_t stateIndex,
+                                 const EiemVariables &values, EiemVariables &proposed,
+                                 std::string &error) {
+  proposed = program.states[stateIndex].variables;
+  for (const auto &item : values) {
+    if (!proposed.count(item.first) || !std::isfinite(item.second)) {
+      error = "Invalid UI variable/value: " + item.first; return false;
+    }
+    proposed[item.first] = item.second;
+  }
+  bool valid = true;
+  for (const auto &definition : program.definitions) if (definition.stateIndex == stateIndex)
+    EiemVisitStatements(definition.statements, [&](const EiemModStatement &s) {
+      if (s.number && !std::isfinite((float)(s.number->Evaluate(proposed) * 100.0))) {
+        valid = false; error = "UI value overflows shape weight: " + s.key;
+      }
+    });
+  return valid;
+}
+
+static bool EiemApplyUiValues(EiemModProgram &program, size_t stateIndex,
+                              const EiemVariables &values, std::string &error) {
+  EiemVariables proposed;
+  if (!EiemValidateUiValues(program,stateIndex,values,proposed,error)) return false;
+  program.states[stateIndex].variables = std::move(proposed); return true;
+}
+
+static bool EiemUiRelativePath(const std::string &value) {
+  if (value.empty() || value.size() > 768 || value.front() == '/' || value.front() == '\\' ||
+      value.find(':') != std::string::npos || value.find('\0') != std::string::npos) return false;
+  std::string normalized = value;
+  std::replace(normalized.begin(), normalized.end(), '\\', '/');
+  std::istringstream parts(normalized);
+  for (std::string part; std::getline(parts, part, '/');) if (part == "..") return false;
+  return true;
+}
+
+static bool EiemValidateModDocument(EiemModProgram &doc, std::string &error) {
+  auto &state = doc.states.front();
+  std::unordered_map<std::string, std::string> resources;
+  std::unordered_map<std::string, size_t> renders;
+  for (const auto &r : doc.resources) resources[EiemModIdentifier("", r.section)] = r.kind;
+  for (size_t i = 0; i < doc.definitions.size(); ++i)
+    renders[EiemModIdentifier("", doc.definitions[i].selector.section)] = i;
+  std::vector<std::vector<size_t>> edges(doc.definitions.size());
+  for (size_t i = 0; i < doc.definitions.size(); ++i) {
+    bool valid = true;
+    std::unordered_set<std::string> shapes;
+    EiemVisitStatements(doc.definitions[i].statements, [&](const EiemModStatement &s) {
+      if (!valid) return;
+      std::string detail;
+      if (s.condition && !s.condition->Validate(state.defaults, detail)) valid = false;
+      if (s.number && !s.number->Validate(state.defaults, detail)) valid = false;
+      if (valid && s.number && !EiemValidShapeExpression(*s.number, state)) {
+        valid = false; detail = "Shape weight exceeds finite Unity float range";
+      }
+      if (s.key.compare(0, 6, "shape.") == 0 && shapes.insert(s.key).second && shapes.size() > 64) {
+        valid = false; detail = "Render exceeds 64 shape channels";
+      }
+      if (!s.condition && !s.value.empty()) {
+        std::string kind;
+        if (s.key == "mesh") kind = "Mesh";
+        else if (s.key == "skeleton") kind = "Skeleton";
+        else if (s.key.compare(0, 9, "material.") == 0) kind = "Material";
+        if (!kind.empty()) {
+          auto it = resources.find(EiemModIdentifier("", s.value.c_str()));
+          if (it == resources.end() || it->second != kind) {
+            valid = false; detail = "Missing " + kind + " declaration: " + s.value;
+          }
+        }
+        if (s.key.compare(0, 8, "partner.") == 0) {
+          auto it = renders.find(EiemModIdentifier("", s.value.c_str()));
+          if (it == renders.end()) { valid = false; detail = "Missing partner: " + s.value; }
+          else edges[i].push_back(it->second);
+        }
+      }
+      if (!valid) error = std::to_string(s.line) + ": " + detail;
+    });
+    if (!valid) return false;
+  }
+  for (const auto &prefab : doc.prefabs)
+    for (uint32_t i = 0; i < prefab.renderCount; ++i)
+      if (prefab.renders[i][0] && !renders.count(EiemModIdentifier("", prefab.renders[i]))) {
+        error = "Prefab references missing Render: " + std::string(prefab.renders[i]); return false;
+      }
+  // Runtime partners are one-level Render templates. Reject unsupported nesting
+  // explicitly instead of accepting an inert or recursive graph.
+  for (const auto &refs : edges) for (size_t target : refs)
+    if (!edges[target].empty()) { error = "Nested/cyclic partner references are not supported"; return false; }
+  for (const auto &key : state.keys) {
+    if (!key.chord.vk || key.assignments.empty()) {
+      error = std::to_string(key.line) + ": Key needs key=, type=cycle and variable values"; return false;
+    }
+    const size_t length = key.assignments.front().values.size();
+    for (const auto &assignment : key.assignments) {
+      if (!state.defaults.count(assignment.variable) || length < 2 || assignment.values.size() != length) {
+        error = std::to_string(key.line) + ": Invalid cycle variable/list: " + assignment.variable; return false;
+      }
+    }
+  }
+  for (const auto &ui : state.uis) {
+    if (!EiemUiRelativePath(ui.path) || !ui.chord.vk || ui.chord.vk == VK_INSERT) {
+      error = "UI needs a relative script path and a non-INSERT key: " + ui.section; return false;
+    }
+    if (ui.condition && !ui.condition->Validate(state.defaults, error)) return false;
+    for (const auto &key : state.keys) if (key.chord == ui.chord) {
+      error = "UI key conflicts with Mod cycle key: " + ui.section; return false;
+    }
+  }
+  state.variables = state.defaults;
+  return true;
+}
+
+static bool EiemModParseStream(std::istream &input, const char *path,
+                                EiemModProgram &output, std::string *error = nullptr) {
+  EiemModProgram doc;
+  doc.states.push_back({});
+  doc.states[0].path = path;
+  auto &state = doc.states[0];
   size_t lineNumber = 0;
   if (error) error->clear();
   auto fail = [&](const std::string &message) {
     if (error) *error = std::to_string(lineNumber) + ": " + message;
     return false;
   };
-  std::string line, section;
-  EiemModRule current = {};
-  EiemModInitRule(&current);
-  EiemModResource resource = {};
-  EiemModPrefab prefab = {};
-  bool inPrefab = false;
-  bool inRender = false;
-  bool inResource = false;
-  auto flush = [&]() {
-    if (!inRender || !current.section[0]) return;
-    strncpy_s(current.modPath, sizeof(current.modPath), path, _TRUNCATE);
-    out.push_back(current);
-    EiemModInitRule(&current);
+  enum Section { None, Constants, Key, UI, Render, Prefab, Resource } section = None;
+  std::unordered_set<std::string> uiFields;
+  std::unordered_set<std::string> sections;
+  struct Frame {
+    std::vector<EiemModStatement> *parent;
+    EiemModStatement *branch;
+    bool hadElse = false;
   };
-  auto flushResource = [&]() {
-    if (!inResource) return;
-    if (resource.path[0]) {
-      strncpy_s(resource.modPath, sizeof(resource.modPath), path, _TRUNCATE);
-      resources.push_back(resource);
-    }
-    resource = {};
+  std::vector<Frame> stack;
+  std::vector<EiemModStatement> *body = nullptr;
+  bool keyTypeSeen = false;
+  size_t conditionNodes = 0;
+  auto finishSection = [&]() {
+    if (!stack.empty()) return fail("Missing endif before section end");
+    if (section == Key && !keyTypeSeen) return fail("Key needs type=cycle");
+    if (section == Resource && !doc.resources.back().path[0]) return fail("Resource needs path");
+    if (section == Prefab && !doc.prefabs.back().path[0]) return fail("Prefab needs path");
+    return true;
   };
-  auto flushPrefab = [&]() {
-    if (!inPrefab) return;
-    if (prefab.section[0] && prefab.path[0]) {
-      strncpy_s(prefab.modPath, sizeof(prefab.modPath), path, _TRUNCATE);
-      prefabs.push_back(prefab);
-    }
-    prefab = {};
-  };
+  std::string line;
   while (std::getline(input, line)) {
     ++lineNumber;
-    if (lineNumber == 1 && line.compare(0, 3, "\xEF\xBB\xBF") == 0)
-      line.erase(0, 3);
-    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (lineNumber == 1 && line.compare(0, 3, "\xEF\xBB\xBF") == 0) line.erase(0, 3);
     EiemModTrim(line);
     if (line.empty() || line[0] == ';' || line[0] == '#') continue;
-    // Until the ordered statement parser exists, do not mistake a condition
-    // containing '=' for an unknown metadata field and run its body unconditionally.
-    const std::string command = line.substr(0, line.find_first_of(" \t=("));
-    if (EiemModEquals(command.c_str(), "if") || EiemModEquals(command.c_str(), "else") ||
-        EiemModEquals(command.c_str(), "elif") || EiemModEquals(command.c_str(), "endif"))
-      return fail("Conditional commands are not implemented");
     if (line.front() == '[' && line.back() == ']') {
-      flush();
-      flushResource();
-      flushPrefab();
-      section = line.substr(1, line.size() - 2);
-      EiemModTrim(section);
-      std::string sectionKey = section;
-      std::transform(sectionKey.begin(), sectionKey.end(), sectionKey.begin(),
-                     [](unsigned char c) { return (char)std::tolower(c); });
-      if (section.empty() || !sections.insert(sectionKey).second)
-        return fail("Empty or duplicate section: " + section);
-      inPrefab = section.size() >= 6 &&
-                 _strnicmp(section.c_str(), "Prefab", 6) == 0;
-      inRender = !inPrefab && section.size() >= 6 &&
-                 _strnicmp(section.c_str(), "Render", 6) == 0;
-      inResource = !inPrefab && !inRender &&
-                   (_strnicmp(section.c_str(), "Mesh", 4) == 0 ||
-                    _strnicmp(section.c_str(), "Skeleton", 8) == 0 ||
-                    _strnicmp(section.c_str(), "Material", 8) == 0 ||
-                    _strnicmp(section.c_str(), "Texture", 7) == 0);
-      if (inRender) EiemModCopy(current.section, sizeof(current.section), section);
-      if (inPrefab) EiemModCopy(prefab.section, sizeof(prefab.section), section);
-      if (inResource) {
-        EiemModCopy(resource.section, sizeof(resource.section), section);
-        if (_strnicmp(section.c_str(), "Mesh", 4) == 0)
-          EiemModCopy(resource.kind, sizeof(resource.kind), "Mesh");
-        else if (_strnicmp(section.c_str(), "Skeleton", 8) == 0)
-          EiemModCopy(resource.kind, sizeof(resource.kind), "Skeleton");
-        else if (_strnicmp(section.c_str(), "Material", 8) == 0)
-          EiemModCopy(resource.kind, sizeof(resource.kind), "Material");
-        else
-          EiemModCopy(resource.kind, sizeof(resource.kind), "Texture");
+      if (!finishSection()) return false;
+      std::string name = line.substr(1, line.size() - 2);
+      EiemModTrim(name);
+      if (name.empty() || name.size() >= 96 || !sections.insert(EiemModIdentifier("", name.c_str())).second)
+        return fail("Empty, too long or duplicate section: " + name);
+      body = nullptr;
+      if (EiemModEquals(name.c_str(), "Constants")) section = Constants;
+      else if (_strnicmp(name.c_str(), "Slider", 6) == 0) {
+        return fail("Slider sections have been removed; re-export as UI + Lua");
+      }
+      else if (_strnicmp(name.c_str(), "UI", 2) == 0) {
+        section = UI; uiFields.clear(); state.uis.push_back({});
+        state.uis.back().section = name;
+      }
+      else if (_strnicmp(name.c_str(), "Key", 3) == 0) {
+        section = Key; keyTypeSeen = false;
+        state.keys.push_back({});
+        state.keys.back().section = name; state.keys.back().line = lineNumber;
+      } else if (_strnicmp(name.c_str(), "Render", 6) == 0) {
+        section = Render;
+        conditionNodes = 0;
+        doc.definitions.push_back({});
+        auto &definition = doc.definitions.back();
+        EiemModInitRule(&definition.selector);
+        EiemModCopy(definition.selector.modPath, sizeof(definition.selector.modPath), path);
+        EiemModCopy(definition.selector.section, sizeof(definition.selector.section), name);
+        body = &definition.statements;
+      } else if (_strnicmp(name.c_str(), "Prefab", 6) == 0) {
+        section = Prefab; doc.prefabs.push_back({});
+        auto &p = doc.prefabs.back();
+        EiemModCopy(p.modPath, sizeof(p.modPath), path);
+        EiemModCopy(p.section, sizeof(p.section), name);
+      } else {
+        const char *kind = _strnicmp(name.c_str(), "Mesh", 4) == 0 ? "Mesh" :
+          _strnicmp(name.c_str(), "Material", 8) == 0 ? "Material" :
+          _strnicmp(name.c_str(), "Texture", 7) == 0 ? "Texture" :
+          _strnicmp(name.c_str(), "Skeleton", 8) == 0 ? "Skeleton" : nullptr;
+        if (!kind) return fail("Unknown section: " + name);
+        section = Resource; doc.resources.push_back({});
+        auto &r = doc.resources.back();
+        EiemModCopy(r.modPath, sizeof(r.modPath), path);
+        EiemModCopy(r.section, sizeof(r.section), name);
+        EiemModCopy(r.kind, sizeof(r.kind), kind);
       }
       continue;
     }
-    if (!inPrefab && !inRender && !inResource) continue;
+    std::string command = line.substr(0, line.find_first_of(" \t("));
+    std::transform(command.begin(), command.end(), command.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+    if (command == "if" || command == "else" || command == "endif") {
+      if (section != Render) return fail("Conditions are only allowed inside Render");
+      std::string expressionText;
+      if (command == "if") {
+        if (++conditionNodes > 128) return fail("Render exceeds 128 conditional nodes");
+        expressionText = line.substr(2); EiemModTrim(expressionText);
+        body->push_back({}); auto &s = body->back(); s.line = lineNumber;
+        std::string detail;
+        s.condition = EiemExpressionParser(expressionText, detail).Parse();
+        if (!s.condition) return fail(detail);
+        stack.push_back({body, &s, false}); body = &s.yes;
+      } else if (command == "else") {
+        if (stack.empty() || stack.back().hadElse) return fail("Unexpected/duplicate else");
+        auto &frame = stack.back();
+        std::string rest = line.substr(4); EiemModTrim(rest);
+        if (rest.empty()) { frame.hadElse = true; body = &frame.branch->no; }
+        else {
+          if (++conditionNodes > 128) return fail("Render exceeds 128 conditional nodes");
+          if (rest.size() <= 2 || _strnicmp(rest.c_str(), "if", 2) != 0 ||
+              !(std::isspace((unsigned char)rest[2]) || rest[2] == '(')) return fail("Expected else or else if");
+          frame.branch->no.push_back({});
+          auto &s = frame.branch->no.back(); s.line = lineNumber;
+          expressionText = rest.substr(2); EiemModTrim(expressionText);
+          std::string detail;
+          s.condition = EiemExpressionParser(expressionText, detail).Parse();
+          if (!s.condition) return fail(detail);
+          frame.branch = &s; body = &s.yes;
+        }
+      } else {
+        if (line.size() != 5 || stack.empty()) return fail("Unexpected endif");
+        body = stack.back().parent; stack.pop_back();
+      }
+      continue;
+    }
     const size_t equals = line.find('=');
-    if (equals == std::string::npos)
-      return fail("Expected key=value; condition/command syntax is not implemented");
+    if (equals == std::string::npos || section == None) return fail("Expected section and key=value");
     std::string key = line.substr(0, equals), value = line.substr(equals + 1);
     EiemModTrim(key); EiemModTrim(value);
-    if (_stricmp(key.c_str(), "path") == 0) {
-      if (inPrefab) EiemModCopy(prefab.path, sizeof(prefab.path), value);
-      else if (inRender) EiemModCopy(current.path, sizeof(current.path), value);
-      else EiemModCopy(resource.path, sizeof(resource.path), value);
+    if (section == Constants) {
+      double number = 0;
+      if (!EiemVariableName(key) || !EiemNumber(value, &number) || !state.defaults.emplace(key, number).second)
+        return fail("Invalid/duplicate variable: " + key);
+      continue;
     }
-    if (inPrefab) {
-      if (_strnicmp(key.c_str(), "render.", 7) == 0) {
-        int32_t index = 0;
-        if (!EiemModInteger(key.substr(7), &index, 0, _countof(prefab.renders) - 1))
-          return fail("Invalid Render reference index: " + key);
-        EiemModCopy(prefab.renders[index], sizeof(prefab.renders[0]), value);
-        if ((uint32_t)(index + 1) > prefab.renderCount)
-          prefab.renderCount = (uint32_t)(index + 1);
+    if (section == Key && EiemVariableName(key)) {
+      auto &assignments = state.keys.back().assignments;
+      for (const auto &a : assignments) if (a.variable == key) return fail("Duplicate key assignment: " + key);
+      EiemKeyAssignment a; a.variable = key;
+      size_t start = 0;
+      for (;;) {
+        size_t end = value.find(',', start);
+        std::string token = value.substr(start, end == std::string::npos ? end : end - start);
+        EiemModTrim(token); double number = 0;
+        if (!EiemNumber(token, &number)) return fail("Invalid cycle value: " + token);
+        a.values.push_back(number);
+        if (end == std::string::npos) break;
+        start = end + 1;
+      }
+      assignments.push_back(std::move(a));
+      continue;
+    }
+    const std::string authoredKey = key;
+    std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+    if (section == Render && key.compare(0, 6, "shape.") == 0) key = "shape." + authoredKey.substr(6);
+    if (section == UI) {
+      if (!uiFields.insert(key).second) return fail("Duplicate UI field: " + key);
+      auto &ui = state.uis.back();
+      if (key == "path" && EiemUiRelativePath(value)) ui.path = value;
+      else if (key == "key" && EiemParseKeyChord(value, &ui.chord)) {}
+      else if (key == "condition") {
+        std::string detail; ui.condition = EiemExpressionParser(value, detail).Parse();
+        if (!ui.condition) return fail(detail);
+      }
+      else return fail("Invalid UI field: " + key);
+      continue;
+    }
+    if (section == Key) {
+      if (key == "key") {
+        if (state.keys.back().chord.vk || !EiemParseKeyChord(value, &state.keys.back().chord)) return fail("Invalid/duplicate key chord");
+      } else if (key == "type" && EiemModEquals(value.c_str(), "cycle") && !keyTypeSeen) keyTypeSeen = true;
+      else return fail("Unsupported Key field: " + key);
+      continue;
+    }
+    if (section == Render) {
+      std::string detail;
+      EiemModRule check; EiemModInitRule(&check);
+      std::shared_ptr<EiemExpression> number;
+      if (key.compare(0, 6, "shape.") == 0 && !value.empty()) {
+        number = EiemExpressionParser(value, detail).Parse();
+        if (!number) return fail(detail);
+      }
+      if (!EiemSetRenderField(check, key, number ? "0" : value, detail)) return fail(detail);
+      if (EiemRenderSelectorKey(key)) {
+        if (!stack.empty()) return fail("Render selectors must be unconditional");
+        EiemSetRenderField(doc.definitions.back().selector, key, value, detail);
+      } else {
+        EiemModStatement s; s.line = lineNumber; s.key = key; s.value = value;
+        s.number = number;
+        body->push_back(std::move(s));
       }
       continue;
     }
-    if (inResource) {
-      if (_stricmp(key.c_str(), "source") == 0)
-        EiemModCopy(resource.source, sizeof(resource.source), value);
-      else if (_stricmp(key.c_str(), "target.path") == 0)
-        EiemModCopy(resource.targetPath, sizeof(resource.targetPath), value);
-      else if (_stricmp(key.c_str(), "target.asset") == 0)
-        EiemModCopy(resource.targetAsset, sizeof(resource.targetAsset), value);
-      else if (EiemModEquals(key.c_str(), "linear") || EiemModEquals(key.c_str(), "mipmaps")) {
-        const bool yes = EiemModEquals(value.c_str(), "true") || value == "1";
-        const bool no = EiemModEquals(value.c_str(), "false") || value == "0";
-        if (!yes && !no) return fail("Invalid boolean: " + key);
-        if (EiemModEquals(key.c_str(), "linear")) resource.textureLinear = yes;
-        else resource.textureMipmaps = yes;
-      } else if (EiemModEquals(key.c_str(), "filter")) {
-        if (!EiemModInteger(value, &resource.textureFilter, 0, 2)) return fail("Invalid filter");
-      } else if (EiemModEquals(key.c_str(), "wrap")) {
-        if (!EiemModInteger(value, &resource.textureWrap, 0, 3)) return fail("Invalid wrap");
-      } else if (EiemModEquals(key.c_str(), "aniso")) {
-        if (!EiemModInteger(value, &resource.textureAniso, 0, 16)) return fail("Invalid aniso");
-      } else if (EiemModEquals(key.c_str(), "mip_bias")) {
-        char *end = nullptr;
-        errno = 0;
-        const float bias = strtof(value.c_str(), &end);
-        if (errno || end == value.c_str() || *end || !std::isfinite(bias))
-          return fail("Invalid mip_bias");
-        resource.textureMipBias = bias;
-      }
+    if (section == Prefab) {
+      auto &p = doc.prefabs.back();
+      if (key == "path") {
+        if (value.size() >= sizeof(p.path)) return fail("Prefab path too long");
+        EiemModCopy(p.path, sizeof(p.path), value);
+      } else if (key.compare(0, 7, "render.") == 0) {
+        int32_t index = 0;
+        if (!EiemModInteger(key.substr(7), &index, 0, _countof(p.renders) - 1) || value.size() >= sizeof(p.renders[0]))
+          return fail("Invalid Render reference");
+        EiemModCopy(p.renders[index], sizeof(p.renders[0]), value);
+        p.renderCount = (std::max)(p.renderCount, (uint32_t)index + 1);
+      } else return fail("Unknown Prefab field: " + key);
+      continue;
     }
-    if (!inRender) continue;
-    if (_stricmp(key.c_str(), "asset") == 0)
-      EiemModCopy(current.asset, sizeof(current.asset), value);
-    else if (_stricmp(key.c_str(), "match.vertices") == 0) {
-      if (!EiemModInteger(value, &current.matchVertices)) return fail("Invalid match.vertices");
-    } else if (_stricmp(key.c_str(), "match.indices") == 0) {
-      if (!EiemModInteger(value, &current.matchIndices)) return fail("Invalid match.indices");
-    } else if (_stricmp(key.c_str(), "match.submeshes") == 0) {
-      if (!EiemModInteger(value, &current.matchSubMeshes)) return fail("Invalid match.submeshes");
-    } else if (_stricmp(key.c_str(), "handling") == 0) {
-      if (!value.empty() && !EiemModEquals(value.c_str(), "skip"))
-        return fail("Unsupported handling: " + value);
-      EiemModCopy(current.handling, sizeof(current.handling), value);
-    } else if (_stricmp(key.c_str(), "mesh") == 0) {
-      EiemModCopy(current.mesh, sizeof(current.mesh), value);
-      current.hasMesh = !value.empty();
-    } else if (_stricmp(key.c_str(), "skeleton") == 0) {
-      EiemModCopy(current.skeleton, sizeof(current.skeleton), value);
-      current.hasSkeleton = !value.empty();
-    } else if (_strnicmp(key.c_str(), "material.", 9) == 0) {
-      int32_t slot = 0;
-      if (!EiemModInteger(key.substr(9), &slot, 0, _countof(current.materialSlots) - 1))
-        return fail("Invalid material slot: " + key);
-      uint32_t entry = 0;
-      while (entry < current.materialCount && current.materialSlots[entry] != slot) ++entry;
-      if (entry == current.materialCount) ++current.materialCount;
-      current.materialSlots[entry] = slot;
-      EiemModCopy(current.materials[entry], sizeof(current.materials[0]), value);
-    } else if (_strnicmp(key.c_str(), "partner.", 8) == 0) {
-      int32_t index = 0;
-      if (!EiemModInteger(key.substr(8), &index, 0, _countof(current.partners) - 1))
-        return fail("Invalid partner index: " + key);
-      EiemModCopy(current.partners[index], sizeof(current.partners[0]), value);
-      if ((uint32_t)(index + 1) > current.partnerCount)
-        current.partnerCount = (uint32_t)(index + 1);
-    } else if (_strnicmp(key.c_str(), "submesh.", 8) == 0) {
-      int32_t submesh = 0, slot = 0;
-      if (!EiemModInteger(key.substr(8), &submesh, 0, _countof(current.submeshSlots) - 1) ||
-          !EiemModInteger(value, &slot))
-        return fail("Invalid submesh material mapping: " + key);
-      current.submeshSlots[submesh] = slot;
-      if ((uint32_t)(submesh + 1) > current.submeshCount)
-        current.submeshCount = (uint32_t)(submesh + 1);
+    auto &r = doc.resources.back();
+    auto copy = [&](auto &field) {
+      if (value.size() >= sizeof(field)) return false;
+      EiemModCopy(field, sizeof(field), value); return true;
+    };
+    if (key == "path") { if (!copy(r.path)) return fail("Resource path too long"); }
+    else if (key == "source") { if (!copy(r.source)) return fail("Resource source too long"); }
+    else if (key == "target.path") { if (!copy(r.targetPath)) return fail("Target path too long"); }
+    else if (key == "target.asset") { if (!copy(r.targetAsset)) return fail("Target asset too long"); }
+    else if (key == "linear" || key == "mipmaps") {
+      bool yes = EiemModEquals(value.c_str(), "true") || value == "1";
+      bool no = EiemModEquals(value.c_str(), "false") || value == "0";
+      if (!yes && !no) return fail("Invalid boolean: " + key);
+      if (key == "linear") r.textureLinear = yes; else r.textureMipmaps = yes;
+    } else if (key == "filter") {
+      if (!EiemModInteger(value, &r.textureFilter, 0, 2)) return fail("Invalid filter");
+    } else if (key == "wrap") {
+      if (!EiemModInteger(value, &r.textureWrap, 0, 3)) return fail("Invalid wrap");
+    } else if (key == "aniso") {
+      if (!EiemModInteger(value, &r.textureAniso, 0, 16)) return fail("Invalid aniso");
+    } else if (key == "mip_bias") {
+      double number = 0;
+      if (!EiemNumber(value, &number) || !std::isfinite((float)number)) return fail("Invalid mip_bias");
+      r.textureMipBias = (float)number;
     }
+    // Resource-only offline metadata remains inert, never interpreted as commands.
   }
-  flush();
-  flushResource();
-  flushPrefab();
-  outputPrefabs.insert(outputPrefabs.end(), prefabs.begin(), prefabs.end());
-  outputRules.insert(outputRules.end(), out.begin(), out.end());
-  outputResources.insert(outputResources.end(), resources.begin(), resources.end());
+  if (input.bad()) return fail("Input read failed");
+  if (!finishSection()) return false;
+  std::string detail;
+  if (!EiemValidateModDocument(doc, detail)) { if (error) *error = detail; return false; }
+  const size_t stateIndex = output.states.size();
+  for (auto &d : doc.definitions) d.stateIndex += stateIndex;
+  output.states.insert(output.states.end(), doc.states.begin(), doc.states.end());
+  output.definitions.insert(output.definitions.end(), doc.definitions.begin(), doc.definitions.end());
+  output.prefabs.insert(output.prefabs.end(), doc.prefabs.begin(), doc.prefabs.end());
+  output.resources.insert(output.resources.end(), doc.resources.begin(), doc.resources.end());
+  EiemCompileModProgram(output);
   return true;
 }
 
-static bool EiemModParseFile(const char *path,
-                             std::vector<EiemModPrefab> &prefabs,
-                             std::vector<EiemModRule> &rules,
-                             std::vector<EiemModResource> &resources,
-                             std::string *error = nullptr) {
+static bool EiemModParseFile(const char *path, EiemModProgram &output, std::string *error = nullptr) {
+  if (error) error->clear();
   std::ifstream input(path, std::ios::binary);
   if (!input) return false;
-  return EiemModParseStream(input, path, prefabs, rules, resources, error);
+  return EiemModParseStream(input, path, output, error);
 }
 
-// Loaded/compiled configuration. Indices are derived once at publication, not
-// recomputed in Mesh setter hooks. A resource's target.* is only metadata.
-struct EiemModProgram {
-  std::vector<EiemModPrefab> prefabs;
-  std::vector<EiemModRule> rules;
-  std::vector<EiemModResource> resources;
-  std::vector<size_t> standaloneRules;
-};
-
-static void EiemCompileModProgram(EiemModProgram &program) {
-  program.standaloneRules.clear();
-  auto key = [](const char *file, const char *section) {
-    std::string result = std::string(file) + '\n' + section;
-    std::transform(result.begin(), result.end(), result.begin(),
-                   [](unsigned char c) { return (char)std::tolower(c); });
-    return result;
-  };
-  std::unordered_set<std::string> referenced;
-  for (const auto &prefab : program.prefabs)
-    for (uint32_t i = 0; i < prefab.renderCount; ++i)
-      if (prefab.renders[i][0]) referenced.insert(key(prefab.modPath, prefab.renders[i]));
-  for (const auto &rule : program.rules)
-    for (uint32_t i = 0; i < rule.partnerCount; ++i)
-      if (rule.partners[i][0]) referenced.insert(key(rule.modPath, rule.partners[i]));
-  for (size_t i = 0; i < program.rules.size(); ++i) {
-    const auto &rule = program.rules[i];
-    if ((rule.path[0] || rule.asset[0]) && !referenced.count(key(rule.modPath, rule.section)))
-      program.standaloneRules.push_back(i);
+// Every press is evaluated in event order; never collapse two presses into one.
+// Returns the mods whose variables actually changed, for scoped restoration.
+static std::vector<std::string> EiemCycleModKey(EiemModProgram &program, EiemKeyChord chord) {
+  std::vector<std::string> changed;
+  for (auto &state : program.states) {
+    bool dirty = false;
+    for (const auto &key : state.keys) {
+      if (!(key.chord == chord)) continue;
+      size_t count = key.assignments.front().values.size(), selected = 0;
+      for (size_t i = 0; i < count; ++i) {
+        bool matches = true;
+        for (const auto &a : key.assignments)
+          if (state.variables.at(a.variable) != a.values[i]) { matches = false; break; }
+        if (matches) { selected = (i + 1) % count; break; }
+      }
+      for (const auto &a : key.assignments) {
+        double &value = state.variables.at(a.variable);
+        dirty = dirty || value != a.values[selected];
+        value = a.values[selected];
+      }
+    }
+    if (dirty) changed.push_back(state.path);
   }
+  if (!changed.empty()) EiemEvaluateModProgram(program);
+  return changed;
 }

@@ -1,0 +1,153 @@
+"""Executable tests of global config, state publication and instance registration."""
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import unittest
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def function(source, signature):
+    start = source.index(signature)
+    brace = source.index("{", start)
+    depth = 1
+    end = brace + 1
+    while depth:
+        if source[end] == "{": depth += 1
+        elif source[end] == "}": depth -= 1
+        end += 1
+    return source[start:end]
+
+
+PREFIX = r'''
+#include <windows.h>
+#include <sstream>
+#include <cstdio>
+#include <vector>
+static int g_guiToggleVK = VK_INSERT, g_modReloadVK = VK_F10;
+static void Log(const char *, ...) {}
+#include "eiem_config.h"
+#include "eiem_mods.h"
+#include "eiem_render_state.h"
+#define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "FAIL %d: %s\n", __LINE__, #x); return 1; } } while (false)
+enum class EiemModelOwnerKind { PrefabProxy, UIModelLoader, BaseModelPart, CharUIModel };
+struct EiemModelOwnerRef { EiemModelOwnerKind kind; void *owner; };
+struct EiemModelInstanceState {
+  void *model = nullptr; uint32_t instanceUid = 0; char path[768] = {};
+  EiemModelOwnerRef owners[4] = {}; uint32_t ownerCount = 0;
+};
+static std::vector<EiemModelInstanceState> s_eiemModelInstances;
+static SRWLOCK s_eiemModelInstanceLock = SRWLOCK_INIT;
+static bool simulateMatch = true;
+static bool EiemApplyStandaloneRenderRules(void *, const char *, bool *matched) {
+  *matched = simulateMatch;
+  return false; // selector matches, but the conditional body is OFF
+}
+static bool EiemApplyPrefabRules(void *, const EiemModPrefab &, const char *) { return false; }
+static void EiemDestroyPartnerObjects(uintptr_t) {}
+static void EiemForgetRenderOverrides(uintptr_t) {}
+'''
+
+MAIN = r'''
+int main(int argc, char **argv) {
+  CHECK(argc == 2);
+  std::string scenario = argv[1], error;
+  if (scenario == "global") {
+    EiemGlobalConfig config;
+    std::istringstream valid("\xEF\xBB\xBF[Hotkeys]\r\nreload=Ctrl+F8\r\ngui=INSERT\r\n");
+    CHECK(EiemParseGlobalConfig(valid, &config, error));
+    CHECK(config.reload.vk == VK_F8 && config.reload.modifiers == MOD_CONTROL);
+    for (const auto &text : {"[Hotkeys]\nreload=bogus", "[Hotkeys]\nreload=INSERT", "[Hotkeys]\nreload=F8\nreload=F9", "reload=F7"}) {
+      std::istringstream invalid(text);
+      CHECK(!EiemParseGlobalConfig(invalid, &config, error));
+      CHECK(config.reload.vk == VK_F8); // failed edits do not remove the working key
+    }
+    CHECK(std::string(kEiemGlobalConfigPath) == "plugin\\eiem.ini");
+    CHECK(LoadEiemConfig()); // create default, not legacy-file search
+    CHECK(EiemGetGlobalConfig().reload.vk == VK_F10);
+    { std::ofstream file(kEiemGlobalConfigPath); file << "[Hotkeys]\nreload=F8\n"; }
+    CHECK(LoadEiemConfig());
+    CHECK(EiemGetGlobalConfig().reload.vk == VK_F8);
+    CHECK(s_eiemGlobalConfigGeneration == 2);
+    { std::ofstream file(kEiemGlobalConfigPath); file << "[Hotkeys]\nreload=invalid\n"; }
+    CHECK(!LoadEiemConfig());
+    CHECK(EiemGetGlobalConfig().reload.vk == VK_F8 && s_eiemGlobalConfigGeneration == 2);
+  } else if (scenario == "slots") {
+    CHECK((EiemRestoreOwnedSlots<int>({9,8}, {1,2}, {0}) == std::vector<int>{1,8}));
+    CHECK((EiemRestoreOwnedSlots<int>({1,9}, {1}, {1}) == std::vector<int>{1}));
+    CHECK((EiemRestoreOwnedSlots<int>({9,8,7}, {1,2}, {0}) == std::vector<int>{1,8,7}));
+    CHECK((EiemRestoreOwnedSlots<int>({1,9,7}, {1}, {1}) == std::vector<int>{1,0,7}));
+    CHECK((EiemRestoreOwnedSlots<int>({1,0,0,9}, {1}, {1,2,3}) == std::vector<int>{1}));
+    CHECK((EiemRestoreOwnedSlots<int>({9,8}, {1,2}, {}) == std::vector<int>{9,8}));
+  } else if (scenario == "events") {
+    EiemModProgram program;
+    std::istringstream input("[Constants]\n$a=0\n[KeyA]\nkey=F6\ntype=cycle\n$a=0,1,2\n"
+      "[RenderMain]\nasset=Body\nif $a == 1\nhandling=skip\nendif\n");
+    CHECK(EiemModParseStream(input, "a/mod.ini", program, &error));
+    EiemPublishModState(program); s_eiemModGeneration = 7;
+    EiemModProgram next; std::vector<std::string> affected;
+    CHECK(!EiemPrepareInputUpdate({{{VK_F6,0},6}}, &next, &affected));
+    CHECK(EiemPrepareInputUpdate({{{VK_F6,0},7}, {{VK_F6,0},7}}, &next, &affected));
+    CHECK(next.states[0].variables.at("$a") == 2);
+    CHECK(s_eiemModProgram.states[0].variables.at("$a") == 0); // not published until restore
+    EiemPublishModState(next);
+    CHECK(s_eiemModProgram.states[0].variables.at("$a") == 2 && s_eiemModGeneration == 7);
+    CHECK(EiemPrepareInputUpdate({{{VK_F6,0},7}}, &next, &affected));
+    CHECK(next.states[0].variables.at("$a") == 0 && !next.rules[0].handling[0]);
+    EiemPublishModState(program); // F10 replacement resets to parsed defaults
+    CHECK(s_eiemModProgram.states[0].variables.at("$a") == 0);
+  } else if (scenario == "default_off_instances") {
+    EiemModProgram program;
+    std::istringstream input("[RenderMain]\nasset=Body\n");
+    CHECK(EiemModParseStream(input, "a/mod.ini", program, &error));
+    EiemPublishModState(program);
+    void *ownerA = (void *)1, *ownerB = (void *)2, *modelA = (void *)11, *modelB = (void *)12;
+    CHECK(!EiemRegisterAndApplyModelInstance(EiemModelOwnerKind::BaseModelPart, ownerA, modelA, nullptr, 0, "test"));
+    CHECK(s_eiemModelInstances.size() == 1); // no mutation is still a tracked target
+    EiemRegisterAndApplyModelInstance(EiemModelOwnerKind::BaseModelPart, ownerB, modelB, nullptr, 0, "test");
+    CHECK(s_eiemModelInstances.size() == 2);
+    EiemRegisterAndApplyModelInstance(EiemModelOwnerKind::BaseModelPart, ownerA, modelA, nullptr, 0, "test");
+    CHECK(s_eiemModelInstances.size() == 2 && s_eiemModelInstances[0].ownerCount == 1);
+    EiemRegisterAndApplyModelInstance(EiemModelOwnerKind::BaseModelPart, ownerA, (void *)13, nullptr, 0, "test");
+    CHECK(s_eiemModelInstances.size() == 2); // recycled owner releases previous instance
+    simulateMatch = false;
+    EiemRegisterAndApplyModelInstance(EiemModelOwnerKind::BaseModelPart, (void *)3, (void *)14, nullptr, 0, "test");
+    CHECK(s_eiemModelInstances.size() == 2); // unrelated instance not registered
+  } else return 2;
+  return 0;
+}
+'''
+
+
+class ModControlsTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not shutil.which("cl"):
+            raise unittest.SkipTest("Requires MSVC developer environment")
+        cls.temp = tempfile.TemporaryDirectory(prefix="eiem-controls-")
+        cls.addClassCleanup(cls.temp.cleanup)
+        cls.folder = Path(cls.temp.name)
+        trace = (ROOT / "src/il2cpp_trace.h").read_text(encoding="utf-8")
+        signature = "static bool EiemRegisterAndApplyModelInstance("
+        # Skip forward declaration; compile the actual runtime implementation.
+        implementation = function(trace[trace.rindex(signature):], signature)
+        source = cls.folder / "controls.cpp"
+        source.write_text(PREFIX + implementation + MAIN, encoding="utf-8")
+        cls.exe = cls.folder / "controls.exe"
+        result = subprocess.run(["cl", "/nologo", "/EHsc", "/std:c++17", "/utf-8",
+                                 f"/I{ROOT / 'src'}", str(source), f"/Fe{cls.exe}"],
+                                cwd=cls.folder, capture_output=True, text=True)
+        if result.returncode: raise AssertionError(result.stdout + result.stderr)
+
+    def run_case(self, name):
+        result = subprocess.run([str(self.exe), name], cwd=self.folder, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_global_config_default_edit_and_invalid_transaction(self): self.run_case("global")
+    def test_only_owned_slots_restore_and_only_owned_tail_removed(self): self.run_case("slots")
+    def test_press_order_stale_generation_and_publish_after_restore(self): self.run_case("events")
+    def test_actual_runtime_registers_default_off_multi_instances(self): self.run_case("default_off_instances")
+
+
+if __name__ == "__main__": unittest.main()

@@ -1,25 +1,25 @@
 """Blender-side regression checks for an EIEM package round trip.
 
-Run inside Blender with ``EIEM_TEST_PACKAGE`` and ``EIEM_TEST_OUTPUT`` passed
-through ``runpy.run_path(..., init_globals=...)``.  The add-on module must be
-loaded as ``eiem_blender_addon`` first.
+Run in background Blender with ``-- ADDON SOURCE_PACKAGE NEW_OUTPUT``.
+Existing output directories are refused, never cleared.
 """
 
 from pathlib import Path
 import configparser
-import shutil
+import importlib.util
 import sys
 
 import bpy
 from mathutils import Vector
 
 
-package = Path(globals()["EIEM_TEST_PACKAGE"])
-output = Path(globals()["EIEM_TEST_OUTPUT"])
-addon = sys.modules["eiem_blender_addon"]
-
-if output.name != "_eiem_roundtrip_test" or output.parent != Path(r"E:\EIEM_Workspace"):
-    raise RuntimeError(f"refusing to clear unexpected test output path: {output}")
+addon_path, package, output = map(Path, sys.argv[sys.argv.index("--") + 1:])
+if output.exists():
+    raise RuntimeError(f"test output must be new: {output}")
+spec = importlib.util.spec_from_file_location("eiem_blender_addon", addon_path)
+addon = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(addon)
+addon.register()
 
 
 def hierarchy_key(payload):
@@ -125,8 +125,6 @@ for section, payload in mesh_payloads.items():
     actual_shapes = len(obj.data.shape_keys.key_blocks) - 1 if obj.data.shape_keys else 0
     assert actual_shapes == expected_shapes, (section, actual_shapes, expected_shapes)
 
-if output.exists():
-    shutil.rmtree(output)
 addon.export_package(
     output,
     mesh_objects=[obj for obj in bpy.context.scene.objects

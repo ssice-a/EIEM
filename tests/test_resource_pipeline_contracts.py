@@ -61,7 +61,8 @@ class RuntimeHookContracts(unittest.TestCase):
 
     def test_f10_reconcile_only_walks_registered_model_instances(self):
         start = self.trace.index("static void EiemRunModReconcile")
-        body = self.trace[start : start + 2200]
+        end = self.trace.index("\n}\n", start)
+        body = self.trace[start:end]
         self.assertIn("s_eiemModelInstances", body)
         self.assertIn("EiemApplyPrefabRules", body)
         self.assertNotIn("find_objects_of_type", body.lower())
@@ -192,7 +193,8 @@ class RuntimeHookContracts(unittest.TestCase):
 
     def test_f10_replays_standalone_mesh_rules_for_registered_instances(self):
         start = self.trace.index("static void EiemRunModReconcile")
-        body = self.trace[start : start + 2400]
+        end = self.trace.index("static void *s_origAssetBundleLoadAsset1", start)
+        body = self.trace[start:end]
         self.assertIn("EiemApplyStandaloneRenderRules", body)
 
     def test_mesh_setter_matches_even_when_resource_origin_was_not_observed(self):
@@ -218,7 +220,7 @@ class RuntimeHookContracts(unittest.TestCase):
         hotkey_start = self.init.index("static DWORD WINAPI HotkeyThread")
         hotkey_end = self.init.index("static DWORD WINAPI InitThread")
         hotkey_body = self.init[hotkey_start:hotkey_end]
-        hotkey_setup = hotkey_body[:hotkey_body.index("constexpr int kGuiHotkeyId")]
+        hotkey_setup = hotkey_body[:hotkey_body.index("enum class KeyAction")]
         self.assertNotIn("EiemReloadMods();", hotkey_setup)
         self.assertNotIn("EiemReloadMods();", hotkey_body)
         self.assertIn("EiemRequestModUpdate(EiemModUpdate::Reload", hotkey_body)
@@ -234,7 +236,7 @@ class RuntimeHookContracts(unittest.TestCase):
     def test_reload_is_dispatched_only_on_unity_thread(self):
         body = self.trace[self.trace.index("static void EiemRunModReconcile()") :][:2700]
         self.assertIn("EiemDispatchModUpdate(requests", body)
-        self.assertIn("EiemRestoreRenderOverrides()", body)
+        self.assertIn("EiemRestoreRenderOverrides(affected)", body)
         self.assertIn("EiemReloadMods()", body)
         entry = (ROOT / "src" / "eiem.cpp").read_text(encoding="utf-8")
         self.assertNotIn("EiemReloadMods();", entry)
@@ -263,8 +265,8 @@ class BlenderExportContracts(unittest.TestCase):
     def test_blender_emits_standalone_render_identity_without_prefab_scope(self):
         start = self.addon.index("def export_package")
         body = self.addon[start : start + 14000]
-        self.assertIn('render_asset = str(obj.get("eiem_render_asset"', body)
-        self.assertIn('obj.data.get("eiem_target_asset"', body)
+        self.assertIn('asset = str(first.get("eiem_render_asset"', body)
+        self.assertIn('"eiem_target_asset", first.data.get("eiem_asset"', body)
         self.assertNotIn("has no Prefab/Render identity", body)
         self.assertNotIn('"render.%d=%s"', body)
 

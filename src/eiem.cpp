@@ -19,10 +19,11 @@
 
 
 #include "globals.h"
+#include "eiem_config.h"
+#include "eiem_camera_fade.h"
 #include "il2cpp_trace.h"
 #include "scene_dump.h"
 #include "model_dump.h"
-#include "eiem_config.h"
 #include "update_check.h"
 
 #include "audio.h"
@@ -53,8 +54,8 @@ static bool UnboxBool(void *boxed) {
 #include "applepie_mgr.h"
 
 static AP_HotkeyInfo s_apHotkeys[] = {
-    { "\xe5\x91\xbc\xe5\x87\xba/\xe9\x9a\x90\xe8\x97\x8f GUI \xe9\x9d\xa2\xe6\x9d\xbf", "gui_toggle_key", VK_INSERT },
-    { "Reload EIEM mods", "mod_reload_key", VK_F10 },
+    { "EIEM GUI", "gui", VK_INSERT },
+    { "Reload EIEM mods", "reload", VK_F10 },
 };
 
 static AP_PluginInfo s_apPluginInfo = {
@@ -62,7 +63,7 @@ static AP_PluginInfo s_apPluginInfo = {
     "eiem",
     "EIEM",
     "Endfield MMD",
-    "eiem_config.txt",
+    "eiem.ini",
     true 
 };
 
@@ -72,24 +73,24 @@ APPLEPIE_PLUGIN_EXPORT AP_PluginInfo* AP_GetPluginInfo() {
 
 APPLEPIE_PLUGIN_EXPORT bool AP_PluginEnable() {
   g_pluginActive = true;
+  EiemReportCameraFade();
   Log("[AP] Plugin enabled by manager");
   return true;
 }
 
 APPLEPIE_PLUGIN_EXPORT bool AP_PluginDisable() {
   g_pluginActive = false;
+  EiemReportCameraFade();
   if (g_guiVisible) ToggleGui();
   Log("[AP] Plugin disabled by manager");
   return true;
 }
 
 APPLEPIE_PLUGIN_EXPORT bool AP_ReloadConfig() {
-  LoadEiemConfig();
   EiemRequestModUpdate(EiemModUpdate::Reload, "ApplePie config reload");
   s_apHotkeys[0].currentVK = g_guiToggleVK;
   s_apHotkeys[1].currentVK = g_modReloadVK;
-  Log("[AP] Config reloaded: gui_toggle_key=%d (%s)", g_guiToggleVK,
-      EiemVKToString(g_guiToggleVK));
+  Log("[AP] Global/mod config reload requested on Unity thread");
   return true;
 }
 

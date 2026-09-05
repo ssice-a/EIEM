@@ -328,6 +328,7 @@ static void *s_eiemMeshUploadMeshData = nullptr;
 static void *s_eiemMeshGetBoneWeights = nullptr;
 static void *s_eiemMeshGetBindPoses = nullptr;
 static void *s_eiemMeshAddBlendShapeFrame = nullptr;
+static void *s_eiemMeshGetBlendShapeFrameCount = nullptr;
 static void *s_eiemMaterialClass = nullptr;
 static void *s_eiemRendererClass = nullptr;
 static void *s_eiemResourceManagerClass = nullptr;
@@ -556,6 +557,9 @@ static void EiemResolveResourceBackend(void **assemblies, size_t assemblyCount) 
     s_eiemMeshAddBlendShapeFrame = EiemFindMethodWithParamTypes(
         s_eiemMeshClass, "AddBlendShapeFrame", blendShapeTypes,
         _countof(blendShapeTypes));
+    g_mesh_get_blendShapeCount = FindMethod(s_eiemMeshClass, "get_blendShapeCount", 0);
+    g_mesh_GetBlendShapeName = FindMethod(s_eiemMeshClass, "GetBlendShapeName", 1);
+    s_eiemMeshGetBlendShapeFrameCount = FindMethod(s_eiemMeshClass, "GetBlendShapeFrameCount", 1);
     g_mesh_recalculateBounds = FindMethod(s_eiemMeshClass, "RecalculateBounds", 0);
   }
   if (s_eiemMaterialClass) {
@@ -1038,6 +1042,60 @@ static bool EiemAlignSkinningPalette(EiemNativeMeshDocument *document,
   return true;
 }
 
+static bool EiemWriteMeshShapes(void *mesh, const EiemNativeMeshDocument &document,
+                                char *error, size_t errorSize) {
+  if (document.blendShapeChannels.empty()) return true;
+  auto reject = [&](const char *reason) {
+    if (error) strncpy_s(error, errorSize, reason, _TRUNCATE);
+    return false;
+  };
+  if (!s_eiemMeshAddBlendShapeFrame || !s_eiemVector3Class ||
+      !g_mesh_get_blendShapeCount || !g_mesh_GetBlendShapeName ||
+      !s_eiemMeshGetBlendShapeFrameCount)
+    return reject("Unity BlendShape APIs are unavailable");
+  for (const auto &channel : document.blendShapeChannels) {
+    for (uint32_t offset = 0; offset < channel.frameCount; ++offset) {
+      const uint32_t frameIndex = channel.frameIndex + offset;
+      const auto &frame = document.blendShapeFrames[frameIndex];
+      std::vector<Vector3> vertices(document.vertexCount), normals(document.vertexCount), tangents(document.vertexCount);
+      for (uint32_t i = 0; i < frame.vertexCount; ++i) {
+        const auto &vertex = document.blendShapeVertices[frame.firstVertex + i];
+        if (vertex.index >= (uint32_t)document.vertexCount)
+          return reject("BlendShape vertex index is outside the mesh");
+        vertices[vertex.index] = vertex.vertex;
+        if (frame.hasNormals) normals[vertex.index] = vertex.normal;
+        if (frame.hasTangents) tangents[vertex.index] = vertex.tangent;
+      }
+      void *name = il2cpp_string_new(channel.name.c_str());
+      float weight = document.blendShapeWeights[frameIndex];
+      void *v = EiemMakeValueArray(s_eiemVector3Class, vertices);
+      void *n = EiemMakeValueArray(s_eiemVector3Class, normals);
+      void *t = EiemMakeValueArray(s_eiemVector3Class, tangents);
+      if (!name || !v || !n || !t) return reject("Unable to allocate BlendShape arrays");
+      void *result = nullptr; void *args[] = {name, &weight, v, n, t};
+      if (!InvokeChecked(s_eiemMeshAddBlendShapeFrame, mesh, args, &result))
+        return reject("Unity AddBlendShapeFrame failed");
+    }
+  }
+  void *boxed = nullptr;
+  if (!InvokeChecked(g_mesh_get_blendShapeCount, mesh, nullptr, &boxed) || !boxed ||
+      *(int *)((char *)boxed + 16) != (int)document.blendShapeChannels.size())
+    return reject("Unity BlendShape channel count does not match payload");
+  for (int index = 0; index < (int)document.blendShapeChannels.size(); ++index) {
+    const auto &channel = document.blendShapeChannels[index];
+    void *text = nullptr; void *args[] = {&index};
+    if (!InvokeChecked(g_mesh_GetBlendShapeName, mesh, args, &text) || !text)
+      return reject("Unable to read Unity BlendShape channel name");
+    std::vector<char> name(channel.name.size() + 2);
+    ReadStrUtf8(text, name.data(), name.size());
+    if (channel.name != name.data() ||
+        !InvokeChecked(s_eiemMeshGetBlendShapeFrameCount, mesh, args, &boxed) || !boxed ||
+        *(int *)((char *)boxed + 16) != (int)channel.frameCount)
+      return reject("Unity BlendShape channel metadata does not match payload");
+  }
+  return true;
+}
+
 static void *EiemBuildNativeMesh(const char *path, void *templateMesh,
                                  char *error, size_t errorSize,
                                  void *skinRenderer = nullptr) {
@@ -1157,48 +1215,7 @@ static void *EiemBuildNativeMesh(const char *path, void *templateMesh,
     if (error) strncpy_s(error, errorSize, "Unity Mesh skinning APIs are unavailable", _TRUNCATE);
     return nullptr;
   }
-  if (!document.blendShapeChannels.empty()) {
-    if (!s_eiemMeshAddBlendShapeFrame || !s_eiemVector3Class) {
-      if (error) strncpy_s(error, errorSize,
-                           "Unity BlendShape APIs are unavailable", _TRUNCATE);
-      return nullptr;
-    }
-    for (const auto &channel : document.blendShapeChannels) {
-      for (uint32_t frameOffset = 0; frameOffset < channel.frameCount;
-           ++frameOffset) {
-        const uint32_t frameIndex = channel.frameIndex + frameOffset;
-        const auto &frame = document.blendShapeFrames[frameIndex];
-        std::vector<Vector3> deltaVertices((size_t)document.vertexCount);
-        std::vector<Vector3> deltaNormals((size_t)document.vertexCount);
-        std::vector<Vector3> deltaTangents((size_t)document.vertexCount);
-        for (uint32_t i = 0; i < frame.vertexCount; ++i) {
-          const auto &vertex = document.blendShapeVertices[frame.firstVertex + i];
-          if (vertex.index >= (uint32_t)document.vertexCount) {
-            if (error) strncpy_s(error, errorSize,
-                                 "BlendShape vertex index is outside the mesh",
-                                 _TRUNCATE);
-            return nullptr;
-          }
-          deltaVertices[vertex.index] = vertex.vertex;
-          if (frame.hasNormals) deltaNormals[vertex.index] = vertex.normal;
-          if (frame.hasTangents) deltaTangents[vertex.index] = vertex.tangent;
-        }
-        void *name = il2cpp_string_new(channel.name.c_str());
-        float weight = document.blendShapeWeights[frameIndex];
-        void *verticesArray = EiemMakeValueArray(s_eiemVector3Class, deltaVertices);
-        void *normalsArray = EiemMakeValueArray(s_eiemVector3Class, deltaNormals);
-        void *tangentsArray = EiemMakeValueArray(s_eiemVector3Class, deltaTangents);
-        if (!verticesArray || !normalsArray || !tangentsArray) {
-          if (error) strncpy_s(error, errorSize,
-                               "Unable to allocate BlendShape arrays", _TRUNCATE);
-          return nullptr;
-        }
-        void *params[] = {name, &weight, verticesArray, normalsArray,
-                          tangentsArray};
-        Invoke(s_eiemMeshAddBlendShapeFrame, mesh, params);
-      }
-    }
-  }
+  if (!EiemWriteMeshShapes(mesh, document, error, errorSize)) return nullptr;
   // A newly-created Unity Mesh starts with an empty bounds volume. Without
   // recalculating it, the renderer can cull a valid replacement immediately.
   if (g_mesh_recalculateBounds)

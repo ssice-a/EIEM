@@ -224,6 +224,18 @@ static void *Invoke(void *method, void *obj, void **params = nullptr) {
   }
 }
 
+// Void methods return null on success too. Callers which own a mutation must
+// check the exception channel rather than treating Invoke's return as success.
+static bool InvokeChecked(void *method, void *obj, void **params, void **result) {
+  if (!method || !il2cpp_runtime_invoke || !result) return false;
+  *result = nullptr;
+  __try {
+    void *exception = nullptr;
+    *result = il2cpp_runtime_invoke(method, obj, params, &exception);
+    return exception == nullptr;
+  } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 static void DumpClassMethods(void *klass, const char *label) {
   if (!klass) return;
   const char *cn = il2cpp_class_get_name(klass);

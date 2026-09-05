@@ -2386,6 +2386,10 @@ static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     EiemRunModReconcile();
     return 0;
   }
+  if (msg == WM_EIEM_MOD_KEY) {
+    EiemQueueModKey({LOWORD(wParam), HIWORD(wParam)}, (LONG)lParam);
+    return 0;
+  }
   if (msg == WM_EIEM_DUMP_DISABLED) {
     EiemApplyDisabledRenderers();
     return 0;
@@ -2596,7 +2600,7 @@ static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                   ? CallWindowProcW(originalWndProc, hwnd, msg, wParam, lParam)
                   : DefWindowProcW(hwnd, msg, wParam, lParam);
 
-  if (g_guiVisible) {
+    if (g_guiVisible || g_modUiVisible) {
     if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN ||
         msg == WM_MBUTTONDOWN || msg == WM_ACTIVATE ||
         msg == WM_SETFOCUS || msg == WM_KILLFOCUS) {

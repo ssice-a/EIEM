@@ -129,10 +129,11 @@ static void ReleaseCursorToGui() {
 }
 
 static void ReturnCursorToGame() {
-  if (g_gameHwnd && g_cursorHideAction)
+  if (!g_modUiVisible && g_gameHwnd && g_cursorHideAction)
     PostMessageW(g_gameHwnd, WM_MMD_CURSOR_HIDE, 0, 0);
 }
 
+#include "eiem_ui_host.h"
 
 static ID3D11Device *g_pd3dDevice = nullptr;
 static ID3D11DeviceContext *g_pd3dDeviceContext = nullptr;
@@ -265,10 +266,18 @@ static void CleanupDeviceD3D() {
   if (g_pd3dDevice) { g_pd3dDevice->Release(); g_pd3dDevice = nullptr; }
 }
 
+static ImGuiContext *s_eiemPanelContext = nullptr;
 static LRESULT CALLBACK GuiWndProc(HWND hWnd, UINT msg, WPARAM wParam,
                                     LPARAM lParam) {
-  if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
-    return true;
+  if (s_eiemPanelContext) {
+    // Synchronous focus/window messages can arrive while Mod UI is drawing.
+    // Always route a native window's input to its own backend context.
+    auto *previous = ImGui::GetCurrentContext();
+    ImGui::SetCurrentContext(s_eiemPanelContext);
+    LRESULT handled = ImGui_ImplWin32_WndProcHandler(hWnd,msg,wParam,lParam);
+    ImGui::SetCurrentContext(previous);
+    if (handled) return true;
+  }
 
   switch (msg) {
   case WM_MOUSEACTIVATE:
@@ -1520,7 +1529,8 @@ static DWORD WINAPI GuiThread(LPVOID) {
   Log("[GUI] DX11 device created successfully");
 
   IMGUI_CHECKVERSION();
-  ImGui::CreateContext();
+  s_eiemPanelContext = ImGui::CreateContext();
+  ImGui::SetCurrentContext(s_eiemPanelContext);
   ImGuiIO &io = ImGui::GetIO();
   io.IniFilename = nullptr; 
   io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
@@ -1608,6 +1618,7 @@ static DWORD WINAPI GuiThread(LPVOID) {
 
   MSG msg;
   ZeroMemory(&msg, sizeof(msg));
+  EiemUiHost modUi;
   while (g_guiRunning && !g_shutdownRequested) {
     while (PeekMessage(&msg, nullptr, 0U, 0U, PM_REMOVE)) {
       TranslateMessage(&msg);
@@ -1625,6 +1636,7 @@ static DWORD WINAPI GuiThread(LPVOID) {
       break;
     }
 
+    modUi.Tick();
     static bool s_panelShown = false;
 
     if (!g_guiVisible) {
@@ -1634,7 +1646,7 @@ static DWORD WINAPI GuiThread(LPVOID) {
         ShowWindow(g_guiHwnd, SW_HIDE);
         s_panelShown = false;
       }
-      Sleep(60);
+      Sleep(g_modUiVisible ? 8 : 60);
       continue;
     }
 
@@ -1702,9 +1714,11 @@ static DWORD WINAPI GuiThread(LPVOID) {
   }
 
   Log("[GUI] Shutting down...");
+  modUi.Shutdown();
   ImGui_ImplDX11_Shutdown();
   ImGui_ImplWin32_Shutdown();
-  ImGui::DestroyContext();
+  ImGui::DestroyContext(s_eiemPanelContext);
+  s_eiemPanelContext = nullptr;
 
   CleanupDeviceD3D();
   DestroyWindow(g_guiHwnd);

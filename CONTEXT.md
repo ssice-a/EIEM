@@ -1,6 +1,14 @@
 # EIEM 领域模型
 
 当前规范：[模型替换设计](docs/model-replacement-design.md)。
+按键与条件：[语法及生命周期](docs/conditional-keys.md)；全局配置固定为 `plugin/eiem.ini`。
+Blender 作者流程：[网格切换组与自动导出](docs/blender-switches.md)。
+形态键控制：[资源、实例权重与 ImGui 绑定](docs/shape-controls.md)。
+独立 Mod UI：[Lua、窗口与变量接口](docs/lua-ui.md)。
+顶点数据与证据边界：[顶点数据契约](docs/vertex-data-contract.md)；原生解码不等于统一重算。
+已有资产先正确解码并保留源切线；仅新增几何可由最终法线和 UV0 生成切线，不能冒充原生数据。
+115/120 切线缺失是修复前调查，后续修复证据与游戏验收边界见该契约，不重复当作当前故障。
+相机反虚化：[CameraMono 调用契约与验证边界](docs/camera-fade.md)；与 mesh/skip 分开，不使用逐 Renderer 恢复表。
 实验历史在 `docs/archive/`，不能把旧实验里的“当前方案”当作现行设计。
 
 - **Resource（资源）**：离线 Mesh、Material、Texture、Skeleton 文件及其声明；与渲染实例分开。

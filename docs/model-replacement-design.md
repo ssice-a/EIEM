@@ -1,7 +1,10 @@
 # 模型、材质、贴图替换：当前设计
 
-状态：v31 架构清理。大世界替换有用户验证；v30 修复了 UI 回调崩溃，
-v31 的完整游戏场景回归尚未验收。不能把赋值成功、编译成功当成画面正确。
+状态：v33 Blender 切换组与 DLL 装配修正。大世界替换有旧版用户验证；v30 修复了 UI 回调崩溃，
+v33 的完整游戏场景回归尚未验收。不能把赋值成功、编译成功当成画面正确。
+
+新语法和全局 `plugin/eiem.ini`：[条件与按键配置](conditional-keys.md)。
+Blender 交互、自动导出与部署记录：[网格切换组](blender-switches.md)。
 
 ## 1. 核心职责
 
@@ -11,7 +14,7 @@ v31 的完整游戏场景回归尚未验收。不能把赋值成功、编译成�
 
 | Module | Interface：调用者需要知道的事 | Implementation |
 |---|---|---|
-| Mod document | INI 输入，得到资源声明与 Render 动作，出错有行号 | `eiem_mod_document.h`；无 Unity、线程或全局配置状态 |
+| Mod document | INI 输入，得到资源声明、变量、按键和有序 Render 条件树，出错有行号 | `eiem_mod_document.h` / `eiem_expression.h`；无 Unity 或全局配置状态 |
 | Mod program | 按 mod/section 查声明，取顶层 Render 集合 | `eiem_mods.h`；一次发布配置和预计算的引用索引 |
 | Mod update | 提交 Reconcile / Reapply / Reload 请求 | `eiem_mod_update.h`；合并请求，明确恢复、发布、重应用顺序 |
 | Render 执行 | 模型根或 Renderer + 规则集合 | `il2cpp_trace.h` 中唯一 `EiemApplyRenderRuleSet` 路径 |
@@ -103,9 +106,9 @@ render.0=RenderBody
 - 同一文件内重复 section 报错，不再让资源查找“取第一条”而 Render 查找“取最后一条”。
 - 不完整语句、未知 handling、坏数字不会静默变成无条件执行。
   非法文件不发布其前半部分；记录文件和行号，跳过该文件，不偷偷保留旧版动作。
-- 当前尚无条件语句、变量、按键配置 DSL。不能把 `if` 当注释吞掉。
+- 条件语句、mod 内变量及 cycle 按键已实现；参见独立语法文档。错误条件不能当注释吞掉。
 - 部分元数据键允许保持为离线信息；这不是完整 schema 验证器。
-  长度截断、跨节引用和循环引用诊断仍有待完善，见审查记录。
+  Render 字段、跨节资源及 partner 引用均在发布前检查；后端容量与其他格式输入限制见审查记录。
 - 现有固定数组容量是实现限制，不是已证明的 Unity 上限；后续语法设计不能继续随意加魔法数字。
 
 ## 4. 生命周期和热更新
@@ -116,11 +119,11 @@ render.0=RenderBody
 共享 Mesh 重新赋值：保留已有绑定，或执行相同的顶层 Mesh 规则
 材质控制器提交：对已绑定 Renderer 重应用材质部分
 
-F10/管理器：提交 Reload 请求
+eiem.ini 的 reload 快捷键（默认 F10）/管理器：提交 Reload 请求
 Unity 主线程：恢复旧效果 → 读取/发布新 program → 重应用已登记实例
 
-后续状态变化：提交 Reapply 请求
-Unity 主线程：恢复旧效果 → 用当前 program 重应用（不读磁盘）
+mod Key：有序按键事件 → 提交 Reapply 请求
+Unity 主线程：求值新状态 → 恢复受影响 mod 的旧效果 → 发布新动作并重应用（不重读 INI）
 ```
 
 - Reconcile 只重试已登记模型；不会因初始 generation 不同而意外恢复启动 hooks 的成果。
@@ -136,6 +139,8 @@ Unity 主线程：恢复旧效果 → 用当前 program 重应用（不读磁盘
 
 ## 5. 资源与 Blender
 
+顶点数据的现行约束及已撤回建议见 [顶点数据契约](vertex-data-contract.md)。
+
 - 离线包、Blender、DLL 使用 EIEMESH 与独立 .mat、贴图；不要求 FBX 中转。
 - 材质 .mat 指明游戏逻辑 `source=`，运行时加载该源材质再克隆。
   例如 `texture._BaseMap=TextureCloth`、`float._SomeParameter=0.2`；
@@ -145,19 +150,26 @@ Unity 主线程：恢复旧效果 → 用当前 program 重应用（不读磁盘
   材质贴图路径优先显示，UV、颜色、形态键使用对应 Blender 数据。
 - 导出选中且修改的资源及依赖；新增网格通过明确 Render/partner 关系表达，
   不靠合并模型继承一堆不透明自定义属性。
+- Blender 0.5 用集合表达切换组/状态，一组一个按键，多组独立。同源拆分部件汇总为一个命中 Render，
+  各部件以条件 partner 装配。选中任一部件时导出同源与状态依赖闭包，隐藏眼睛不删减导出。
+- Blender 0.6 在 Mesh 数据块保存形态键滑条作者数据，导出 `Slider`/`shape.名称` 绑定。
+  权重属于 Renderer 实例；ImGui 与按键只写 Mod 变量，纯权重更新不重建资源。
+  [形态键控制](shape-controls.md)记录实现和未验收的游戏自定义 GPU 阶段。
 - 旧 EIEMESH 输入版本及来源元数据不是旧运行时替换引擎。仍在使用的离线包
   Reader 不因为“清理兼容”就任意删除，除非有迁移和等价验证。
-- 骨架编辑、同路径改像素的增量依赖、导出失败时保护旧输出等仍存在已记录限制；
+- 输出先在临时目录完成校验和文件构建，再更新目标；输入或构建出错不清空旧包。
+  最后复制阶段的磁盘故障并非跨文件原子提交，仍须另行处理。
+- 骨架编辑、同路径改像素的增量依赖等仍存在已记录限制；
   本文不宣称这些已完整实现。
 
-## 6. 后续 if/endif、按键设计应落在哪里
+## 6. if/endif、按键实现位置
 
-这次只搭接口，不预定用户尚未确认的语法：
+实现采用用户确认的职责，具体语法见 [conditional-keys.md](conditional-keys.md)：
 
-1. 解析器保留有顺序、可嵌套的语句信息；不能在读文件时简单删除“不成立”的行，
+1. 解析器保留有顺序、可嵌套的语句信息；不在读文件时简单删除“不成立”的行，
    否则按键后无法重新求值。
 2. 变量/按键改变求值状态；状态层不直接调用 Unity，也不复制每种 hook 的逻辑。
-3. 求值结果交给现有 Render 执行模块；恢复与重应用走 Reapply，
+3. 求值结果交给现有 Render 执行模块；只在匹配时登记实例，不依赖动作是否生效。恢复与重应用走 Reapply，
    修改磁盘文件才走 Reload。
 4. 资源声明与条件动作分离。Blender 项目保留语义数据，更新 exporter 后再生成新配置。
 5. 实例所有权、资源退休、规则冲突要先收敛，不能继续增加自动猜测或静默回退。
@@ -171,6 +183,8 @@ Unity 主线程：恢复旧效果 → 用当前 program 重应用（不读磁盘
 - `tests/test_mesh_resource_cache.py`：真实缓存函数的七个状态场景。
 - `tests/test_ui_async_passthrough.py`：UI 回调原样传递的六个场景。
 - `tools/Blender/test_eiem_material_slot_gaps.py`：空材质槽、INI 槽号、重新导入一致。
+- `tests/test_blender_switches.py`：实际 Blender P 分离、作者工程保存/重开、导出，再由真实 DLL 解析器切换六次。
+- `tests/test_partner_controls.py`：实际退休与排除函数在模拟 Unity 调用下的顺序/所有权测试。
 - 其余静态合同检查是代码组织护栏，不等同于游戏行为测试。
 - [架构审查与剩余风险](architecture-review-v1.md)
 - [UI 回调崩溃实证](debugging/2026-09-05-ui-callback-crash.md)
