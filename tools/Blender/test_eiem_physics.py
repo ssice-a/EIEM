@@ -24,11 +24,12 @@ bpy.ops.object.mode_set(mode="OBJECT")
 group = physics.create_group(rig, [rig.data.bones["Extra"],rig.data.bones["Tip"]], "尾链")
 group.eiem_physics.gravity = 5
 assert abs(group.eiem_physics.node_radius - .006) < 1e-8
-radius_curve = physics.author_radius_curve(group)
-assert radius_curve is not None and len(radius_curve.keyframe_points) == 2
+radius_node = physics.native.curve_mapping_node(group, physics.native.NODE_RADIUS_PARAMETER)
+assert radius_node is not None and len(radius_node.mapping.curves[0].points) == 2
 group.eiem_physics.node_radius = .02
-radius_curve.keyframe_points[1].co.y = .25
-radius_curve.update(); physics.rebuild_group(group)
+radius_end = max(radius_node.mapping.curves[0].points, key=lambda point: point.location.x)
+radius_end.location = (radius_end.location.x, .25)
+radius_node.mapping.update(); physics.native.poll_curve_previews(); physics.rebuild_group(group)
 samples = []
 for child in group.children:
     if child.get("eiem_physics_preview") == physics.native.NODE_RADIUS_PREVIEW_MARKER:
@@ -84,12 +85,12 @@ copy = physics.duplicate_group(group)
 assert copy.eiem_physics.identity != group.eiem_physics.identity
 assert copy.eiem_physics.gravity == 5 and copy.eiem_physics.colliders[0].object == collider
 assert abs(copy.eiem_physics.node_radius - .02) < 1e-7
-assert abs(physics.author_radius_curve(copy).keyframe_points[1].co.y - .25) < 1e-7
+assert abs(physics.author_radius_record(copy)["keys"][-1]["value"] - .25) < 1e-7
 copy.eiem_physics.gravity = 7
 assert group.eiem_physics.gravity == 5
 
 # The two-button clipboard copies every author parameter, the complete editable
-# radius F-Curve, and the group's collider set rather than retaining a preset
+# radius Float Curve, and the group's collider set rather than retaining a preset
 # pointer to the source.
 bpy.context.view_layer.objects.active = group
 assert bpy.ops.eiem.physics_parameters(action="COPY") == {"FINISHED"}
@@ -206,7 +207,8 @@ for record in legacy_payload["groups"]: record.pop("radius"); record.pop("native
 legacy_file = output / "legacy.physics"; legacy_file.write_bytes(physics.document.encode(legacy_payload))
 legacy_rig, legacy_groups = physics.import_physics(legacy_file)
 assert all(abs(item.eiem_physics.node_radius - .006) < 1e-8 for item in legacy_groups)
-assert all(physics.author_radius_curve(item) is not None for item in legacy_groups)
+assert all(physics.native.curve_mapping_node(item, physics.native.NODE_RADIUS_PARAMETER) is not None
+           for item in legacy_groups)
 legacy_out = output / "legacy-current.physics"; physics.export_physics(legacy_out, legacy_groups)
 assert physics.document.read(legacy_out)["version"] == physics.document.VERSION
 

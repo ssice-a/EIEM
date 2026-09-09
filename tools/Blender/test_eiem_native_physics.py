@@ -124,42 +124,45 @@ for group in groups:
         assert {"value", "useCurve"} <= set(fields)
         assert any(key.startswith("curve.m_Curve.") for key in fields)
 
-# Native curves can be viewed and edited in Blender's Graph Editor. Friendly
-# custom-property channels keep raw TypeTree paths out of the everyday UI.
+# Native curves use private Float Curve nodes. Only one selected curve is drawn
+# in the panel, and the old nine object custom properties are not retained.
 curve_group = groups[0]
-action = native.build_curve_projection(curve_group)
-fcurves = list(native.action_fcurves(curve_group))
-assert action[native.CURVE_ACTION_MARKER] == curve_group.eiem_native_physics.source_key
-assert len(fcurves) == 9
-assert all("serializeData" not in curve.data_path and "物理曲线" in curve.data_path for curve in fcurves)
+tree = native.build_curve_mappings(curve_group)
+assert len(tree.nodes) == len(native.CURVE_PARAMETERS) == 9
+assert curve_group.animation_data is None or curve_group.animation_data.action is None
+assert not any(str(key).startswith(native.CURVE_PROPERTY_PREFIX) for key in curve_group.keys())
 assert native.friendly_field_label(
     "serializeData.angleLimitConstraint.limitAngle.curve.m_Curve.0.value"
 ) == "角度限制 · 关键帧 1 · 倍率"
-damping_fields = native.curve_fields(curve_group, "serializeData.damping")
-damping_curve = native.find_action_curve(
-    curve_group, native.property_data_path(native.curve_property(0, "阻尼")))
-points = sorted(damping_curve.keyframe_points, key=lambda point: point.co.x)
-inactive_in_weight = damping_fields["curve.m_Curve.0.inWeight"].value
-points[-1].co.y += .25; damping_curve.mute = False; damping_curve.update()
-assert native.apply_curve_projection(curve_group) >= 18
+damping_parameter = "serializeData.damping"
+damping_fields, damping_original = native.source_curve_keys(curve_group, damping_parameter)
+damping_original = copy.deepcopy(damping_original)
+damping_original_enabled = damping_fields["useCurve"].integer
+damping_fields["useCurve"].integer = "1"
+damping_node = native.curve_mapping_node(curve_group, damping_parameter)
+damping_end = max(damping_node.mapping.curves[0].points, key=lambda point: point.location.x)
+damping_end.location = (damping_end.location.x, damping_end.location.y + .25)
+damping_node.mapping.update()
+assert native.poll_curve_previews() == .2
+damping_fields, damping_keys = native.source_curve_keys(curve_group, damping_parameter)
 assert damping_fields["useCurve"].integer == "1"
-assert abs(damping_fields["curve.m_Curve.1.value"].value - points[-1].co.y) < 1e-6
-assert damping_fields["curve.m_Curve.0.weightedMode"].integer == "0"
-assert damping_fields["curve.m_Curve.0.inWeight"].value == inactive_in_weight
-for field in curve_group.eiem_native_physics.fields:
-    original = json.loads(field.original)
-    if field.floating: field.value = original
-    else: field.integer = str(original)
-native.build_curve_projection(curve_group)
+assert abs(damping_keys[-1]["value"] - damping_end.location.y) < 1e-6
+assert all(key["weightedMode"] == 0 for key in damping_keys)
+native.replace_curve_key_fields(curve_group, damping_parameter, damping_original)
+damping_fields = native.curve_fields(curve_group, damping_parameter)
+damping_fields["useCurve"].integer = damping_original_enabled
+native.load_curve_mapping(curve_group, damping_parameter, damping_original)
+if native.CURVE_MAPPING_EDITED in curve_group:
+    del curve_group[native.CURVE_MAPPING_EDITED]
 
-# useAngleLimit is independent from the angle curve's useCurve flag. The compact
-# checkbox writes the real source field and regenerates/removes the cone preview.
+# useAngleLimit is independent from the angle curve's useCurve flag.
+# Inline edits refresh the cone without changing the total enable switch.
 rope = next(group for group in groups if native.record(group)["name"] == "MBC_Typhoea_Cloth_Skirt_Rope")
-native.build_curve_projection(rope)
-angle_index = native.CURVE_PARAMETER_INDEX[native.ANGLE_CURVE_PARAMETER]
-angle_curve = native.find_action_curve(
-    rope, native.property_data_path(native.curve_property(angle_index, native.CURVE_PARAMETERS[angle_index][1])))
-assert not angle_curve.mute and not rope.eiem_native_physics.angle_limit_enabled
+native.build_curve_mappings(rope)
+angle_node = native.curve_mapping_node(rope, native.ANGLE_CURVE_PARAMETER)
+angle_fields, angle_original = native.source_curve_keys(rope, native.ANGLE_CURVE_PARAMETER)
+angle_original = copy.deepcopy(angle_original)
+assert int(native.curve_fields(rope, native.ANGLE_CURVE_PARAMETER)["useCurve"].integer) and not rope.eiem_native_physics.angle_limit_enabled
 rope.eiem_native_physics.angle_limit_enabled = True
 native.flush_group_previews()
 before_visual = next(child for child in rope.children
@@ -167,13 +170,10 @@ before_visual = next(child for child in rope.children
 before_pointer = before_visual.as_pointer()
 before_samples = before_visual["eiem_physics_angle_samples"]
 
-# One lightweight timer is the only Graph Editor change detector. It catches
-# direct F-Curve edits, rebuilds only this group's previews, and needs no native
-# depsgraph handler.
-end_point = max(angle_curve.keyframe_points, key=lambda point: point.co.x)
-original_y = float(end_point.co.y)
-end_point.co.y = original_y + .25
-angle_curve.update()
+angle_end = max(angle_node.mapping.curves[0].points, key=lambda point: point.location.x)
+original_y = float(angle_end.location.y)
+angle_end.location = (angle_end.location.x, original_y + .25)
+angle_node.mapping.update()
 assert native.poll_curve_previews() == .2
 assert rope.name_full in native._GROUP_PREVIEW_DIRTY
 native.flush_group_previews()
@@ -181,33 +181,31 @@ after_visual = next(child for child in rope.children
                     if child.get("eiem_physics_preview") == native.ANGLE_PREVIEW_MARKER)
 assert after_visual.as_pointer() != before_pointer
 assert after_visual["eiem_physics_angle_samples"] != before_samples
-end_point.co.y = original_y
-angle_curve.update()
-assert native.poll_curve_previews() == .2
-native.flush_group_previews()
+native.replace_curve_key_fields(rope, native.ANGLE_CURVE_PARAMETER, angle_original)
+native.load_curve_mapping(rope, native.ANGLE_CURVE_PARAMETER, angle_original)
+if native.CURVE_MAPPING_EDITED in rope:
+    del rope[native.CURVE_MAPPING_EDITED]
 rope.eiem_native_physics.angle_limit_enabled = False
 native.flush_group_previews()
 assert not any(child.get("eiem_physics_preview") == native.ANGLE_PREVIEW_MARKER for child in rope.children)
-native.build_curve_projection(rope)
 
-# Radius F-Curves refresh the physical-size node spheres even for a group whose
+# Radius Float Curve edits refresh physical-size node spheres even when the
 # angle-limit preview is disabled.
 radius_group = next(group for group in groups
                     if int(native.curve_fields(group, native.NODE_RADIUS_PARAMETER)["useCurve"].integer))
-native.build_curve_projection(radius_group)
+native.build_curve_mappings(radius_group)
+radius_fields, radius_original = native.source_curve_keys(radius_group, native.NODE_RADIUS_PARAMETER)
+radius_original = copy.deepcopy(radius_original)
 native.flush_group_previews()
 radius_visual = next(child for child in radius_group.children
                      if child.get("eiem_physics_preview") == native.NODE_RADIUS_PREVIEW_MARKER and
                      any(sample[1] > .99 for sample in json.loads(child["eiem_physics_node_radius_samples"])))
 before_radius_samples = radius_visual["eiem_physics_node_radius_samples"]
-radius_index = native.CURVE_PARAMETER_INDEX[native.NODE_RADIUS_PARAMETER]
-radius_curve = native.find_action_curve(
-    radius_group, native.property_data_path(native.curve_property(
-        radius_index, native.CURVE_PARAMETERS[radius_index][1])))
-radius_end = max(radius_curve.keyframe_points, key=lambda point: point.co.x)
-radius_original_y = float(radius_end.co.y)
-radius_end.co.y = radius_original_y + .25
-radius_curve.update()
+radius_node = native.curve_mapping_node(radius_group, native.NODE_RADIUS_PARAMETER)
+radius_end = max(radius_node.mapping.curves[0].points, key=lambda point: point.location.x)
+radius_original_y = float(radius_end.location.y)
+radius_end.location = (radius_end.location.x, radius_original_y + .25)
+radius_node.mapping.update()
 assert native.poll_curve_previews() == .2
 assert radius_group.name_full in native._GROUP_PREVIEW_DIRTY
 native.flush_group_previews()
@@ -215,11 +213,12 @@ radius_visual = next(child for child in radius_group.children
                      if child.get("eiem_physics_preview") == native.NODE_RADIUS_PREVIEW_MARKER and
                      any(sample[1] > .99 for sample in json.loads(child["eiem_physics_node_radius_samples"])))
 assert radius_visual["eiem_physics_node_radius_samples"] != before_radius_samples
-radius_end.co.y = radius_original_y
-radius_curve.update()
-assert native.poll_curve_previews() == .2
+native.replace_curve_key_fields(radius_group, native.NODE_RADIUS_PARAMETER, radius_original)
+native.load_curve_mapping(radius_group, native.NODE_RADIUS_PARAMETER, radius_original)
+if native.CURVE_MAPPING_EDITED in radius_group:
+    del radius_group[native.CURVE_MAPPING_EDITED]
+native.schedule_group_preview(radius_group)
 native.flush_group_previews()
-native.build_curve_projection(radius_group)
 
 # Each group Empty owns explicit references to the shared Collider Empties.
 by_source = {o.eiem_native_physics.source_key:o for o in colliders}
@@ -315,6 +314,8 @@ bpy.ops.wm.save_as_mainfile(filepath=str(output / "native-author.blend"))
 bpy.ops.wm.open_mainfile(filepath=str(output / "native-author.blend"))
 objects = [bpy.data.objects[name] for name in names]; rig = bpy.data.objects[rig_name]
 radius_group = bpy.data.objects[radius_group_name]
+assert radius_group.eiem_native_physics.curve_mapping_tree is not None
+assert len(radius_group.eiem_native_physics.curve_mapping_tree.nodes) == 9
 native.export_source(output / "saved.physics", objects)
 assert native.source.read(output / "saved.physics") == baseline
 before = set(bpy.data.objects)
@@ -442,12 +443,10 @@ assert saved_parameters["nativeType"] == native.record(template)["type"]
 assert len(saved_parameters["nativeFields"]) == len(template.eiem_native_physics.fields) == 249
 assert len(created_group.eiem_native_physics.fields) == 249
 assert native.is_parameter_group(created_group)
-author_action = created_group.animation_data.action
-assert author_action[native.CURVE_ACTION_MARKER] == created_group.eiem_native_physics.source_key
-assert len(list(native.action_fcurves(created_group))) == len(native.CURVE_PARAMETERS) == 9
-assert {key for key in created_group.keys() if str(key).startswith(native.CURVE_PROPERTY_PREFIX)} == {
-    native.curve_property(index, label)
-    for index, (path, label) in enumerate(native.CURVE_PARAMETERS)}
+author_tree = created_group.eiem_native_physics.curve_mapping_tree
+assert author_tree is not None and len(author_tree.nodes) == len(native.CURVE_PARAMETERS) == 9
+assert created_group.animation_data is None or created_group.animation_data.action is None
+assert not any(str(key).startswith(native.CURVE_PROPERTY_PREFIX) for key in created_group.keys())
 copied_colliders = [ref.object for ref in template.eiem_physics.colliders]
 assert [ref.object for ref in created_group.eiem_physics.colliders] == copied_colliders
 # The old 0.23 .blend representation stored only the hidden snapshot. Reload
@@ -462,7 +461,8 @@ assert len(created_group.eiem_physics.colliders) == 0
 created_group.eiem_physics.collider_candidate = copied_colliders[0]
 assert bpy.ops.eiem.physics_edit(action="LINK_CANDIDATE") == {"FINISHED"}
 assert [ref.object for ref in created_group.eiem_physics.colliders] == copied_colliders
-# Full fields are editable on the author Empty and feed the v4 author document.
+# Main controls feed the author snapshot; the complete field table remains an
+# internal/read-only export contract.
 author_damping = next(field for field in created_group.eiem_native_physics.fields
                       if field.label == "serializeData.damping.value")
 author_damping_path = author_damping.label
@@ -471,16 +471,14 @@ edited_damping = author_damping.value
 saved_parameters = json.loads(created_group.eiem_physics.native_parameter_snapshot)
 assert next(item["value"] for item in saved_parameters["nativeFields"]
             if item["path"] == author_damping.label) == edited_damping
+damping_node = native.curve_mapping_node(created_group, "serializeData.damping")
+damping_point = min(damping_node.mapping.curves[0].points, key=lambda point: point.location.x)
+damping_point.location = (damping_point.location.x, damping_point.location.y + .125)
+damping_node.mapping.update()
+native.poll_curve_previews()
 author_damping_key = next(field for field in created_group.eiem_native_physics.fields
                           if field.label == "serializeData.damping.curve.m_Curve.0.value")
-author_damping_key.value += .125
-edited_damping_key = author_damping_key.value
-author_damping_curve = native.find_action_curve(
-    created_group, native.property_data_path(native.curve_property(0, "阻尼")))
-projected_damping = min(author_damping_curve.keyframe_points, key=lambda point: point.co.x).co.y
-assert abs(projected_damping - edited_damping_key) < 1e-6, (
-    projected_damping, edited_damping_key, created_group.eiem_native_physics.ready,
-    created_group.animation_data.action.get(native.CURVE_ACTION_MARKER))
+assert abs(author_damping_key.value - damping_point.location.y) < 1e-6
 # Source collider associations are now preserved for editing, selection and
 # visibility. Conversion to author collider records remains a separate DLL task.
 try:

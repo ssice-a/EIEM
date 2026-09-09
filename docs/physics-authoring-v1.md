@@ -1,7 +1,7 @@
 # Physics 作者资源 v1 / v3 / v4
 
 当前线格式版本：4；版本 1/3 保持读取/重编码兼容；版本 2 保留给原生源图格式，不用于新增作者组。
-作者工具初次交付于 Blender 插件 0.11.0，当前源码为 0.25.0。
+作者工具初次交付于 Blender 插件 0.11.0，当前源码为 0.26.0。
 原始 Prefab 源图保留和编辑使用独立的[源作者 v2](physics-authoring-v2.md)，不改变本文 v1 格式含义。
 工作区接入和验证状态统一见[文档索引](README.md)。
 
@@ -19,6 +19,9 @@
 0.25.0 把带完整模板的作者组和原生组统一到同一参数编辑器：常用参数、角度限制、九条 Blender F-Curve、
 九个 Empty 自定义属性及高级字段使用同一数据投影。直接编辑高级曲线字段或 Graph Editor 都会写回同一份
 `nativeParameters`；旧的单独节点半径 Action 在重载时迁移为九曲线 Action。
+0.26.0 收回这些重复入口：常用参数采用固定顺序，九类曲线从下拉框选择并在对象面板内一次编辑一条浮点曲线；
+旧 Action 和九个自定义曲线属性在重载时迁移后移除。完整字段区改为排序稳定的只读源数据检查，复制/粘贴仍会
+一次传递全部模板字段和碰撞集合。未修改的源曲线继续保留原切线/权重；编辑浮点曲线后按当前控制点生成新曲线。
 没有粘贴原生模板的新组仍使用 `ClothSerializeData` 构造默认值，只显式覆盖这五项参数与节点半径曲线。
 组合 Mod 入口可把所选 **无独立碰撞体作者组**与同一共享 Rig 的所选 Mesh 一起写出，并在相同 Mesh 命中规则的
 Render 动作中生成 `skeleton=` 与 `physics=`；未选物理组时仍是原有 Mesh 增量导出。
@@ -128,8 +131,8 @@ Skeleton 存在相邻 `skeletons/<完整SHA256>.skeleton`，包含同一 Rig 的
 - [Python 编解码](../tools/Blender/eiem_physics_document.py)
 - [Blender 作者工具](../tools/Blender/eiem_physics_authoring.py)
 - [C++ reader/validator](../src/eiem_physics_document.h)：失败保留调用者原 document；[依赖读取](../src/eiem_physics_asset.h)已通过针对性宿主测试和本地构建，未接原生执行，记录见[原生调查第 16 节](native-physics-investigation.md)。
-- [实际 Blender 测试](../tools/Blender/test_eiem_physics.py)：编辑模式按钮、节点基础半径与曲线、按深度变化的
-  真实半径球、完整参数字段编辑和旧快照迁移、碰撞集合复制/加入/移除、局部变换和胶囊量测、保存重开、
+- [实际 Blender 测试](../tools/Blender/test_eiem_physics.py)：编辑模式按钮、节点基础半径与内嵌浮点曲线、按深度变化的
+  真实半径球、完整参数快照和旧工程迁移、碰撞集合复制/加入/移除、局部变换和胶囊量测、保存重开、
   骨骼改名、隐藏辅助体、无权重骨骼、
   失效引用、错误导出不覆盖原文件、独立 Rig 导入。
 - [跨语言/坏文件测试](../tests/test_physics_document.py)：C++ 读取 Python/Blender 输出；

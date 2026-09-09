@@ -30,11 +30,11 @@ COLORS = {"FIXED": (1.0, .32, .06, 1), "MOVE": (.05, .65, 1, 1),
           "COLLIDER": (.9, .2, .7, 1), "ANGLE": (1.0, .72, .06, 1)}
 PARAMETER_PAGE_SIZE = 32
 COMMON_PARAMETERS = (
-    ("serializeData.gravity", "重力"),
-    ("serializeData.stablizationTimeAfterReset", "重置后稳定时间"),
-    ("serializeData.gravityFalloff", "重力衰减"),
     ("serializeData.blendWeight", "物理混合权重"),
+    ("serializeData.gravity", "重力"),
+    ("serializeData.gravityFalloff", "重力衰减"),
     ("serializeData.animationPoseRatio", "动画姿态比例"),
+    ("serializeData.stablizationTimeAfterReset", "重置后稳定时间"),
 )
 CURVE_PARAMETERS = (
     ("serializeData.damping", "阻尼"),
@@ -48,6 +48,36 @@ CURVE_PARAMETERS = (
     ("serializeData.selfCollisionConstraint.surfaceThickness", "自碰撞表面厚度"),
 )
 CURVE_PARAMETER_INDEX = {path: index for index, (path, label) in enumerate(CURVE_PARAMETERS)}
+CURVE_PARAMETER_ITEMS = tuple(
+    (str(index), label, "编辑%s沿物理链根部到末端的倍率" % label, index)
+    for index, (path, label) in enumerate(CURVE_PARAMETERS)
+)
+CURVE_CONTEXT_FIELDS = {
+    "serializeData.angleRestorationConstraint.stiffness": (
+        ("serializeData.angleRestorationConstraint.useAngleRestoration", "启用角度恢复"),
+        ("serializeData.angleRestorationConstraint.velocityAttenuation", "速度衰减"),
+    ),
+    "serializeData.angleLimitConstraint.limitAngle": (
+        ("serializeData.angleLimitConstraint.useAngleLimit", "启用角度限制"),
+        ("serializeData.angleLimitConstraint.stiffness", "限制刚度"),
+    ),
+    "serializeData.motionConstraint.maxDistance": (
+        ("serializeData.motionConstraint.useMaxDistance", "启用最大距离"),
+        ("serializeData.motionConstraint.stiffness", "运动约束强度"),
+    ),
+    "serializeData.motionConstraint.backstopDistance": (
+        ("serializeData.motionConstraint.useBackstop", "启用回挡"),
+        ("serializeData.motionConstraint.backstopRadius", "回挡半径"),
+        ("serializeData.motionConstraint.stiffness", "运动约束强度"),
+    ),
+    "serializeData.colliderCollisionConstraint.limitDistance": (
+        ("serializeData.colliderCollisionConstraint.mode", "碰撞模式"),
+        ("serializeData.colliderCollisionConstraint.friction", "碰撞摩擦"),
+    ),
+    "serializeData.selfCollisionConstraint.surfaceThickness": (
+        ("serializeData.selfCollisionConstraint.selfMode", "自碰撞模式"),
+    ),
+}
 CURVE_FRAME_SCALE = 100.0
 CURVE_PROPERTY_PREFIX = "物理曲线 "
 CURVE_ACTION_MARKER = "eiem_native_physics_curves"
@@ -71,7 +101,11 @@ NODE_RADIUS_VISUAL_FIELDS = {NODE_RADIUS_BASE_FIELD,
                              NODE_RADIUS_PARAMETER + ".useCurve"}
 NODE_RADIUS_CURVE_FIELD_PREFIX = NODE_RADIUS_PARAMETER + ".curve."
 NODE_RADIUS_PREVIEW_MARKER = "native-node-radius"
-CURVE_PREVIEW_SIGNATURE = "eiem_physics_curve_preview_signature"
+CURVE_MAPPING_TREE_MARKER = "eiem_physics_curve_mapping_tree"
+CURVE_MAPPING_PARAMETER = "eiem_physics_curve_parameter"
+CURVE_MAPPING_SIGNATURE = "eiem_physics_curve_mapping_signature"
+CURVE_MAPPING_SOURCE_SIGNATURE = "eiem_physics_curve_mapping_source_signature"
+CURVE_MAPPING_EDITED = "eiem_physics_curve_mapping_edited"
 _GROUP_PREVIEW_DIRTY = set()
 _SOURCE_CACHE = {}
 
@@ -128,7 +162,15 @@ def current_record(obj):
     data = copy.deepcopy(record(obj))
     data["operation"] = "disable" if obj.eiem_native_physics.disabled else data["operation"]
     data["name"] = obj.eiem_physics.label
+    edited_curves = curve_mapping_edited_parameters(obj)
+    for parameter in edited_curves:
+        _, keys = source_curve_keys(obj, parameter)
+        parameter_data = source.get_field(data["fields"], tuple(parameter.split(".")))
+        parameter_data["curve"]["m_Curve"] = copy.deepcopy(keys)
     for field in obj.eiem_native_physics.fields:
+        if any(field.label.startswith(parameter + ".curve.m_Curve.")
+               for parameter in edited_curves):
+            continue
         value = field.value if field.floating else int(field.integer)
         # RNA floats are float32; preserve the original serialized decimal when
         # the author did not change that field through Blender.
@@ -553,6 +595,221 @@ def source_curve_keys(obj, parameter):
     return fields, keys
 
 
+def curve_mapping_tree(obj, create=False):
+    """Return the private node tree used only by the inline Float Curve UI."""
+    state = obj.eiem_native_physics
+    tree = state.curve_mapping_tree
+    if tree is not None:
+        return tree
+    if not create:
+        return None
+    name = ".EIEM 物理曲线 " + (obj.eiem_physics.identity or obj.name_full)
+    tree = bpy.data.node_groups.new(name=name, type="ShaderNodeTree")
+    tree[CURVE_MAPPING_TREE_MARKER] = obj.eiem_physics.identity or obj.name_full
+    state.curve_mapping_tree = tree
+    return tree
+
+
+def curve_mapping_node(obj, parameter, create=False):
+    tree = curve_mapping_tree(obj, create)
+    if tree is None:
+        return None
+    node = next((item for item in tree.nodes
+                 if item.get(CURVE_MAPPING_PARAMETER) == parameter), None)
+    if node is None and create:
+        index = CURVE_PARAMETER_INDEX.get(parameter, 0)
+        label = CURVE_PARAMETERS[index][1] if parameter in CURVE_PARAMETER_INDEX else parameter
+        node = tree.nodes.new("ShaderNodeFloatCurve")
+        node.name = "EIEM_CURVE_%02d" % index
+        node.label = label
+        node[CURVE_MAPPING_PARAMETER] = parameter
+    return node
+
+
+def curve_mapping_signature(node):
+    if node is None:
+        return ""
+    mapping = node.mapping
+    values = {
+        "clip": [float(mapping.clip_min_x), float(mapping.clip_max_x),
+                 float(mapping.clip_min_y), float(mapping.clip_max_y)],
+        "points": [[float(point.location.x), float(point.location.y), point.handle_type]
+                   for point in sorted(mapping.curves[0].points,
+                                       key=lambda item: item.location.x)],
+    }
+    return json.dumps(values, separators=(",", ":"), allow_nan=False)
+
+
+def source_curve_signature(keys):
+    return json.dumps(keys, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def load_curve_mapping(obj, parameter, keys):
+    """Project source keys into Blender's compact Float Curve widget."""
+    source.require(2 <= len(keys) <= 64, "浮点曲线需要 2..64 个控制点")
+    node = curve_mapping_node(obj, parameter, True)
+    mapping = node.mapping
+    curve = mapping.curves[0]
+    points = curve.points
+    while len(points) > 2:
+        points.remove(points[-1])
+    ordered = sorted(keys, key=lambda item: item["time"])
+    points[0].location = (float(ordered[0]["time"]), float(ordered[0]["value"]))
+    points[1].location = (float(ordered[-1]["time"]), float(ordered[-1]["value"]))
+    points[0].handle_type = points[1].handle_type = "AUTO"
+    for key in ordered[1:-1]:
+        point = points.new(float(key["time"]), float(key["value"]))
+        point.handle_type = "AUTO"
+    values = [float(key["value"]) for key in ordered]
+    low, high = min(values), max(values)
+    padding = max(.1, (high - low) * .2)
+    mapping.use_clip = True
+    mapping.clip_min_x = 0.0
+    mapping.clip_max_x = 1.0
+    mapping.clip_min_y = min(0.0, low - padding)
+    mapping.clip_max_y = max(1.0, high + padding)
+    mapping.extend = "HORIZONTAL"
+    mapping.update()
+    node[CURVE_MAPPING_SOURCE_SIGNATURE] = source_curve_signature(ordered)
+    node[CURVE_MAPPING_SIGNATURE] = curve_mapping_signature(node)
+    return node
+
+
+def curve_mapping_keys(node):
+    """Convert one simple Float Curve to Unity-style keys with unweighted slopes."""
+    source.require(node is not None, "物理浮点曲线已丢失")
+    mapping = node.mapping
+    curve = mapping.curves[0]
+    points = sorted(curve.points, key=lambda item: item.location.x)
+    source.require(2 <= len(points) <= 64, "浮点曲线需要 2..64 个控制点")
+    times = [float(point.location.x) for point in points]
+    source.require(all(0.0 <= value <= 1.0 for value in times) and
+                   all(a < b for a, b in zip(times, times[1:])),
+                   "浮点曲线横轴必须在 0..1 内严格递增")
+    result = []
+    for index, (point, time) in enumerate(zip(points, times)):
+        left_span = time - times[index - 1] if index else (
+            times[1] - time if len(times) > 1 else 1.0)
+        right_span = times[index + 1] - time if index + 1 < len(times) else left_span
+        epsilon = max(1e-5, min(left_span, right_span) * .001)
+        left = max(0.0, time - epsilon)
+        right = min(1.0, time + epsilon)
+        value = float(point.location.y)
+        in_slope = ((value - float(mapping.evaluate(curve, left))) / (time - left)
+                    if time > left else 0.0)
+        out_slope = ((float(mapping.evaluate(curve, right)) - value) / (right - time)
+                     if right > time else 0.0)
+        result.append({"time": time, "value": value,
+                       "inSlope": in_slope, "outSlope": out_slope,
+                       "weightedMode": 0, "inWeight": 1 / 3,
+                       "outWeight": 1 / 3})
+    return result
+
+
+def curve_mapping_edited_parameters(obj):
+    try:
+        values = json.loads(str(obj.get(CURVE_MAPPING_EDITED, "[]")))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        values = []
+    return {value for value in values if value in CURVE_PARAMETER_INDEX}
+
+
+def mark_curve_mapping_edited(obj, parameter):
+    values = curve_mapping_edited_parameters(obj)
+    values.add(parameter)
+    obj[CURVE_MAPPING_EDITED] = json.dumps(sorted(values), separators=(",", ":"))
+
+
+def replace_curve_key_fields(obj, parameter, keys):
+    """Replace one curve array while keeping every unrelated source field intact."""
+    state = obj.eiem_native_physics
+    prefix = parameter + ".curve.m_Curve."
+    records = [{"path": field.path, "label": field.label,
+                "original": field.original, "floating": bool(field.floating),
+                "value": float(field.value) if field.floating else str(field.integer)}
+               for field in state.fields if not field.label.startswith(prefix)]
+    path_prefix = tuple(parameter.split(".")) + ("curve", "m_Curve")
+    for index, key in enumerate(keys):
+        for suffix in ("time", "value", "inSlope", "outSlope",
+                       "weightedMode", "inWeight", "outWeight"):
+            floating = suffix != "weightedMode"
+            value = float(key[suffix]) if floating else int(key[suffix])
+            path = path_prefix + (index, suffix)
+            records.append({"path": source.dumps(path),
+                            "label": ".".join(str(part) for part in path),
+                            "original": source.dumps(value),
+                            "floating": floating,
+                            "value": value if floating else str(value)})
+    previous_ready = bool(state.ready)
+    state.ready = False
+    try:
+        state.fields.clear()
+        for record in sorted(records, key=lambda item: natural_path_key(item["label"])):
+            field = state.fields.add()
+            field.path, field.label, field.original = record["path"], record["label"], record["original"]
+            field.floating = record["floating"]
+            if field.floating:
+                field.value = float(record["value"])
+            else:
+                field.integer = str(record["value"])
+    finally:
+        state.ready = previous_ready
+
+
+def apply_curve_mapping(obj, parameter):
+    """Commit one edited inline curve to the canonical parameter fields."""
+    source.require(is_parameter_group(obj), "当前物理组没有完整参数模板")
+    node = curve_mapping_node(obj, parameter)
+    keys = curve_mapping_keys(node)
+    replace_curve_key_fields(obj, parameter, keys)
+    mark_curve_mapping_edited(obj, parameter)
+    node[CURVE_MAPPING_SOURCE_SIGNATURE] = source_curve_signature(keys)
+    node[CURVE_MAPPING_SIGNATURE] = curve_mapping_signature(node)
+    if obj.eiem_physics.kind == "GROUP" and AUTHOR is not None:
+        AUTHOR.sync_author_controls_from_native_fields(obj)
+    else:
+        schedule_group_preview(obj)
+    return len(keys)
+
+
+def retire_legacy_curve_projection(obj):
+    """Remove old Graph Editor channels after their values have been migrated."""
+    action = obj.animation_data.action if obj.animation_data else None
+    if action is None or action.get(CURVE_ACTION_MARKER) != obj.eiem_native_physics.source_key:
+        return
+    if action.get(CURVE_ACTION_SIGNATURE, "") != curve_projection_signature(obj):
+        apply_curve_projection(obj)
+    remove_curve_projection(obj)
+    obj.animation_data_clear()
+    if action.users == 0:
+        bpy.data.actions.remove(action)
+
+
+def build_curve_mappings(obj):
+    """Ensure all nine compact widgets reflect the canonical source fields."""
+    source.require(is_parameter_group(obj), "请选择含完整参数的物理组")
+    action = obj.animation_data.action if obj.animation_data else None
+    if action and action.get(CURVE_ACTION_MARKER) == obj.eiem_native_physics.source_key and \
+            action.get(CURVE_ACTION_SIGNATURE, "") != curve_projection_signature(obj):
+        apply_curve_projection(obj)
+    for parameter, label in CURVE_PARAMETERS:
+        fields, keys = source_curve_keys(obj, parameter)
+        node = curve_mapping_node(obj, parameter)
+        wanted = source_curve_signature(keys)
+        if node is not None:
+            current = curve_mapping_signature(node)
+            baseline = str(node.get(CURVE_MAPPING_SIGNATURE, ""))
+            if baseline and baseline != current:
+                apply_curve_mapping(obj, parameter)
+                fields, keys = source_curve_keys(obj, parameter)
+                wanted = source_curve_signature(keys)
+        if node is None or str(node.get(CURVE_MAPPING_SOURCE_SIGNATURE, "")) != wanted:
+            load_curve_mapping(obj, parameter, keys)
+    retire_legacy_curve_projection(obj)
+    ensure_curve_preview_timer()
+    return curve_mapping_tree(obj)
+
+
 def remove_curve_projection(obj):
     curves = action_fcurves(obj)
     if curves is not None:
@@ -585,13 +842,6 @@ def curve_projection_signature(obj, parameters=None):
              point.interpolation, point.handle_left_type, point.handle_right_type]
             for point in sorted(curve.keyframe_points, key=lambda item: item.co.x)]})
     return json.dumps(values, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-
-
-def curve_preview_signature(obj):
-    parameters = [NODE_RADIUS_PARAMETER]
-    if bool(native_number(obj, ANGLE_ENABLED_FIELD)):
-        parameters.append(ANGLE_CURVE_PARAMETER)
-    return curve_projection_signature(obj, parameters)
 
 
 def build_curve_projection(obj):
@@ -742,6 +992,14 @@ def friendly_field_label(path):
     return " · ".join(translations.get(part, part) for part in compact)
 
 
+def natural_path_key(path):
+    """Give imported and authored source fields the same deterministic order."""
+    parts = []
+    for part in path.split("."):
+        parts.append((0, int(part)) if part.isdigit() else (1, part.casefold()))
+    return tuple(parts)
+
+
 def native_field(obj, path):
     return next((field for field in obj.eiem_native_physics.fields if field.label == path), None)
 
@@ -799,15 +1057,15 @@ def evaluate_source_curve(keys, time):
 def curve_parameter_value(obj, parameter, depth):
     """Evaluate one native base value and its optional chain-depth multiplier."""
     base = float(native_number(obj, parameter + ".value"))
-    index = CURVE_PARAMETER_INDEX[parameter]
-    label = CURVE_PARAMETERS[index][1]
-    curve = find_action_curve(obj, property_data_path(curve_property(index, label)))
-    if curve is not None:
-        multiplier = 1.0 if curve.mute else float(curve.evaluate(float(depth) * CURVE_FRAME_SCALE))
+    fields, keys = source_curve_keys(obj, parameter)
+    enabled = bool(int(fields["useCurve"].integer))
+    node = curve_mapping_node(obj, parameter)
+    pending_mapping_edit = (node is not None and str(node.get(CURVE_MAPPING_SIGNATURE, "")) !=
+                            curve_mapping_signature(node))
+    if enabled and pending_mapping_edit:
+        multiplier = float(node.mapping.evaluate(node.mapping.curves[0], float(depth)))
     else:
-        fields, keys = source_curve_keys(obj, parameter)
-        multiplier = (evaluate_source_curve(keys, float(depth))
-                      if int(fields["useCurve"].integer) else 1.0)
+        multiplier = evaluate_source_curve(keys, float(depth)) if enabled else 1.0
     return base * multiplier
 
 
@@ -953,7 +1211,6 @@ def rebuild_angle_preview(obj, graph=None):
             remove_visual(child)
     action = obj.animation_data.action if obj.animation_data else None
     if action and action.get(CURVE_ACTION_MARKER) == obj.eiem_native_physics.source_key:
-        obj[CURVE_PREVIEW_SIGNATURE] = curve_preview_signature(obj)
         ensure_curve_preview_timer()
     if not bool(native_number(obj, ANGLE_ENABLED_FIELD)):
         obj["eiem_physics_angle_preview"] = "disabled"
@@ -1045,33 +1302,34 @@ def schedule_group_preview(obj):
 
 
 def poll_curve_previews():
-    """Catch Graph Editor edits that do not emit an Action depsgraph update."""
+    """Commit inline Float Curve edits and refresh only affected previews."""
     if AUTHOR is None or not hasattr(bpy.data, "objects"):
         return None
     tracked = False
-    # Applying an authored curve can rebuild its generated preview Objects.
-    # Iterate a stable owner list instead of Blender's live object collection.
-    groups = [obj for obj in bpy.data.objects if is_parameter_group(obj)]
+    groups = [obj for obj in bpy.data.objects
+              if hasattr(obj, "eiem_native_physics") and obj.eiem_native_physics.curve_mapping_tree]
     for obj in groups:
-        if not is_parameter_group(obj):
-            continue
-        action = obj.animation_data.action if obj.animation_data else None
-        if not action or action.get(CURVE_ACTION_MARKER) != obj.eiem_native_physics.source_key:
+        tree = curve_mapping_tree(obj)
+        if tree is None:
             continue
         tracked = True
-        signature = curve_preview_signature(obj)
-        previous = str(obj.get(CURVE_PREVIEW_SIGNATURE, ""))
-        if previous and previous != signature:
-            obj[CURVE_PREVIEW_SIGNATURE] = signature
-            if obj.eiem_physics.kind == "GROUP":
+        for node in list(tree.nodes):
+            parameter = str(node.get(CURVE_MAPPING_PARAMETER, ""))
+            if not parameter:
+                continue
+            signature = curve_mapping_signature(node)
+            previous = str(node.get(CURVE_MAPPING_SIGNATURE, ""))
+            if previous and previous != signature:
                 try:
-                    apply_curve_projection(obj)
+                    if is_parameter_group(obj):
+                        apply_curve_mapping(obj, parameter)
+                    elif obj.eiem_physics.kind == "GROUP" and AUTHOR is not None:
+                        AUTHOR.author_curve_mapping_edited(obj, parameter, curve_mapping_keys(node))
+                        node[CURVE_MAPPING_SIGNATURE] = curve_mapping_signature(node)
                 except (ValueError, KeyError, ReferenceError):
                     continue
-            else:
-                schedule_group_preview(obj)
-        elif not previous:
-            obj[CURVE_PREVIEW_SIGNATURE] = signature
+            elif not previous:
+                node[CURVE_MAPPING_SIGNATURE] = signature
     return .2 if tracked else None
 
 
@@ -1088,6 +1346,8 @@ def rebuild_existing_native():
     owners = [obj for obj in bpy.data.objects if is_native(obj)]
     for obj in owners:
         try:
+            if obj.eiem_physics.kind == "NATIVE_GROUP" and is_parameter_group(obj):
+                build_curve_mappings(obj)
             rebuild(obj)
         except (ValueError, KeyError, ReferenceError):
             continue
@@ -1141,6 +1401,38 @@ def angle_stiffness_set(self, value):
     set_native_number(self.id_data, ANGLE_STIFFNESS_FIELD, value)
 
 
+def active_curve_parameter(state):
+    try:
+        index = min(max(int(state.active_curve), 0), len(CURVE_PARAMETERS) - 1)
+    except (TypeError, ValueError):
+        index = 0
+    return CURVE_PARAMETERS[index][0]
+
+
+def curve_enabled_get(self):
+    return bool(native_number(self.id_data, active_curve_parameter(self) + ".useCurve"))
+
+
+def curve_enabled_set(self, value):
+    set_native_number(self.id_data, active_curve_parameter(self) + ".useCurve", bool(value))
+
+
+def context_enabled_path(state):
+    return next((path for path, label in CURVE_CONTEXT_FIELDS.get(active_curve_parameter(state), ())
+                 if path.rsplit(".", 1)[-1].startswith("use")), "")
+
+
+def context_enabled_get(self):
+    path = context_enabled_path(self)
+    return bool(native_number(self.id_data, path)) if path else False
+
+
+def context_enabled_set(self, value):
+    path = context_enabled_path(self)
+    if path:
+        set_native_number(self.id_data, path, bool(value))
+
+
 class EIEM_PG_native_field(bpy.types.PropertyGroup):
     path: StringProperty()
     label: StringProperty()
@@ -1154,8 +1446,10 @@ class EIEM_PG_native_physics(bpy.types.PropertyGroup):
     source_text: PointerProperty(type=bpy.types.Text)
     source_key: StringProperty()
     fields: CollectionProperty(type=EIEM_PG_native_field)
+    curve_mapping_tree: PointerProperty(type=bpy.types.NodeTree, options={"HIDDEN"})
+    active_curve: EnumProperty(name="变化参数", items=CURVE_PARAMETER_ITEMS, default="0")
     search: StringProperty(name="筛选参数", description="参数名称，例如 gravity、damping、curve")
-    show_parameters: BoolProperty(name="高级源字段", default=False)
+    show_parameters: BoolProperty(name="源数据检查（只读）", default=False)
     parameter_page: IntProperty(name="页", default=0, min=0)
     ready: BoolProperty(default=False, options={"HIDDEN"})
     disabled: BoolProperty(name="显式禁用此源组件", default=False)
@@ -1168,6 +1462,12 @@ class EIEM_PG_native_physics(bpy.types.PropertyGroup):
     angle_limit_stiffness: FloatProperty(
         name="限制刚度", description="原生角度限制求解的刚度",
         min=0.0, max=1.0, get=angle_stiffness_get, set=angle_stiffness_set)
+    curve_enabled: BoolProperty(
+        name="使用位置曲线", description="让当前参数按根部到末端的曲线倍率变化",
+        get=curve_enabled_get, set=curve_enabled_set)
+    context_enabled: BoolProperty(
+        name="启用约束", description="启用当前曲线所属的原生约束",
+        get=context_enabled_get, set=context_enabled_set)
 
 
 def mapped_parameters(obj):
@@ -1300,43 +1600,6 @@ def preview_style_updated(self, context):
     apply_visibility(context.scene)
 
 
-class EIEM_OT_native_curves(bpy.types.Operator):
-    bl_idname = "eiem.native_physics_curves"
-    bl_label = "编辑 Blender 物理曲线"
-    bl_options = {"REGISTER", "UNDO"}
-    action: StringProperty()
-
-    def execute(self, context):
-        try:
-            obj = context.object if is_parameter_group(context.object) else AUTHOR.group_of(context)
-            source.require(is_parameter_group(obj), "请选择含完整参数的物理组")
-            if self.action == "REFRESH":
-                build_curve_projection(obj)
-                self.report({"INFO"}, "已从源数据重建 9 条 Blender 曲线")
-                return {"FINISHED"}
-            source.require(self.action == "OPEN", "未知曲线操作")
-            action = obj.animation_data.action if obj.animation_data else None
-            if not action or action.get(CURVE_ACTION_MARKER) != obj.eiem_native_physics.source_key:
-                build_curve_projection(obj)
-            if context.mode != "OBJECT":
-                bpy.ops.object.mode_set(mode="OBJECT")
-            for selected in context.selected_objects:
-                selected.select_set(False)
-            obj.hide_set(False); obj.select_set(True); context.view_layer.objects.active = obj
-            context.area.type = "GRAPH_EDITOR"
-            space = context.area.spaces.active
-            if hasattr(space, "dopesheet"):
-                space.dopesheet.show_only_selected = True
-            region = next((item for item in context.area.regions if item.type == "WINDOW"), None)
-            if region:
-                with context.temp_override(area=context.area, region=region):
-                    bpy.ops.graph.view_all()
-            self.report({"INFO"}, "横轴 0–100 是根到末端；纵轴是参数倍率；静音表示未启用")
-            return {"FINISHED"}
-        except Exception as error:
-            self.report({"ERROR"}, str(error)); return {"CANCELLED"}
-
-
 class EIEM_OT_native_parameter_page(bpy.types.Operator):
     bl_idname = "eiem.native_physics_parameter_page"
     bl_label = "切换原生参数页"
@@ -1417,7 +1680,7 @@ def import_source(filename, rig=None):
         source.require(expected <= {n[0] for n in skeleton["nodes"]}, "Physics 的 Skeleton 依赖缺少源节点")
     existing = {o.eiem_native_physics.source_key for o in bpy.data.objects if is_native(o) and o.eiem_physics.rig == rig}
     source.require(not existing.intersection(c["source"] for c in payload["components"]), "当前 Rig 已有这些物理组件")
-    kinds = ("objects", "curves", "meshes", "armatures", "collections", "texts", "materials")
+    kinds = ("objects", "curves", "meshes", "armatures", "collections", "texts", "materials", "node_groups")
     before = {kind: set(getattr(bpy.data, kind)) for kind in kinds}
     old_group = bpy.context.scene.eiem_physics_group
     bone_ids = {b.name: b.get("eiem_physics_id") for b in rig.data.bones} if rig else {}
@@ -1460,7 +1723,10 @@ def import_source(filename, rig=None):
                 item.original = source.dumps(value); item.floating = primitive in ("float", "double") or type(value) is float
                 if item.floating: item.value = value
                 else: item.integer = str(int(value))
-            p.ready = True; rebuild(obj); made.append(obj)
+            p.ready = True
+            if kind == "NATIVE_GROUP":
+                build_curve_mappings(obj)
+            rebuild(obj); made.append(obj)
         groups = [o for o in made if o.eiem_physics.kind == "NATIVE_GROUP"]
         colliders = {o.eiem_native_physics.source_key: o for o in made
                      if o.eiem_physics.kind == "NATIVE_COLLIDER"}
@@ -1497,6 +1763,8 @@ def export_source(filename, objects):
     source.require(filename.suffix == ".physics", "输出文件必须为 .physics")
     source.require(all(Path(o["eiem_physics_source_file"]).resolve() != filename for o in objects), "请选择新文件，不覆盖源包")
     for obj in objects:
+        if obj.eiem_physics.kind == "NATIVE_GROUP":
+            build_curve_mappings(obj)
         action = obj.animation_data.action if obj.animation_data else None
         if obj.eiem_physics.kind == "NATIVE_GROUP" and action and \
                 action.get(CURVE_ACTION_MARKER) == obj.eiem_native_physics.source_key and \
@@ -1565,30 +1833,48 @@ class EIEM_OT_native_select(bpy.types.Operator):
 
 
 def draw_group_parameter_controls(layout, obj):
-    """Use one editor for imported and newly-authored BoneCloth parameters."""
+    """Draw the one supported day-to-day editor in a fixed order."""
     p = obj.eiem_native_physics
     common = {field.label: field for field in p.fields}
-    box = layout.box(); box.label(text="常用物理参数（直接写回此物理组）", icon="PREFERENCES")
+    box = layout.box(); box.label(text="物理组参数", icon="PREFERENCES")
     for key, label in COMMON_PARAMETERS:
         field = common.get(key)
         if field:
             API["draw_eiem_rna_property"](
                 box, field, "value" if field.floating else "integer", label, factor=.42)
-    angle_box = layout.box(); angle_box.label(text="角度限制", icon="MESH_CONE")
-    angle_box.prop(p, "angle_limit_enabled")
-    if p.angle_limit_enabled:
-        angle_box.prop(p, "angle_limit_base")
-        angle_box.prop(p, "angle_limit_stiffness")
-        angle_box.label(text="黄色锥体：各可动骨段相对静止基准边的允许方向", icon="INFO")
-        angle_box.label(text="每段按根到该点的累计长度，从本组角度曲线取倍率")
+
+    curve_box = layout.box(); curve_box.label(text="沿骨链位置变化", icon="FCURVE")
+    curve_box.prop(p, "active_curve", text="参数")
+    index = min(max(int(p.active_curve), 0), len(CURVE_PARAMETERS) - 1)
+    parameter, label = CURVE_PARAMETERS[index]
+    base = common.get(parameter + ".value")
+    enabled = common.get(parameter + ".useCurve")
+    if base:
+        API["draw_eiem_rna_property"](
+            curve_box, base, "value" if base.floating else "integer", "基础值", factor=.42)
+    if enabled:
+        curve_box.prop(p, "curve_enabled")
+    for path, extra_label in CURVE_CONTEXT_FIELDS.get(parameter, ()):
+        field = common.get(path)
+        if field:
+            if path.rsplit(".", 1)[-1].startswith("use"):
+                curve_box.prop(p, "context_enabled", text=extra_label)
+            else:
+                API["draw_eiem_rna_property"](
+                    curve_box, field, "value" if field.floating else "integer", extra_label, factor=.42)
+    node = curve_mapping_node(obj, parameter)
+    if node is not None:
+        column = curve_box.column()
+        column.enabled = bool(p.curve_enabled) if enabled else True
+        column.template_curve_mapping(node, "mapping", type="NONE", use_negative_slope=True)
+        curve_box.label(text="横轴：根部 0 → 末端 1　纵轴：基础值倍率")
+    else:
+        curve_box.label(text="曲线数据尚未建立，请重新选择此物理组", icon="ERROR")
+    if parameter == ANGLE_CURVE_PARAMETER and bool(native_number(obj, ANGLE_ENABLED_FIELD)):
+        curve_box.label(text="黄色锥体显示每段当前允许角度", icon="MESH_CONE")
         preview = str(obj.get("eiem_physics_angle_preview", ""))
         if preview.startswith("error:"):
-            angle_box.label(text=preview[6:], icon="ERROR")
-    graph_box = layout.box(); graph_box.label(text="Blender 曲线编辑器", icon="FCURVE")
-    graph_box.label(text="横轴 0–100：累计长度 / 本组最长链 · 纵轴：倍率")
-    graph_box.label(text="曲线静音只表示该项不使用曲线，不代表角度限制已关闭")
-    operator = graph_box.operator("eiem.native_physics_curves", text="查看 / 编辑 9 条曲线", icon="GRAPH")
-    operator.action = "OPEN"
+            curve_box.label(text=preview[6:], icon="ERROR")
 
 
 def draw_parameter_fields(layout, obj, source_type, allow_refresh=False, include_disabled=False):
@@ -1597,16 +1883,12 @@ def draw_parameter_fields(layout, obj, source_type, allow_refresh=False, include
     if not p.show_parameters:
         return
     layout.label(text="源类型：" + source_type)
-    if include_disabled:
-        layout.prop(p, "disabled")
-    if allow_refresh:
-        operator = layout.operator(
-            "eiem.native_physics_curves", text="从参数字段重建 9 条 Blender 曲线", icon="FILE_REFRESH")
-        operator.action = "REFRESH"
+    layout.label(text="复制/粘贴会一次填充这些保留值；日常无需逐项输入", icon="INFO")
     layout.prop(p, "search", icon="VIEWZOOM")
     search = p.search.casefold()
-    fields = [field for field in p.fields if search in field.label.casefold() or
-              search in friendly_field_label(field.label).casefold()]
+    fields = sorted((field for field in p.fields if search in field.label.casefold() or
+                     search in friendly_field_label(field.label).casefold()),
+                    key=lambda field: natural_path_key(field.label))
     pages = max(1, (len(fields) + PARAMETER_PAGE_SIZE - 1) // PARAMETER_PAGE_SIZE)
     page = min(p.parameter_page, pages - 1)
     row = layout.row(align=True)
@@ -1616,8 +1898,12 @@ def draw_parameter_fields(layout, obj, source_type, allow_refresh=False, include
     following = row.operator("eiem.native_physics_parameter_page", text="", icon="TRIA_RIGHT")
     following.delta = 1
     for field in fields[page * PARAMETER_PAGE_SIZE:(page + 1) * PARAMETER_PAGE_SIZE]:
-        API["draw_eiem_rna_property"](
-            layout, field, "value" if field.floating else "integer", friendly_field_label(field.label))
+        row = layout.row(align=True)
+        row.label(text=friendly_field_label(field.label))
+        value = ("%.7g" % float(field.value)) if field.floating else str(field.integer)
+        trailing = row.row()
+        trailing.alignment = "RIGHT"
+        trailing.label(text=value)
 
 
 def draw(layout, context, obj):
@@ -1625,6 +1911,7 @@ def draw(layout, context, obj):
     layout.prop(obj.eiem_physics, "label")
     layout.label(text=("物理组（可包含多条骨链）" if c["type"] == "BeyondBoneCloth" else "共享碰撞体"), icon="OUTLINER_OB_EMPTY")
     layout.label(text="绑定骨骼：" + (c.get("bone") or "Prefab 根"))
+    layout.prop(p, "disabled")
     if c["type"] == "BeyondBoneCloth":
         sel = c["fields"]["serializeData2"]["selectionData"]
         value = snapshot(obj)
@@ -1685,7 +1972,7 @@ def draw(layout, context, obj):
 
 
 CLASSES = (EIEM_PG_native_field, EIEM_PG_native_physics, EIEM_OT_native_import,
-           EIEM_OT_native_select, EIEM_OT_native_curves,
+           EIEM_OT_native_select,
            EIEM_OT_native_parameter_page,
            EIEM_OT_native_focus, EIEM_OT_native_bones)
 

@@ -47,11 +47,11 @@ for cycle in range(3):
     assert bpy.ops.eiem.organize_physics.get_rna_type() is not None
     assert bpy.ops.eiem.physics_parameters.get_rna_type() is not None
     assert bpy.ops.eiem.switch_key_record.get_rna_type() is not None
-    assert bpy.ops.eiem.native_physics_curves.get_rna_type() is not None
     assert hasattr(bpy.types, "OBJECT_PT_eiem_physics")
     assert hasattr(bpy.types, "EIEM_MT_physics_create")
     assert not hasattr(bpy.types, "EIEM_MT_physics_copy")
     assert hasattr(bpy.types.Object, "eiem_physics")
+    assert hasattr(bpy.types.Object, "eiem_native_physics")
     assert hasattr(bpy.types.Scene, "eiem_physics_visibility")
     assert hasattr(bpy.types.Scene, "eiem_physics_preview_style")
     assert hasattr(bpy.types.Scene, "eiem_physics_xray")

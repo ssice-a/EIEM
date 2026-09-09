@@ -86,12 +86,14 @@ def author_group_parameter_updated(self, context):
             sync_author_radius_controls_to_native_fields(obj)
             rebuild_group(obj)
             return
-        curve = author_radius_curve(obj)
-        if curve is not None:
-            curve.mute = not bool(obj.eiem_physics.radius_use_curve)
-        if hasattr(obj, "eiem_native_physics") and obj.eiem_native_physics.ready and \
-                len(obj.eiem_native_physics.fields):
-            sync_author_direct_fields(obj)
+        try:
+            radius = json.loads(obj.eiem_physics.radius_curve_snapshot)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            radius = document.default_radius()
+        radius["value"] = float(obj.eiem_physics.node_radius)
+        radius["useCurve"] = bool(obj.eiem_physics.radius_use_curve)
+        obj.eiem_physics.radius_curve_snapshot = json.dumps(
+            radius, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
         rebuild_group(obj)
 
 
@@ -175,12 +177,34 @@ def author_curve_keys(obj):
 
 
 def author_radius_record(obj):
-    action = obj.animation_data.action if obj and obj.animation_data else None
-    if native.is_parameter_group(obj) and action and \
-            action.get(native.CURVE_ACTION_MARKER) == obj.eiem_native_physics.source_key:
-        if action.get(native.CURVE_ACTION_SIGNATURE, "") != native.curve_projection_signature(obj):
+    node = native.curve_mapping_node(obj, native.NODE_RADIUS_PARAMETER)
+    if node is not None and str(node.get(native.CURVE_MAPPING_SIGNATURE, "")) != \
+            native.curve_mapping_signature(node):
+        if native.is_parameter_group(obj):
+            native.apply_curve_mapping(obj, native.NODE_RADIUS_PARAMETER)
+        else:
+            author_curve_mapping_edited(obj, native.NODE_RADIUS_PARAMETER,
+                                        native.curve_mapping_keys(node))
+            node[native.CURVE_MAPPING_SIGNATURE] = native.curve_mapping_signature(node)
+    if native.is_parameter_group(obj):
+        action = obj.animation_data.action if obj and obj.animation_data else None
+        if action and action.get(native.CURVE_ACTION_MARKER) == obj.eiem_native_physics.source_key and \
+                action.get(native.CURVE_ACTION_SIGNATURE, "") != native.curve_projection_signature(obj):
             native.apply_curve_projection(obj)
         return native.mapped_radius(obj)
+
+    saved = obj.eiem_physics.radius_curve_snapshot
+    if saved:
+        try:
+            result = json.loads(saved)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError("Physics: 节点半径曲线数据损坏")
+        result["value"] = float(obj.eiem_physics.node_radius)
+        result["useCurve"] = bool(obj.eiem_physics.radius_use_curve)
+        return result
+
+    # Compatibility path for .blend files authored before the inline curve UI.
+    action = obj.animation_data.action if obj and obj.animation_data else None
     curve = author_radius_curve(obj)
     result = document.default_radius()
     result["value"] = float(obj.eiem_physics.node_radius)
@@ -198,95 +222,48 @@ def author_radius_record(obj):
 
 
 def load_author_radius(obj, radius):
-    """Create the editable Blender F-Curve that is the author radius source."""
+    """Load the author radius into the private inline Float Curve."""
     action = obj.animation_data.action if obj.animation_data else None
-    if action and hasattr(obj, "eiem_native_physics") and \
-            action.get(native.CURVE_ACTION_MARKER) == obj.eiem_native_physics.source_key:
+    if action is not None:
+        owned = (action.get(AUTHOR_CURVE_ACTION_MARKER) == obj.eiem_physics.identity or
+                 hasattr(obj, "eiem_native_physics") and
+                 action.get(native.CURVE_ACTION_MARKER) == obj.eiem_native_physics.source_key)
+        document.require(owned, "该物理组已有非 EIEM 动画，请先移除或转移该 Action")
         native.remove_curve_projection(obj)
         obj.animation_data_clear()
-        action = None
-    document.require(action is None or action.get(AUTHOR_CURVE_ACTION_MARKER) == obj.eiem_physics.identity,
-                     "该物理组已有非 EIEM 动画，请先移除或转移该 Action")
-    obj.eiem_physics.node_radius = float(radius["value"])
-    obj.eiem_physics.radius_use_curve = bool(radius["useCurve"])
-    path = native.property_data_path(AUTHOR_RADIUS_PROPERTY)
-    curves = native.action_fcurves(obj)
-    if curves is not None:
-        for curve in list(curves):
-            if curve.data_path == path:
-                curves.remove(curve)
-    obj[AUTHOR_RADIUS_PROPERTY] = float(radius["keys"][0]["value"])
+    if AUTHOR_RADIUS_PROPERTY in obj:
+        del obj[AUTHOR_RADIUS_PROPERTY]
+    state = obj.eiem_native_physics if hasattr(obj, "eiem_native_physics") else None
+    previous_ready = bool(state.ready) if state else False
+    if state:
+        state.ready = False
     try:
-        obj.id_properties_ui(AUTHOR_RADIUS_PROPERTY).update(
-            description="节点半径倍率；横轴 0–100 对应物理链根部到末端")
-    except (AttributeError, TypeError):
-        pass
-    for key in radius["keys"]:
-        obj[AUTHOR_RADIUS_PROPERTY] = float(key["value"])
-        obj.keyframe_insert(data_path=path, frame=float(key["time"]) * native.CURVE_FRAME_SCALE,
-                            group="EIEM 物理参数曲线")
-    action = obj.animation_data.action
-    action[AUTHOR_CURVE_ACTION_MARKER] = obj.eiem_physics.identity
-    action.name = "EIEM 节点半径 " + obj.eiem_physics.label
-    curve = native.find_action_curve(obj, path)
-    document.require(curve is not None, "Blender 未建立节点半径曲线")
-    curve.mute = not bool(radius["useCurve"])
-    curve.color_mode = "CUSTOM"; curve.color = native.COLORS["MOVE"][:3]
-    keys = radius["keys"]
-    points = sorted(curve.keyframe_points, key=lambda item: item.co.x)
-    document.require(len(points) == len(keys), "Blender 节点半径关键帧数量不一致")
-    for index, (point, key) in enumerate(zip(points, keys)):
-        left_interval = (keys[index]["time"] - keys[index - 1]["time"] if index else
-                         keys[1]["time"] - keys[0]["time"])
-        right_interval = (keys[index + 1]["time"] - keys[index]["time"]
-                          if index + 1 < len(keys) else left_interval)
-        left_span = left_interval * (key["inWeight"] if int(key["weightedMode"]) & 1 else 1 / 3)
-        right_span = right_interval * (key["outWeight"] if int(key["weightedMode"]) & 2 else 1 / 3)
-        point.interpolation = "BEZIER"
-        point.handle_left_type = "FREE"; point.handle_right_type = "FREE"
-        point.handle_left = ((key["time"] - left_span) * native.CURVE_FRAME_SCALE,
-                             key["value"] - key["inSlope"] * left_span)
-        point.handle_right = ((key["time"] + right_span) * native.CURVE_FRAME_SCALE,
-                              key["value"] + key["outSlope"] * right_span)
-    curve.update()
-    action[AUTHOR_CURVE_METADATA] = json.dumps({
-        "keys": radius["keys"],
-        "weightedModes": [int(key["weightedMode"]) for key in radius["keys"]],
-        "preInfinity": int(radius.get("preInfinity", 2)),
-        "postInfinity": int(radius.get("postInfinity", 2)),
-        "rotationOrder": int(radius.get("rotationOrder", 4)),
-        "geometrySignature": author_curve_geometry_signature(curve)}, separators=(",", ":"))
-    obj[AUTHOR_CURVE_SIGNATURE] = author_curve_signature(obj)
-    ensure_author_curve_timer()
-    return curve
+        obj.eiem_physics.node_radius = float(radius["value"])
+        obj.eiem_physics.radius_use_curve = bool(radius["useCurve"])
+        obj.eiem_physics.radius_curve_snapshot = json.dumps(
+            radius, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        node = native.load_curve_mapping(obj, native.NODE_RADIUS_PARAMETER, radius["keys"])
+    finally:
+        if state:
+            state.ready = previous_ready
+    native.ensure_curve_preview_timer()
+    return node
 
 
-def poll_author_curve_previews():
-    tracked = False
-    groups = [obj for obj in getattr(bpy.data, "objects", ())
-              if hasattr(obj, "eiem_physics") and obj.eiem_physics.kind == "GROUP"]
-    for obj in groups:
-        if not hasattr(obj, "eiem_physics") or obj.eiem_physics.kind != "GROUP":
-            continue
-        # Complete templates use native.poll_curve_previews for all nine curves.
-        if native.is_parameter_group(obj):
-            continue
-        curve = author_radius_curve(obj)
-        if curve is None:
-            continue
-        tracked = True
-        signature = author_curve_signature(obj)
-        if str(obj.get(AUTHOR_CURVE_SIGNATURE, "")) != signature:
-            obj[AUTHOR_CURVE_SIGNATURE] = signature
-            if hasattr(obj, "eiem_native_physics") and len(obj.eiem_native_physics.fields):
-                sync_author_direct_fields(obj, include_radius=True)
-            rebuild_group(obj)
-    return .2 if tracked else None
-
-
-def ensure_author_curve_timer():
-    if not bpy.app.timers.is_registered(poll_author_curve_previews):
-        bpy.app.timers.register(poll_author_curve_previews, first_interval=.2)
+def author_curve_mapping_edited(obj, parameter, keys):
+    """Commit an inline curve for a minimal author group."""
+    document.require(parameter == native.NODE_RADIUS_PARAMETER and
+                     obj.eiem_physics.kind == "GROUP", "作者组不支持此曲线")
+    try:
+        radius = json.loads(obj.eiem_physics.radius_curve_snapshot)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        radius = document.default_radius()
+    radius["value"] = float(obj.eiem_physics.node_radius)
+    radius["useCurve"] = bool(obj.eiem_physics.radius_use_curve)
+    radius["keys"] = keys
+    obj.eiem_physics.radius_curve_snapshot = json.dumps(
+        radius, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    rebuild_group(obj)
 
 
 def rebuild_existing_author_groups():
@@ -301,15 +278,16 @@ def rebuild_existing_author_groups():
               if hasattr(obj, "eiem_physics") and obj.eiem_physics.kind == "GROUP"]
     for obj in groups:
         found = True
-        action = obj.animation_data.action if obj.animation_data else None
-        if author_radius_curve(obj) is None and action is None:
-            load_author_radius(obj, document.default_radius())
+        if native.curve_mapping_node(obj, native.NODE_RADIUS_PARAMETER) is None:
+            radius = author_radius_record(obj) if author_radius_curve(obj) is not None or \
+                native.is_parameter_group(obj) else document.default_radius()
+            load_author_radius(obj, radius)
         ensure_author_native_fields(obj)
         if native.is_parameter_group(obj):
             activate_author_full_projection(obj)
         rebuild_group(obj)
     if found:
-        ensure_author_curve_timer()
+        native.ensure_curve_preview_timer()
     return None
 
 
@@ -455,14 +433,15 @@ def rebuild_group(obj):
             distances[bone.name] = value
             return value
         maximum = max((distance(bone) for bone, role in nodes if role == "MOVE"), default=0.0)
-        curve = author_radius_curve(obj)
-        use_curve = curve is not None and not curve.mute
+        curve_node = native.curve_mapping_node(obj, native.NODE_RADIUS_PARAMETER)
+        use_curve = bool(obj.eiem_physics.radius_use_curve) and curve_node is not None
         samples = {role: [] for role in ("FIXED", "MOVE")}
         ignored = []
         for index, (bone, role) in enumerate(nodes):
             depth = distance(bone) / maximum if maximum > 1e-9 else 0.0
             if role in samples:
-                multiplier = float(curve.evaluate(depth * native.CURVE_FRAME_SCALE)) if use_curve else 1.0
+                multiplier = (float(curve_node.mapping.evaluate(curve_node.mapping.curves[0], depth))
+                              if use_curve else 1.0)
                 samples[role].append((index, tuple(bone.head_local),
                                       max(0.0, obj.eiem_physics.node_radius * multiplier), depth))
             else:
@@ -480,7 +459,6 @@ def rebuild_group(obj):
         if native.is_parameter_group(obj):
             action = obj.animation_data.action if obj.animation_data else None
             if action and action.get(native.CURVE_ACTION_MARKER) == obj.eiem_native_physics.source_key:
-                obj[native.CURVE_PREVIEW_SIGNATURE] = native.curve_preview_signature(obj)
                 native.ensure_curve_preview_timer()
             if bool(native.native_number(obj, native.ANGLE_ENABLED_FIELD)):
                 cones = []
@@ -745,18 +723,14 @@ def clear_author_parameter_action(obj):
 
 
 def activate_author_full_projection(obj):
-    """Give a pasted author group the same nine Blender curves as its source group."""
+    """Give a pasted author group the same nine inline curves as its source group."""
     if not native.is_parameter_group(obj):
         return None
-    action = obj.animation_data.action if obj.animation_data else None
-    if action and action.get(native.CURVE_ACTION_MARKER) == obj.eiem_native_physics.source_key:
-        native.ensure_curve_preview_timer()
-        return action
     sync_author_direct_fields(obj, include_radius=True)
     clear_author_parameter_action(obj)
-    action = native.build_curve_projection(obj)
+    tree = native.build_curve_mappings(obj)
     native.ensure_curve_preview_timer()
-    return action
+    return tree
 
 
 def sync_author_controls_from_native_fields(obj):
@@ -790,11 +764,6 @@ def sync_author_radius_controls_to_native_fields(obj):
                          "完整参数缺少节点半径字段")
         base.value = float(obj.eiem_physics.node_radius)
         enabled.integer = "1" if obj.eiem_physics.radius_use_curve else "0"
-        curve = author_radius_curve(obj)
-        if curve is not None:
-            curve.mute = not bool(obj.eiem_physics.radius_use_curve)
-            action = obj.animation_data.action
-            action[native.CURVE_ACTION_SIGNATURE] = native.curve_projection_signature(obj)
         persist_author_native_fields(obj)
     finally:
         p.ready = True
@@ -819,10 +788,7 @@ def author_native_field_edited(obj, field):
         if field.label in direct and field.floating:
             setattr(obj.eiem_physics, direct[field.label], float(field.value))
         if curve_parameter is not None:
-            # Recreate the projected Action from the source-compatible field
-            # table. This keeps all nine curves and their custom properties in
-            # the same shape as an imported native group.
-            native.build_curve_projection(obj)
+            native.build_curve_mappings(obj)
         if changes_radius:
             radius = native.mapped_radius(obj)
             obj.eiem_physics.node_radius = float(radius["value"])
@@ -878,6 +844,7 @@ def _parameter_clipboard_payload(obj):
     document.require(obj and obj.eiem_physics.kind in ("GROUP", "NATIVE_GROUP"),
                      "请选择要复制参数的物理组")
     if native.is_native(obj):
+        native.build_curve_mappings(obj)
         action = obj.animation_data.action if obj.animation_data else None
         if action and action.get(native.CURVE_ACTION_MARKER) == obj.eiem_native_physics.source_key:
             native.apply_curve_projection(obj)
@@ -1089,7 +1056,7 @@ def paste_group_parameters(scene, obj):
         raise
     finally:
         target.ready = True
-    native.build_curve_projection(obj)
+    native.build_curve_mappings(obj)
     native.rebuild(obj)
     return len(wanted)
 
@@ -1434,40 +1401,13 @@ class EIEM_PG_physics(bpy.types.PropertyGroup):
     radius_use_curve: bpy.props.BoolProperty(
         name="使用半径曲线", description="按根部到末端的归一化链位置改变每个模拟点半径",
         default=True, update=author_group_parameter_updated)
+    radius_curve_snapshot: StringProperty(
+        name="节点半径曲线数据", options={"HIDDEN"},
+        description="内嵌浮点曲线的无损作者数据；界面只显示当前曲线")
     native_parameter_snapshot: StringProperty(
         name="完整原生参数快照", options={"HIDDEN"},
         description="由复制/粘贴保存的完整原生数值与曲线字段；不包含根骨、碰撞体引用或 SelectionData")
     show_structure: bpy.props.BoolProperty(name="结构编辑", default=False)
-
-
-class EIEM_OT_author_radius_curve(bpy.types.Operator):
-    bl_idname = "eiem.author_radius_curve"
-    bl_label = "查看节点半径曲线"
-    bl_options = {"REGISTER", "UNDO"}
-
-    def execute(self, context):
-        try:
-            obj = context.object if context.object and context.object.eiem_physics.kind == "GROUP" else group_of(context)
-            document.require(obj and obj.eiem_physics.kind == "GROUP", "请选择新增物理组")
-            if author_radius_curve(obj) is None:
-                load_author_radius(obj, document.default_radius())
-            if context.mode != "OBJECT":
-                bpy.ops.object.mode_set(mode="OBJECT")
-            for selected in context.selected_objects:
-                selected.select_set(False)
-            obj.hide_set(False); obj.select_set(True); context.view_layer.objects.active = obj
-            context.area.type = "GRAPH_EDITOR"
-            space = context.area.spaces.active
-            if hasattr(space, "dopesheet"):
-                space.dopesheet.show_only_selected = True
-            region = next((item for item in context.area.regions if item.type == "WINDOW"), None)
-            if region:
-                with context.temp_override(area=context.area, region=region):
-                    bpy.ops.graph.view_all()
-            self.report({"INFO"}, "横轴 0–100 是根部到末端；纵轴乘以节点基础半径")
-            return {"FINISHED"}
-        except Exception as error:
-            self.report({"ERROR"}, str(error)); return {"CANCELLED"}
 
 
 class EIEM_OT_physics_edit(bpy.types.Operator):
@@ -1794,12 +1734,17 @@ class EIEM_PT_physics_object(bpy.types.Panel):
                 native.draw_group_parameter_controls(layout, obj)
             else:
                 parameter_box = layout.box(); parameter_box.label(text="整组共享参数", icon="PREFERENCES")
-                for key in document.PARAMETERS:
-                    parameter_box.prop(data, key)
+                for path, label in native.COMMON_PARAMETERS:
+                    parameter_box.prop(data, path.rsplit(".", 1)[-1], text=label)
                 radius_box = layout.box(); radius_box.label(text="模拟点碰撞半径", icon="MESH_UVSPHERE")
                 radius_box.prop(data, "node_radius")
                 radius_box.prop(data, "radius_use_curve")
-                radius_box.operator("eiem.author_radius_curve", text="在曲线编辑器查看", icon="FCURVE")
+                node = native.curve_mapping_node(obj, native.NODE_RADIUS_PARAMETER)
+                if node is not None:
+                    column = radius_box.column()
+                    column.enabled = bool(data.radius_use_curve)
+                    column.template_curve_mapping(node, "mapping", type="NONE", use_negative_slope=True)
+                    radius_box.label(text="横轴：根部 0 → 末端 1　纵轴：基础半径倍率")
             lookup = {str(b.get("eiem_physics_id")): b for b in data.rig.data.bones
                       if b.get("eiem_physics_id")} if data.rig else {}
             names = [lookup[node.bone_id].name if node.bone_id in lookup else "骨骼已删除"
@@ -1862,7 +1807,7 @@ class EIEM_OT_physics_organize(bpy.types.Operator):
 
 
 CLASSES = (EIEM_PG_physics_node, EIEM_PG_physics_reference, EIEM_PG_physics,
-           EIEM_OT_author_radius_curve, EIEM_OT_physics_edit, EIEM_OT_physics_parameters,
+           EIEM_OT_physics_edit, EIEM_OT_physics_parameters,
            EIEM_OT_physics_export, EIEM_OT_physics_import,
            EIEM_OT_physics_organize, EIEM_MT_physics_create,
            EIEM_PT_physics, EIEM_PT_physics_object)
@@ -1896,8 +1841,6 @@ def unregister():
         bpy.app.timers.unregister(flush_armature_visuals)
     if bpy.app.timers.is_registered(rebuild_existing_author_groups):
         bpy.app.timers.unregister(rebuild_existing_author_groups)
-    if bpy.app.timers.is_registered(poll_author_curve_previews):
-        bpy.app.timers.unregister(poll_author_curve_previews)
     _DIRTY_ARMATURES.clear()
     native.unregister()
     del bpy.types.Scene.eiem_physics_parameter_clipboard
