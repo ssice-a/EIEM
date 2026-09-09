@@ -1,25 +1,35 @@
 # EIEM 领域模型
 
-当前规范：[模型替换设计](docs/model-replacement-design.md)。
-按键与条件：[语法及生命周期](docs/conditional-keys.md)；全局配置固定为 `plugin/eiem.ini`。
-Blender 作者流程：[网格切换组与自动导出](docs/blender-switches.md)。
-形态键控制：[资源、实例权重与 ImGui 绑定](docs/shape-controls.md)。
-独立 Mod UI：[Lua、窗口与变量接口](docs/lua-ui.md)。
-顶点数据与证据边界：[顶点数据契约](docs/vertex-data-contract.md)；原生解码不等于统一重算。
-已有资产先正确解码并保留源切线；仅新增几何可由最终法线和 UV0 生成切线，不能冒充原生数据。
-115/120 切线缺失是修复前调查，后续修复证据与游戏验收边界见该契约，不重复当作当前故障。
-相机反虚化：[CameraMono 调用契约与验证边界](docs/camera-fade.md)；与 mesh/skip 分开，不使用逐 Renderer 恢复表。
-实验历史在 `docs/archive/`，不能把旧实验里的“当前方案”当作现行设计。
+现行文档、工作区状态和阅读顺序：[文档索引](docs/README.md)。
+历史实验及部署记录统一放在 `docs/archive/`，不作为当前实现说明。
 
-- **Resource（资源）**：离线 Mesh、Material、Texture、Skeleton 文件及其声明；与渲染实例分开。
-- **Render action（渲染操作）**：选择原 Mesh 的消费者并组织 mesh、material、skip、partner；是动作，不是资源文件。
-- **Model instance（模型实例）**：游戏中实际存在的模型根；拥有独立 Transform、骨架、Renderer 和生命周期。
-- **Prefab（PFB）**：原游戏序列化对象图；运行时提供可选作用域和实例来源，不替代 Mesh 资源身份。
-- **Partner**：通过独立 Render 模板显式创建的额外 Renderer，归源模型实例所有。
-- **Mod program**：解析后的资源声明、Render 动作及预计算的作用域索引；不包含 Unity 对象。
-- **Update request**：Reconcile 重试、Reapply 状态重应用、Reload 磁盘重载；只在 Unity 线程修改运行时对象。
+## 核心对象
 
-原则：一个资源的所有匹配消费者都应受规则影响；mesh、skip 和 partner 相互独立。
-同名 Mesh 不自动证明同一逻辑文件。不能用吞错、缺省骨骼索引或猜测 PFB 名称掩盖未知情况。
+- **Resource（资源）**：离线 Mesh、Material、Texture、Skeleton 及 Physics 作者数据；与实例状态分开。
+- **Render action（渲染操作）**：命中原 Mesh 消费者，组织 mesh、material、skip、partner、skeleton 等动作。
+- **Model instance（模型实例）**：游戏中的模型根，拥有独立 Transform、骨架、Renderer 和生命周期。
+- **Observed instance（已观察实例）**：生命周期入口发现的模型弱引用，独立于 Mod 开关，F10 用于重新匹配。
+- **Prefab（PFB）**：原游戏序列化对象图，提供资源关系和实例来源；不限制 Render 的 Mesh 消费者范围，也不替代 Mesh 资源身份。
+- **Partner**：通过独立 Render 模板创建的额外 Renderer，归源模型实例所有。
+- **Mod program**：解析后的资源声明、Render 动作和关系索引，不包含 Unity 对象。
+- **Update request**：Reconcile 重试、Reapply 状态重应用、Reload 磁盘重载；只在 Unity 线程修改对象。
 
-本仓库审查记录使用 `docs/architecture-review-v1.md`，本轮未创建远端 Issue 或修改项目管理配置。
+## 现行约束
+
+- 一个资源的所有匹配消费者均受规则影响；mesh、skip 和 partner 各自有明确语义。
+- NPC 可直接构造 Renderer 而不经过 PFB/模型根及 Unity `sharedMesh` setter；这类实例在游戏的
+  `RendererInfo._Init` 完成干净源材质采样后进入同一个 Mesh 身份执行器。
+- 同名 Mesh 不证明来源相同；不能以缺省骨骼索引、猜测 PFB 名称或吞错掩盖缺失依赖。
+- Blender 只导出显式选择的网格。对象相机关表示游戏隐藏；眼睛/显示器只影响编辑预览。
+- 源骨骼槽、bind pose 和有效顶点通道保留；新增骨骼按完整路径解析到当前实例。
+- state.ini 只保存仍声明的玩家数值，不保存动作、Unity 对象或模拟状态。
+- Mod UI 的触发、窗口和布局属于 INI/Lua；DLL 提供宿主与接口，没有默认 Mod UI 快捷键。
+- 物理使用游戏原生系统。Physics 作者文件不等于原生配置完整往返，也不等于已实现游戏模拟。
+- 骨链构建序、模拟槽、Animator 写回槽和 Mesh palette 分别映射，不能共用数字索引。
+- 函数返回、跟踪归零和无丢日志不能证明 Task/Job/动画写回已退出，组合使用也不能替代退出契约。
+- 生命周期缺少实测证据或明确 completion fence 时标记“尚未验证”；仅阻塞依赖该结论的操作，不阻塞独立的源码实现、编译、静态分析和测试。
+- 隐藏 Mesh 不等于删除物理骨骼；新增节点必须保留到消费者和原生工作不再引用它们。
+- 自动测试、构建、部署和游戏验收分别记录。源码中的版本字符串不等于已构建或已安装版本。
+
+物理接入的证据和未完成条件以标记为 authoritative 的[原生调查](docs/native-physics-investigation.md)为准，计划不作为验证结果；
+完整作者链路要求见[三端设计契约](docs/physics-authoring-design.md)。

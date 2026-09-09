@@ -23,6 +23,7 @@
 #include "eiem_camera_fade.h"
 #include "il2cpp_trace.h"
 #include "scene_dump.h"
+#include "eiem_native_physics_diagnostic.h"
 #include "model_dump.h"
 #include "update_check.h"
 
@@ -80,6 +81,7 @@ APPLEPIE_PLUGIN_EXPORT bool AP_PluginEnable() {
 
 APPLEPIE_PLUGIN_EXPORT bool AP_PluginDisable() {
   g_pluginActive = false;
+  EiemPhysicsStopTrace();
   EiemReportCameraFade();
   if (g_guiVisible) ToggleGui();
   Log("[AP] Plugin disabled by manager");

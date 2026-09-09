@@ -1,5 +1,7 @@
 # EIEM Endfield resource browser
 
+Current authoring/runtime scope: [documentation index](../docs/README.md).
+
 EIEM ships a pinned AnimeStudio fork with a direct Endfield VFS data source.
 It does not require a 53 GB decrypted `.ab` tree or a separately generated
 AssetMap.
@@ -77,6 +79,14 @@ an EIEM selector JSON and exports only the matching records. The current
 mesh-only runtime dump is name-matched; a dump containing `source`, `type`, and
 `pathId` is matched precisely.
 
+`Export Prefab as EIEM mod package` writes the editable package used by the
+Blender add-on. When the selected Prefab contains supported BeyondDynamicBone
+components, the same export also writes `physics/components.json` plus the
+original component bytes, TypeTree schemas and decoded fields under
+`physics/`. This source graph is optional authoring data and is deliberately
+absent from `mod.ini`; Blender imports it only when **Import physics bones and
+colliders** is enabled.
+
 ## Build
 
 The source is pinned under `tools\AnimeStudio`. The local release targets
@@ -88,5 +98,5 @@ dotnet build .\tools\AnimeStudio\AnimeStudio\AnimeStudio.csproj `
 dotnet publish .\tools\AnimeStudio\AnimeStudio.GUI\AnimeStudio.GUI.csproj `
   -c Release -f net9.0-windows -r win-x64 --self-contained true `
   --no-restore -p:BuildProjectReferences=false `
-  -o .\tools\AnimeStudio\dist\win-x64-vfs
+  -o .\tools\AnimeStudio\dist\win-x64-vfs-next
 ```

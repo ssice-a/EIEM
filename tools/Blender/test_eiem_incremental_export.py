@@ -64,7 +64,7 @@ target.select_set(True)
 bpy.context.view_layer.objects.active = target
 stats = addon.export_package(output_root)
 assert stats == {
-    "meshes": 1, "skeletons": 0, "materials": 1, "textures": 1,
+    "meshes": 1, "skeletons": 0, "physics": 0, "materials": 1, "textures": 1,
     "prefabs": 0,
 }, stats
 

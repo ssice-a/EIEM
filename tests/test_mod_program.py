@@ -60,13 +60,16 @@ int main(int argc, char **argv) {
                 "[RenderExtra]\nasset=Extra\n[RenderUnusedTemplate]\nmesh=MeshBody\n"
                 "[MeshBody]\npath=body.mesh\ntarget.asset=Body\n", p, error));
     EiemCompileModProgram(p);
-    CHECK(p.standaloneRules.size() == 1 && EiemModEquals(p.rules[p.standaloneRules[0]].section, "RenderMain"));
-    // Same identifier in another mod is independent, not captured by A's PFB.
+    CHECK(p.standaloneRules.size() == 2);
+    CHECK(EiemModEquals(p.rules[p.standaloneRules[0]].section, "RenderScoped"));
+    CHECK(EiemModEquals(p.rules[p.standaloneRules[1]].section, "RenderMain"));
+    // A PFB reference organizes related declarations; it does not scope Mesh
+    // consumers. Same identifiers in another mod remain independent too.
     CHECK(parse("[RenderScoped]\nasset=Other\n", p, error, "other/mod.ini"));
     EiemCompileModProgram(p);
-    CHECK(p.standaloneRules.size() == 2);
+    CHECK(p.standaloneRules.size() == 3);
     EiemCompileModProgram(p);
-    CHECK(p.standaloneRules.size() == 2); // recompilation is idempotent
+    CHECK(p.standaloneRules.size() == 3); // recompilation is idempotent
   } else if (scenario == "reload") {
     EiemModUpdateQueue queue;
     std::string order;

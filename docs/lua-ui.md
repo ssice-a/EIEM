@@ -1,4 +1,9 @@
-# Mod Lua UI（v37 / Blender 0.7）
+# Mod Lua UI
+
+现行边界：**DLL 是运行宿主，不定义 Mod UI 的打开方式、窗口数量或业务布局。**
+用户写 INI 变量/按键和 Lua 绘制；Blender 只可选地生成一个简单模板，不代表 DLL 固定界面。
+没有默认 Mod UI 快捷键。F8 只是旧模板的预填值，现已移除。
+此前答复“关闭窗口销毁变量并恢复模型”是错误描述；关闭 UI 与模型状态独立，除非用户脚本显式修改模型变量。
 
 本轮只接入独立 Mod UI、Lua 与现有变量系统；不修改用户模型、现有 Mod 配置或游戏资源替换算法。
 INSERT 仅控制插件管理面板。原来的内置 Mod 滑条标签页及 Slider 配置不再作为运行时 UI 引擎保留；
@@ -9,24 +14,34 @@ Blender 形态键作者数据保留，更新导出器重新导出为 Lua UI。
 ```ini
 [Constants]
 $size=0
+$window=0
+
+; 用户自行选择此键，F6 仅是这个例子的值，不是 DLL 默认值
+[KeyWindow]
+key=F6
+scope=both
+type=cycle
+$window=0,1
 
 [UICloth]
 path=ui.lua
-key=F8
-; 可选，使用已有变量表达式；不代表已支持视锥/可见 Mesh 探测
-condition=$size >= 0
 ```
 
-一个 UI section 对应一个可独立开关的 ImGui 窗口、一个 Lua 环境。多个 section 可共用键，
-仅条件成立的窗口响应。UI 键不能用 INSERT、不能与本 Mod 的循环按键重复；全局键冲突明确报错。
-条件变为假会关闭窗口，不会等条件恢复后自动弹出。多个窗口共用快捷键时，该键切换每个符合条件窗口自己的开关。
+一个 UI section 只声明脚本文件，对应一个隔离的 Lua 环境；脚本可以绘制零个、一个或多个窗口。
+UI 块没有 key/condition 字段，打开条件、关闭行为及多个窗口的协调全部由 Lua 决定。
+普通 Key 块更新变量，不知道变量会被 UI 还是 Render 使用。可配置 scope=game（缺省）、ui 或 both，
+决定游戏窗口、插件/Mod 窗口或两者有焦点时响应；不会在其他应用前台注册这些快捷键。
+与用户全局 gui/reload 键冲突时报告并不注册重复快捷键，不暗中改为 F8。
 没有自动轮询磁盘。默认 F10 重读 INI 与 Lua，关闭 UI 只隐藏窗口，不改变模型变量。
 相对 Lua 路径限制在 Mod 目录内；不允许绝对路径、上级目录或重解析点越出 Mod 目录。
 
 ```lua
 return function()
+    if mod.get("$window") == 0 then return end
     imgui.SetNextWindowBgAlpha(0.8)
-    if imgui.Begin("衣服") then
+    local visible, open = imgui.Begin("衣服", true)
+    if not open then mod.set("$window", 0) end
+    if visible then
         local changed, value = imgui.SliderFloat("鼓起", mod.get("$size"), 0, 1)
         if changed then mod.set("$size", value) end
     end
@@ -34,8 +49,9 @@ return function()
 end
 ```
 
-Lua 返回每帧绘制函数。窗口名与控件 ID 由宿主按 Mod/section 隔离。每 section 每帧一个根窗口，
-复杂布局用子窗口、分组、表格等；多个独立窗口用多个 section。
+Lua 返回每帧绘制函数，即使上一帧没有窗口也继续调用，以便脚本响应变量决定显示。
+常显窗口可以不声明任何 Key，也不用 `$window`。按钮、滑条、窗口之间可用 Lua 局部状态或者本 Mod 变量协调。
+窗口名与控件 ID 按 Mod/section 隔离，保留原生 `###` 稳定 ID 语义；同脚本的多个窗口使用不同名称/ID。
 绑定常用公共 ImGui 接口，保持原生名称：Begin/End、Button、Checkbox、SliderFloat/DragFloat、
 InputFloat、Text、布局、子窗口、表格、颜色/样式等。未绑定接口报错，不假装暴露完整 C++ API。
 
@@ -43,11 +59,13 @@ InputFloat、Text、布局、子窗口、表格、颜色/样式等。未绑定�
 
 参数遵循 Lua 数值/字符串传值，不传 C++ 指针。控件 label 支持原生 `##id` 隐藏 ID。
 Begin/End、BeginChild/EndChild 必须配对，即使 Begin 返回 false；BeginTable 返回 true 才 EndTable。
-根窗口默认有 × 关闭按钮；主动设置 NoTitleBar 会隐藏标题栏，此时仍可用配置快捷键关闭。
+`Begin(title)` 不显示 ×；`Begin(title, open, flags)` 显示 × 并返回新的 open，是否保存这个值由脚本决定。
+DLL 不擅自选择窗口开关的保存策略、快捷键或关闭行为；用户声明 persist 的变量由统一状态存储保存，
+脚本通过同一变量事务控制模型，不另设窗口专用的模型恢复流程。
 
 | 接口 | 参数及返回值 |
 | --- | --- |
-| `Begin` / `End` | `Begin(title, flags=0) → visible`；每 section 每帧最多一个根窗口 |
+| `Begin` / `End` | `Begin(title, open=nil, flags=0) → visible, newOpen`；多个根窗口分别配对 |
 | `BeginChild` / `EndChild` | `BeginChild(id, width=0, height=0, border=false) → visible` |
 | `Button` / `RadioButton` | `(label, width=0, height=0) → clicked` / `(label, active) → clicked` |
 | `Checkbox` | `(label, value) → changed, newValue`，value 是布尔值 |
@@ -57,7 +75,7 @@ Begin/End、BeginChild/EndChild 必须配对，即使 Begin 返回 false；Begin
 | `Text` / `SetTooltip` | `(text)`，按原样文本绘制，不解析 printf 格式 |
 | `SameLine` / `Dummy` | `(offset=0, spacing=-1)` / `(width=0, height=0)` |
 | `Separator` / `Spacing` / `NewLine` | 无参数 |
-| `SetNextWindowSize` / `SetNextWindowPos` | `(x, y)`，FirstUseEver，允许用户后续拖动/缩放 |
+| `SetNextWindowSize` / `SetNextWindowPos` | `(x, y, condition=0)`，条件由用户选择，不强制 FirstUseEver |
 | `SetNextWindowBgAlpha` / `SetNextItemWidth` | `(alpha=1)` / `(width)` |
 | `PushStyleColor` / `PopStyleColor` | `(imgui.Col.xxx, r, g, b, a=1)` / `(count=1)` |
 | `PushStyleVar` / `PopStyleVar` | `(imgui.StyleVar.xxx, value[, value2])` / `(count=1)` |
@@ -71,34 +89,40 @@ Begin/End、BeginChild/EndChild 必须配对，即使 Begin 返回 false；Begin
 | `IsItemHovered` | 无参数 → hovered |
 
 枚举：`imgui.WindowFlags` 提供 NoTitleBar、NoResize、NoMove、NoBackground、AlwaysAutoResize，可用 Lua `|` 组合。
+`imgui.Cond` 提供 Always、Once、FirstUseEver、Appearing。
 `imgui.Col` 提供 Text、WindowBg、Button、ButtonHovered、ButtonActive、FrameBg；
 `imgui.StyleVar` 提供 Alpha、WindowPadding、WindowRounding、FrameRounding、FramePadding、ItemSpacing。
 未提供 Image/外部纹理句柄、FFI 或所有 ImGui 重载；需要新绑定时增加这一个边界，不修改 Render 语义。
 
 ## 状态与执行
 
-- UI 只通过 `mod.get("$变量")` / `mod.set("$变量", 数值)` 访问本 Mod 已声明变量。
+- UI 通过 `mod.get("$变量")` / `mod.set("$变量", 数值)` 访问本 Mod 已声明变量；
+  `mod.default("$变量")` 只读该变量的作者默认值。恢复默认值使用普通 set 事务，不另建替换通道。
 - 一帧脚本写入先暂存，绘制成功才通过统一输入队列提交；多个变量作为一批提交。
 - ImGui 线程不调用 Unity；现有 Unity 线程求值 Render，保留形态键纯权重更新路径。
 - 独立透明原生宿主承载所有 Mod ImGui 窗口，不嵌入插件面板，不 hook 游戏图形管线。
   在现有 GUI 线程调度，使用独立 ImGui context 和绘制资源；鼠标不在 Mod 窗口时穿透到游戏。
 - 全局刷新在帧边界销毁旧 Lua 状态、清除旧交互；事件带配置代号，旧代事件不可落入新配置。
-  保留仍存在窗口的开关状态；变量默认值沿用 F10 既有重置语义。
+  Lua 局部状态重新初始化；普通变量使用 Constants 默认值，persist 变量恢复玩家值。
+  之后是否画窗口由新脚本决定，DLL 不持久化 Lua 局部状态。详见 [作者状态](author-state-materials.md)。
+  这与“关闭 UI”不同：关闭 UI 本身既不卸载脚本，也不重置 Mod 变量。
 
 ## 错误与权限
 
 每 UI 独立 Lua 状态，限定内存/每帧指令预算。仅开放基础运算、math/string/table/utf8；
 不开放 io/os/package/debug、文件加载、动态库或 Unity 指针。不把它宣传成进程级安全沙箱。
-Lua 错误或 ImGui 栈不平衡会停止该窗口脚本并显示文件/行号；清理当前帧栈，不执行半帧变量写入。
-其他窗口继续工作。F10 修正并重载，不保留旧脚本静默回退。
+Lua 错误或 ImGui 栈不平衡会停止该脚本并记录 `[UI]` 文件/行号；清理当前帧栈，不执行半帧变量写入。
+不擅自生成一个 DLL 固定布局的 Mod 错误窗口。其他脚本继续工作，全局刷新修正并重载，不静默回退。
 当前 Lua 5.4.9：脚本文件最多 256 KiB、Lua 分配预算 16 MiB、每次执行约 200,000 条 VM 指令。
 不开放 Lua 侧 pcall/xpcall/coroutine，避免脚本反复捕获指令预算错误。宿主用受保护调用和 C++ 异常展开。
 指令限额不是原生库函数的硬实时中断；不承诺恶意脚本在同进程绝对安全或任意复杂 UI 都无帧耗。
 
 ## Blender
 
-保留现有网格切换组和形态键控制面板；增加 Mod UI 开关键/标题设置。
-有切换组或形态键控制时自动生成 `ui.lua`、UI section，按钮控制切换组，滑条控制形态键。
+保留现有网格切换组和形态键控制面板。N → EIEM 可勾选“生成简单 UI”（默认不勾选）。
+勾选后选择标题及用户自定开关键，生成 `ui.lua`、UI section；按钮控制切换组，滑条控制形态键。
+快捷键留空时，模板生成不含按键/关闭按钮的常显 UI；填写时，模板生成普通 Key、`$ui_open` 及 Lua 开关逻辑。
+不勾选时仍导出网格/形态键及其变量绑定，但不生成 UI 声明或脚本。模板尺寸/排版在 Lua 文件中可修改。
 旧 .blend 无需修改格式；生成脚本属于导出产物，再导出会更新生成脚本。
 
 ## 验收
@@ -108,29 +132,4 @@ Lua 错误或 ImGui 栈不平衡会停止该窗口脚本并显示文件/行号�
 后台 Blender：作者数据保存重开、生成 Lua、INI 由实际解析器读取、脚本由真实 Lua VM 执行。
 原生宿主进行独立隐藏窗口测试，不启动或修改用户游戏；真实游戏输入/透明显示结果另行记录。
 
-### 2026-09-05 本轮记录
-
-- 保留源切线的现行结论已归一到顶点数据契约；115/120 是修复前调查。本轮没有修改顶点数据。
-- C++ 真实 Lua VM + ImGui 帧：变量隔离、重载重置脚本局部状态、原生滑块点击、× 关闭、
-  错误后丢弃写入、死循环/内存超额、作用域不平衡后另一个窗口可继续绘制。
-- 解析与发布：UI 条件、重复字段、路径、保留键冲突、跨 Mod 变量隔离、批量拒绝和旧代事件丢弃。
-- 热键线程模拟 OS：Mod UI 有焦点时 UI/全局刷新仍可用，不注册模型循环键；跨 UI 共用键去重。
-- 后台 Blender 保存重开作者工程，导出按钮/滑条 Lua；实际 C++ 解析器和 Lua VM 读取执行生成结果。
-- 真实 DirectComposition 隐藏宿主：初始化、关闭、再次创建和关闭时刷新。测试发现并修正
-  `CreateContext` 不自动替换已有当前 context 的问题，防止 Mod 后端绑定到插件主 context。
-- 游戏内鼠标穿透、焦点/光标与透明合成尚待验收；新增形态键的游戏 GPU 变形也仍待独立验收。
-  不把离线 UI 测试通过当作这两项已通过。
-
-### 构建与部署
-
-- 本轮完整 `unittest discover -s tests -q`：63 项通过，包含 MSVC、真实 Lua/ImGui 和后台 Blender。
-- `build.bat` 构建成功，标识 `resource-runtime-v37-lua-ui`；`git diff --check` 无空白错误。
-- 确认游戏进程未运行后，已更新 `D:\Hypergryph Launcher\games\Endfield Game\plugin\eiem.dll`，
-  SHA256：`FF2EBA6AFB41A833FFBAABCAA492876002550C33540A61AF6AB969465A336CE8`。
-- 同步 `E:\vscode\EIEM_Blender` 的三个插件文件，逐个核对哈希；没有修改开发环境设置或打开的工程。
-- 旧 DLL、全局配置及三个旧插件文件备份在
-  `E:\EIEM_Workspace\plugin-releases\before-v37-lua-ui-20260905-203541`。
-- 全局配置哈希未变；现有 Mod 配置与模型未修改，没有重新导出用户资源，没有提交 Git。
-  Lua 许可证随 DLL 放置为 `LUA-LICENSE.txt`。
-- Blender 执行 Reload Addons，N → EIEM 设置 UI 开关键/标题，重新导出需要按钮或滑条的 Mod。
-  DLL 更新需要下次启动游戏加载；随后 Lua/INI 文件编辑才使用全局刷新（默认 F10）。
+历史测试和部署结果见[版本记录](archive/release-records.md)。

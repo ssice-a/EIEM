@@ -33,24 +33,17 @@ obj["eiem_original_material_sections_json"] = json.dumps({"0": "MaterialBase"})
 material = addon.load_material(Path(), "MaterialBase", {
     "source": "assets/test/base.mat", "name": "Base", "float.Value": "0"})
 mesh.materials.append(material)
-arm = bpy.data.objects.new("SharedRig", bpy.data.armatures.new("SharedRig"))
-bpy.context.scene.collection.objects.link(arm)
-bpy.context.view_layer.objects.active = arm
-arm.select_set(True)
-bpy.ops.object.mode_set(mode="EDIT")
-for i, name in enumerate(("Root", "Tip", "Unused")):
-    bone = arm.data.edit_bones.new(name)
-    bone.head = (0, i, 0)
-    bone.tail = (0, i + .5, 0)
-bpy.ops.object.mode_set(mode="OBJECT")
-for bone in arm.data.bones:
-    bone["eiem_path"] = bone.name
+arm = addon.make_armature("SkeletonSharedRig", {
+    "coordinate": "unity-y-up-left-handed",
+    "nodes": [('', -1, (0,0,0), (0,0,0,1), (1,1,1))] +
+             [(name, 0, (0,0,-i), (0,0,0,1), (1,1,1))
+              for i,name in enumerate(('Root','Tip','Unused'))]}, bpy.context.scene.collection)
 for name in ("Root", "Tip", "Unused"):
     obj.vertex_groups.new(name=name)
 obj.vertex_groups[0].add(list(range(6)), 1.0, "REPLACE")
 obj.vertex_groups[1].add(list(range(6, 12)), 1.0, "REPLACE")
 obj.modifiers.new("Skin", "ARMATURE").object = arm
-obj["eiem_bone_palette_json"] = "[0,1,2]"
+obj["eiem_bone_palette_json"] = "[1,2,3]"
 obj["eiem_bindposes_json"] = json.dumps([[int(r == c) for r in range(4) for c in range(4)]] * 3)
 obj["eiem_bone_hashes_json"] = "[10,20,30]"
 obj["eiem_bone_paths_json"] = '["Root","Tip","Unused"]'
@@ -78,11 +71,32 @@ accessory = separate(obj, 6, 7, "Accessory")
 assert [len(o.data.polygons) for o in (obj, top, accessory)] == [1, 2, 1]
 for part in (top, accessory):
     assert part.data["eiem_section"] == "MeshSource"
-    assert part["eiem_bone_palette_json"] == "[0,1,2]"
+    assert part["eiem_bone_palette_json"] == "[1,2,3]"
     assert [g.name for g in part.vertex_groups] == ["Root", "Tip", "Unused"]
 
 top_group = addon.create_switch_group("TopSwitch", "F6", [top])
 acc_group = addon.create_switch_group("AccessorySwitch", "F7", [accessory])
+
+# Blender keyboard events are recorded into the finite runtime key vocabulary;
+# duplicate assignments are rejected before changing the current group.
+class KeyEvent:
+    value = "PRESS"
+    ctrl = shift = alt = False
+    def __init__(self, event_type, **modifiers):
+        self.type = event_type
+        for key, value in modifiers.items(): setattr(self, key, value)
+
+assert addon.switch_key_from_event(KeyEvent("A", ctrl=True, shift=True)) == "CTRL+SHIFT+A"
+assert addon.switch_key_from_event(KeyEvent("ONE", alt=True)) == "ALT+1"
+assert addon.switch_key_from_event(KeyEvent("PAGE_DOWN")) == "PAGEDOWN"
+assert addon.set_switch_group_key(top_group, "Ctrl+Shift+F8") == "CTRL+SHIFT+F8"
+try:
+    addon.set_switch_group_key(acc_group, "shift+ctrl+f8")
+    raise AssertionError("duplicate recorded key accepted")
+except ValueError as error:
+    assert "已有切换组" in str(error)
+assert acc_group["eiem_key"] == "F7"
+addon.set_switch_group_key(top_group, "F6")
 variant = top.copy()
 variant.data = top.data.copy()
 variant.name = "Variant"
@@ -104,6 +118,8 @@ addon.restore_switch_preview()
 assert not top.hide_get() and not variant.hide_get() and accessory.hide_get()
 
 plan = addon.plan_switch_export([top])
+assert plan["objects"] == [top] and len(plan["groups"]) == 1
+plan = addon.plan_switch_export([obj, top, accessory, variant])
 assert set(plan["objects"]) == {obj, top, accessory, variant}
 assert len(plan["sources"]) == 1 and len(plan["groups"]) == 2
 assert len(bpy.data.armatures) == 1
@@ -117,10 +133,12 @@ variant = bpy.data.objects["Variant"]
 top_group = bpy.data.collections["TopSwitch"]
 acc_group = bpy.data.collections["AccessorySwitch"]
 assert len(addon.switch_groups()) == 2
-plan = addon.plan_switch_export([top])
+selected = [obj, top, accessory, variant]
+plan = addon.plan_switch_export(selected)
 package = output / "package"
-stats = addon.export_package(package, [top], [])
-assert stats == {"meshes": 4, "materials": 1, "textures": 0, "skeletons": 0, "prefabs": 0}, stats
+stats = addon.export_package(package, selected, [])
+assert stats == {"meshes": 4, "materials": 1, "textures": 0, "skeletons": 0,
+                 "physics": 0, "prefabs": 0}, stats
 text = (package / "mod.ini").read_text(encoding="utf-8")
 assert text.count("asset=SourceAsset") >= 1
 assert text.count("handling=skip") == 1
@@ -136,14 +154,14 @@ for p in payloads:
 # Preview state is never export selection: default off still exports geometry.
 addon.set_switch_default(top_group, addon.switch_states(top_group)[1])
 addon.preview_switch(top_group, addon.switch_states(top_group)[1])
-addon.export_package(output / "default-off", [top], [])
+addon.export_package(output / "default-off", selected, [])
 addon.set_switch_default(top_group, addon.switch_states(top_group)[0])
 
 # Validation errors must leave a previously working package untouched.
 baseline = {str(p.relative_to(package)): p.read_bytes() for p in package.rglob("*") if p.is_file()}
 def unchanged_on_error():
     try:
-        addon.export_package(package, [top], [])
+        addon.export_package(package, selected, [])
     except ValueError:
         pass
     else:
@@ -159,13 +177,13 @@ acc_group["eiem_key"] = "F7"
 addon.switch_states(acc_group)[0].objects.link(top)
 unchanged_on_error()
 addon.switch_states(acc_group)[0].objects.unlink(top)
-top["eiem_bone_palette_json"] = "[]"
+top["eiem_bone_paths_json"] = '["Root","Missing","Unused"]'
 unchanged_on_error()
-top["eiem_bone_palette_json"] = "[0,1,2]"
+top["eiem_bone_paths_json"] = '["Root","Tip","Unused"]'
 
 # Re-registering the add-on does not erase project semantics.
 addon.unregister()
 addon.register()
-assert len(addon.plan_switch_export([top])["groups"]) == 2
+assert len(addon.plan_switch_export(selected)["groups"]) == 2
 addon.unregister()
 print("EIEM_SWITCHES_OK", stats)

@@ -4,7 +4,7 @@
 
 只改变相机渐隐，不做 UI 绘制、景深处理或模型资源替换。
 旧 Renderer setter hook 在真实日志中未命中，已删除；失败证据保存在
-[v34 实验记录](archive/camera-fade-v34.md)。
+[v34 失败结论](archive/release-records.md)。
 
 运行时从 IL2CPP 元数据查找 `Beyond.Gameplay.View.CameraMono` 的两个零参数实例方法：
 `_ProcessDitherByPitch()` 与 `ForceClearDither()`。不硬编码地址、偏移或角色名字。
@@ -68,13 +68,13 @@ F10 不重装 hook，也不在按键线程直接调用游戏相机方法；它�
 - 原评估失败不会吞异常或继续清理。
 - 类、方法、参数个数或地址缺失时拒绝安装，不猜地址、不转旧实现。
 
-新契约测试首先在 v34 adapter 上失败于安装 CameraMono 入口；修复后应全部通过。
+历史回归曾在旧 v34 adapter 上复现错误；当前测试覆盖 CameraMono 入口。
 模拟对象里的 skip/manual 字段不变，只验证 adapter 未直接修改它们，不证明真实游戏副作用。
 `tests/test_camera_fade.py` 保留真实全局配置解析与发布测试。
 
 ### 日志验收
 
-- `[BUILD] resource-runtime-v35-camera-mono-fade`：实际加载版本。
+- `[BUILD]`：核对实际加载版本；以当前部署 DLL 的标识为准，不固定要求 v35。
 - `Installed`：MinHook 安装完成，不等于画面成功。
 - `observed`：真实原评估返回，首次记录。
 - `cleared`：真实 ForceClearDither 返回，首次记录。
@@ -82,22 +82,6 @@ F10 不重装 hook，也不在按键线程直接调用游戏相机方法；它�
 - `Unavailable`：元数据或 hook 安装失败。
 
 游戏画面需要核验拉近镜头、开关往返、换地图、角色 UI，并与日志一起判断。
-编译及模拟 MinHook 测试不能替代该验收。本轮自动验证与部署结果追加于下方。
+编译及模拟 MinHook 测试不能替代该验收。历史自动验证与部署结果见版本记录。
 
-### 2026-09-05 v35 验证与部署
-
-- 先跑新 hook 契约测试：旧 adapter 上 3 项失败于 CameraMono 安装；反例及缺失接口拒绝安装测试通过。
-  替换实现后，5 项真实 MinHook + 模拟 CameraMono 测试与 1 项全局配置测试全部通过。
-- 全套 `py -X utf8 -m unittest discover -s tests -v`：57 项，55 通过、2 项 Blender 联测因未设置
-  `EIEM_BLENDER` 跳过。本轮未修改 Blender 插件或用户场景。
-- 首次构建命令在外层先调用 vcvars64，build.bat 内又调用一次，因本机 PATH 引号导致环境脚本报错；
-  改为直接 `cmd /c build.bat` 后编译成功，未为此修改系统 PATH 或构建脚本。
-- `git diff --check` 通过，仅有既有 LF/CRLF 提示。活动 src/tests 中旧恢复表、旧 setter hook、
-  `EiemRefreshCameraFade` 和专用 `il2cpp_gchandle_new_weakref` 引用均已清除。
-- 确认游戏未运行后，仅部署 `plugin/eiem.dll`（1,214,464 字节）。构建产物与已安装文件 SHA256 一致：
-  `9C7D6E89E8C627D3DD3A3DB9D8DE89DF361B3CF5E190FC5766ACEDA7077F49D7`。
-- 部署前 DLL 与全局配置备份在 `E:\EIEM_Workspace\plugin-releases\before-v35-camera-mono-fade-20260905`。
-  原 v34 DLL SHA256 为 `E9EBD359C693BCF4F64279985455F59B29EB7FFF09CB2743F431AF449F004B04`。
-- 已安装 `plugin/eiem.ini` 保留 `disable_camera_fade=true`、F10、INSERT，仅修正功能注释。
-  未部署构建产生的代理加载器，未修改任何 mod.ini、Mesh、Material、Texture 或 Blender 文件。
-- 尚未启动游戏，没有本版游戏内 observed/cleared 记录或画面验收；不得以本节自动测试宣布视觉效果成功。
+历史测试和部署结果见[版本记录](archive/release-records.md)。

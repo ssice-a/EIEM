@@ -1,6 +1,7 @@
 """Background-only shape control authoring; never accesses a live user scene."""
 import importlib.util
 import sys
+import re
 from pathlib import Path
 from types import SimpleNamespace
 import bpy
@@ -23,6 +24,7 @@ obj["eiem_author_package"] = str(output / "offline")
 bpy.context.view_layer.objects.active = obj
 bpy.context.scene.eiem_ui_title = "衣服控制"
 bpy.context.scene.eiem_ui_key = "F9"
+bpy.context.scene.eiem_ui_template = True
 obj.select_set(True)
 basis = obj.shape_key_add(name="Renamed Basis")
 key = obj.shape_key_add(name="Inflate")
@@ -49,26 +51,42 @@ assert obj.data.eiem_shape_controls[0].shape == "Inflate"
 assert obj.data.eiem_shape_controls[0].label == "衣服鼓起"
 assert bpy.context.scene.eiem_ui_title == "衣服控制"
 assert bpy.context.scene.eiem_ui_key == "F9"
+assert bpy.context.scene.eiem_ui_template
 
 package = output / "package"
 addon.export_package(package, [obj], [])
 ini = (package / "mod.ini").read_text(encoding="utf-8")
-assert "[UIMod]" in ini and "shape.Inflate=$shape1" in ini and "key=F9" in ini
+variable = re.search(r"shape\.Inflate=(\$\w+)", ini).group(1)
+assert "[UIMod]" in ini and "key=F9" in ini
 lua = (package / "ui.lua").read_text(encoding="utf-8")
-assert "imgui.SliderFloat" in lua and 'mod.get("$shape1")' in lua
+assert "imgui.SliderFloat" in lua and ('mod.get("%s")' % variable) in lua
 assert "衣服控制" in lua and "衣服鼓起" in lua
-assert "$shape1=0.25" in ini and "[Constants]" in ini
+assert "[KeyModUI]" in ini and "scope=both" in ini
+assert '$ui_open=0' in ini and 'mod.get("$ui_open")' in lua
+assert ("persist %s=0.25" % variable) in ini and "[Constants]" in ini
 payload = addon.read_mesh(next((package / "meshes").glob("*.mesh")))
 assert payload["blend_channels"][0][0] == "Inflate"
 assert payload["blend_weights"] == [100.0]  # NOT the current .25 slider weight
 assert payload["blend_vertices"][0][1] == (0.0, 0.0, 0.5)
+
+# Template generation is optional, independent from shape data and controls.
+bpy.context.scene.eiem_ui_template = False
+addon.export_package(output / "no-ui", [obj], [])
+assert "[UIMod]" not in (output / "no-ui/mod.ini").read_text(encoding="utf-8")
+assert not (output / "no-ui/ui.lua").exists()
+bpy.context.scene.eiem_ui_template = True
+bpy.context.scene.eiem_ui_key = ""
+addon.export_package(output / "always-ui", [obj], [])
+always_ini = (output / "always-ui/mod.ini").read_text(encoding="utf-8")
+assert "[UIMod]" in always_ini and "[KeyModUI]" not in always_ini and "$ui_open" not in always_ini
+bpy.context.scene.eiem_ui_key = "F9"
 
 # Split/partner authoring must bind shape control on the partner template.
 addon.create_switch_group("Cloth", "F6", [obj])
 addon.export_package(output / "partner", [obj], [])
 ini = (output / "partner/mod.ini").read_text(encoding="utf-8")
 assert "handling=skip" in ini and "partner.0=" in ini
-assert "shape.Inflate=$shape1" in ini.split("[RenderSourcePart0]")[1]
+assert ("shape.Inflate=" + variable) in ini.split("[RenderSourcePart0]")[1]
 
 # Shared resource controls are emitted once; distinct resources remain independent.
 copy = obj.copy()

@@ -4,6 +4,8 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <io.h>
+#include <fcntl.h>
 
 // Dump requests are posted to the game window and executed by MmdWndProc on
 // Unity's main thread. This keeps all interaction with observed IL2CPP object
@@ -17,6 +19,7 @@
 #define WM_EIEM_DUMP_DISABLED (WM_APP + 0x313)
 #define WM_EIEM_MODEL_CURRENT (WM_APP + 0x314)
 #define WM_EIEM_MODEL_FULL    (WM_APP + 0x315)
+// 0x316/0x317 belong to Mod reconciliation/input (globals.h).
 
 static SRWLOCK s_dumpSelectionLock = SRWLOCK_INIT;
 static void *s_dumpSelectedMeshes[4096] = {};

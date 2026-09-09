@@ -97,7 +97,9 @@ int main() {
   EiemModProgram program;
   std::string error;
   std::istringstream input("[Constants]\n$a=0\n[KeyA]\nkey=F6\ntype=cycle\n$a=0,1\n"
-    "[UIA]\npath=ui.lua\nkey=F9\n[UIB]\npath=other.lua\nkey=F9\n");
+    "[UIA]\npath=ui.lua\n[UIB]\npath=other.lua\n"
+    "[KeyUiA]\nkey=F9\ntype=cycle\nscope=both\n$a=0,1\n"
+    "[KeyUiB]\nkey=F9\ntype=cycle\nscope=both\n$a=0,1\n");
   if (!EiemModParseStream(input, "a/mod.ini", program, &error)) return 1;
   EiemPublishModState(program); s_eiemModGeneration = 9;
   HotkeyThread(nullptr);

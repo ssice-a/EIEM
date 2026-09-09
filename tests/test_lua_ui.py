@@ -10,16 +10,18 @@ SOURCE = r'''
 #include "eiem_lua_ui.h"
 #include <cstdio>
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"FAIL %d: %s\n",__LINE__,#x); return 1; } } while(false)
-static bool frame(EiemLuaUi &ui, const EiemVariables &vars, EiemVariables &writes) {
+static bool frame(EiemLuaUi &ui, const EiemVariables &vars, EiemVariables &writes, const EiemVariables &defaults={}) {
   ImGui::GetIO().DisplaySize={800,600}; ImGui::GetIO().DeltaTime=1.f/60;
-  ImGui::NewFrame(); bool ok=ui.Draw(vars,writes); ImGui::Render(); return ok;
+  ImGui::NewFrame(); bool ok=ui.Draw(vars,writes,defaults); ImGui::Render(); return ok;
 }
 int main(int argc, char **argv) {
   ImGui::CreateContext();
   auto &io=ImGui::GetIO(); io.IniFilename=nullptr; io.Fonts->AddFontDefault();
   unsigned char *pixels; int w,h; io.Fonts->GetTexDataAsRGBA32(&pixels,&w,&h);
   EiemVariables vars{{"$size",.25},{"$other",0}}, writes;
-  EiemLuaUi a("a/UI"), b("b/UI"); a.open=b.open=true;
+  EiemLuaUi a("a/UI"), b("b/UI");
+  EiemLuaUi reset("reset/UI");CHECK(reset.Load("return function() mod.set('$size',mod.default('$size')) end","reset.lua"));
+  CHECK(frame(reset,vars,writes,{{"$size",.8}}) && writes.at("$size")==.8 && !writes.count("$other"));
   const char *source=R"lua(
     local count=0
     return function()
@@ -53,8 +55,8 @@ int main(int argc, char **argv) {
   CHECK(frame(a,vars,writes)); CHECK(writes.at("$size")==.5 && writes.at("$other")==1);
   CHECK(frame(a,vars,writes)); CHECK(writes.at("$other")==2);
   CHECK(frame(b,vars,writes)); CHECK(writes.at("$other")==1);
-  CHECK(ImGui::FindWindowByName("Same title###a/UI") != ImGui::FindWindowByName("Same title###b/UI"));
-  a.open=false; CHECK(!frame(a,vars,writes) && writes.empty()); a.open=true;
+  CHECK(ImGui::FindWindowByName(a.WindowLabel("Same title").c_str()) !=
+        ImGui::FindWindowByName(b.WindowLabel("Same title").c_str()));
   CHECK(a.Load(source,"a.lua")); CHECK(frame(a,vars,writes) && writes.at("$other")==1);
 
   for (const char *bad : {
@@ -81,12 +83,15 @@ int main(int argc, char **argv) {
 
   // Drive the actual native slider with ImGui input events, not an unconditional
   // mod.set in the script. Measure its real rectangle via the public bindings.
-  EiemLuaUi click("click/UI"); click.open=true;
-  EiemVariables inputVars{{"$size",0},{"$x",0},{"$y",0},{"$right",0}};
+  EiemLuaUi click("click/UI");
+  EiemVariables inputVars{{"$size",0},{"$x",0},{"$y",0},{"$right",0},{"$open",1}};
   CHECK(click.Load(R"lua(return function()
+    if mod.get("$open") == 0 then return end
     imgui.SetNextWindowPos(40,40)
     imgui.SetNextWindowSize(300,180)
-    if imgui.Begin("Slider interaction") then
+    local visible,open=imgui.Begin("Slider interaction",true)
+    if not open then mod.set("$open",0) end
+    if visible then
       imgui.SetNextItemWidth(200)
       local changed,value=imgui.SliderFloat("##size",mod.get("$size"),0,1)
       if changed then mod.set("$size",value) end
@@ -102,23 +107,47 @@ int main(int argc, char **argv) {
   CHECK(frame(click,inputVars,writes));
   CHECK(writes.count("$size") && writes.at("$size")>.4 && writes.at("$size")<.6);
   io.AddMouseButtonEvent(0,false); CHECK(frame(click,inputVars,writes));
-  auto *window=ImGui::FindWindowByName("Slider interaction###click/UI");
+  auto *window=ImGui::FindWindowByName(click.WindowLabel("Slider interaction").c_str());
   CHECK(window);
   float closeX=window->Pos.x+window->Size.x-ImGui::GetStyle().FramePadding.x-ImGui::GetFontSize()/2;
   float closeY=window->Pos.y+ImGui::GetStyle().FramePadding.y+ImGui::GetFontSize()/2;
   io.AddMousePosEvent(closeX,closeY); io.AddMouseButtonEvent(0,true);
   CHECK(frame(click,inputVars,writes));
   io.AddMouseButtonEvent(0,false); CHECK(frame(click,inputVars,writes));
-  CHECK(!click.open); // Begin's native X closes only this UI
+  CHECK(writes.at("$open")==0 && !writes.count("$size")); // Lua chooses close action; model untouched
+  inputVars["$open"]=0;
+  CHECK(frame(click,inputVars,writes) && writes.empty());
+  inputVars["$open"]=1;
+  CHECK(frame(click,inputVars,writes)); // script reopens; no DLL open flag gates it
+
+  // One script freely composes multiple independent root windows, no key needed.
+  EiemLuaUi multi("multi/UI");
+  CHECK(multi.Load(R"lua(return function()
+    imgui.SetNextWindowPos(20,20,imgui.Cond.Always)
+    if imgui.Begin("First###stable") then imgui.Text("one") end
+    imgui.End()
+    imgui.SetNextWindowPos(350,20,imgui.Cond.Always)
+    if imgui.Begin("Second",nil,imgui.WindowFlags.NoTitleBar) then imgui.Text("two") end
+    imgui.End()
+  end)lua","multi.lua"));
+  CHECK(frame(multi,vars,writes) && writes.empty());
+  auto *first=ImGui::FindWindowByName(multi.WindowLabel("First###stable").c_str());
+  auto *second=ImGui::FindWindowByName(multi.WindowLabel("Second").c_str());
+  CHECK(first && second && first!=second && !first->HasCloseButton && !second->HasCloseButton);
+  CHECK(ImHashStr(multi.WindowLabel("First###stable").c_str()) ==
+        ImHashStr(multi.WindowLabel("Changed###stable").c_str()));
 
   // Optional generated Blender packages use the same real VM and bindings.
   for (int i=1;i<argc;++i) {
     EiemModProgram program; std::string error;
     CHECK(EiemModParseFile(argv[i],program,&error));
     for (const auto &state:program.states) for(const auto &ui:state.uis) {
-      EiemLuaUi generated(state.path+ui.section); generated.open=true;
+      EiemLuaUi generated(state.path+ui.section);
       CHECK(generated.LoadFile(state.path,ui.path));
-      CHECK(frame(generated,state.variables,writes));
+      CHECK(frame(generated,state.variables,writes,state.defaults));
+      auto active=state.variables;
+      if(active.count("$ui_open")) active["$ui_open"]=1;
+      CHECK(frame(generated,active,writes,state.defaults));
     }
   }
   ImGui::DestroyContext();

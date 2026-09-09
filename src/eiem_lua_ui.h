@@ -14,10 +14,10 @@ class EiemLuaUi {
   lua_State *vm = nullptr;
   size_t memory = 0;
   int budget = 0, drawRef = LUA_NOREF;
-  bool drawing = false, began = false;
+  bool drawing = false;
   int colors = 0, styles = 0;
   std::vector<char> scopes;
-  EiemVariables variables, pending;
+  EiemVariables variables, pending, defaults;
   std::string identity, sourceName;
   enum Op { Begin, End, BeginChild, EndChild, Text, Button, Checkbox, SliderFloat,
     DragFloat, InputFloat, ColorEdit4, SameLine, Separator, Spacing, NewLine, Dummy,
@@ -25,7 +25,7 @@ class EiemLuaUi {
     PushStyleColor, PopStyleColor, PushStyleVar, PopStyleVar, PushID, PopID,
     BeginDisabled, EndDisabled, BeginGroup, EndGroup, BeginTable, EndTable,
     TableNextRow, TableNextColumn, CollapsingHeader, RadioButton,
-    GetItemRectMin, GetItemRectMax, IsItemHovered, SetTooltip, Get, Set };
+    GetItemRectMin, GetItemRectMax, IsItemHovered, SetTooltip, Get, Set, Default };
   static void *Allocate(void *ud, void *ptr, size_t oldSize, size_t newSize) {
     auto &self = *static_cast<EiemLuaUi *>(ud);
     if (!ptr) oldSize = 0;
@@ -58,9 +58,13 @@ class EiemLuaUi {
     if (!s.drawing) return luaL_error(L, "UI APIs are only available inside the draw function");
     auto boolean = [&](bool value) { lua_pushboolean(L, value); return 1; };
     auto changed = [&](bool yes, float value) { lua_pushboolean(L, yes); lua_pushnumber(L, value); return 2; };
-    if (op == Get || op == Set) {
+    if (op == Get || op == Set || op == Default) {
       const std::string name = luaL_checkstring(L, 1);
       if (!s.variables.count(name)) return luaL_error(L, "Undeclared Mod variable: %s", name.c_str());
+      if(op==Default) {
+        if(!s.defaults.count(name))return luaL_error(L,"Author default unavailable: %s",name.c_str());
+        lua_pushnumber(L,s.defaults.at(name));return 1;
+      }
       if (op == Get) {
         lua_pushnumber(L, s.pending.count(name) ? s.pending.at(name) : s.variables.at(name)); return 1;
       }
@@ -74,13 +78,16 @@ class EiemLuaUi {
     if (!setup && s.scopes.empty()) return luaL_error(L, "Control needs imgui.Begin");
     switch (op) {
     case Begin: {
-      if (s.began || !s.scopes.empty()) return luaL_error(L, "One root Begin per UI section per frame");
-      std::string title = std::string(luaL_checkstring(L, 1)) + "###" + s.identity;
-      int flags = (int)luaL_optinteger(L, 2, 0);
+      std::string title = s.WindowLabel(luaL_checkstring(L, 1));
+      bool hasOpen = !lua_isnoneornil(L,2), open = true;
+      if (hasOpen) { luaL_checktype(L,2,LUA_TBOOLEAN); open = lua_toboolean(L,2) != 0; }
+      int flags = (int)luaL_optinteger(L, 3, 0);
       // Internal child/popup flags cannot be supplied by a public root window.
       if (flags & ~((1 << 19) - 1)) return luaL_error(L, "Unsupported window flags");
-      s.began = true; s.scopes.push_back('w');
-      return boolean(ImGui::Begin(title.c_str(), &s.open, flags));
+      s.scopes.push_back('w');
+      lua_pushboolean(L,ImGui::Begin(title.c_str(), hasOpen ? &open : nullptr, flags));
+      if (hasOpen) lua_pushboolean(L,open); else lua_pushnil(L);
+      return 2;
     }
     case End: s.PopScope('w'); ImGui::End(); break;
     case BeginChild: {
@@ -124,8 +131,14 @@ class EiemLuaUi {
     case Spacing: ImGui::Spacing(); break;
     case NewLine: ImGui::NewLine(); break;
     case Dummy: ImGui::Dummy({Number(L,1),Number(L,2)}); break;
-    case SetNextWindowSize: ImGui::SetNextWindowSize({Number(L,1),Number(L,2)}, ImGuiCond_FirstUseEver); break;
-    case SetNextWindowPos: ImGui::SetNextWindowPos({Number(L,1),Number(L,2)}, ImGuiCond_FirstUseEver); break;
+    case SetNextWindowSize: case SetNextWindowPos: {
+      float x = Number(L,1), y = Number(L,2); int cond = (int)luaL_optinteger(L,3,0);
+      if (cond != 0 && cond != ImGuiCond_Always && cond != ImGuiCond_Once &&
+          cond != ImGuiCond_FirstUseEver && cond != ImGuiCond_Appearing) return luaL_error(L,"Invalid ImGui condition");
+      if (op == SetNextWindowSize) ImGui::SetNextWindowSize({x,y},cond);
+      else ImGui::SetNextWindowPos({x,y},cond);
+      break;
+    }
     case SetNextWindowBgAlpha: ImGui::SetNextWindowBgAlpha(Number(L,1,1)); break;
     case SetNextItemWidth: ImGui::SetNextItemWidth(Number(L,1)); break;
     case PushStyleColor: {
@@ -219,9 +232,12 @@ class EiemLuaUi {
     constants("WindowFlags", {{"NoTitleBar",ImGuiWindowFlags_NoTitleBar},{"NoResize",ImGuiWindowFlags_NoResize},
       {"NoMove",ImGuiWindowFlags_NoMove},{"NoBackground",ImGuiWindowFlags_NoBackground},
       {"AlwaysAutoResize",ImGuiWindowFlags_AlwaysAutoResize}});
+    constants("Cond", {{"Always",ImGuiCond_Always},{"Once",ImGuiCond_Once},
+      {"FirstUseEver",ImGuiCond_FirstUseEver},{"Appearing",ImGuiCond_Appearing}});
     lua_setglobal(L,"imgui"); lua_newtable(L);
     lua_pushinteger(L,Get); lua_pushcclosure(L,Dispatch,1); lua_setfield(L,-2,"get");
     lua_pushinteger(L,Set); lua_pushcclosure(L,Dispatch,1); lua_setfield(L,-2,"set");
+    lua_pushinteger(L,Default); lua_pushcclosure(L,Dispatch,1); lua_setfield(L,-2,"default");
     lua_setglobal(L,"mod"); return 0;
   }
   bool Call(int arguments, int results) {
@@ -233,12 +249,17 @@ class EiemLuaUi {
     lua_remove(vm,function); return result == LUA_OK;
   }
 public:
-  bool open = false;
   std::string error;
   explicit EiemLuaUi(std::string id) : identity(std::move(id)) {}
   EiemLuaUi(const EiemLuaUi &) = delete;
   EiemLuaUi &operator=(const EiemLuaUi &) = delete;
   ~EiemLuaUi() { if (vm) lua_close(vm); }
+  std::string WindowLabel(const std::string &title) const {
+    // Keep native ### stable-title semantics without letting it discard the
+    // Mod namespace. Multiple windows per script have independent native IDs.
+    char id[16]; snprintf(id,sizeof(id),"%08X",ImHashStr(title.c_str(),0,ImHashStr(identity.c_str())));
+    return title.substr(0,title.find("##")) + "###EIEM-" + id;
+  }
   bool Load(const std::string &source, const std::string &filename) {
     if (vm) { lua_close(vm); vm = nullptr; }
     memory = 0; error.clear(); drawRef = LUA_NOREF; sourceName = filename;
@@ -276,9 +297,9 @@ public:
       return Load(source,path.u8string());
     } catch (const std::exception &e) { error = relative + ": " + e.what(); return false; }
   }
-  bool Draw(const EiemVariables &current, EiemVariables &writes) {
-    writes.clear(); if (!open || !error.empty() || drawRef == LUA_NOREF) return false;
-    variables = current; pending.clear(); scopes.clear(); colors = styles = 0; began = false;
+  bool Draw(const EiemVariables &current, EiemVariables &writes, const EiemVariables &authorDefaults = {}) {
+    writes.clear(); if (!error.empty() || drawRef == LUA_NOREF) return false;
+    variables = current; defaults=authorDefaults;pending.clear(); scopes.clear(); colors = styles = 0;
     ImGuiErrorRecoveryState base, after;
     ImGui::ErrorRecoveryStoreState(&base);
     auto *context = ImGui::GetCurrentContext();
@@ -305,14 +326,5 @@ public:
     if (ok && error.empty()) { writes.swap(pending); return true; }
     if (!error.empty() && error.find(sourceName) == std::string::npos) error = sourceName + ": " + error;
     pending.clear(); return false;
-  }
-  void DrawError() {
-    if (!open || error.empty()) return;
-    std::string title = "Mod UI error###" + identity;
-    if (ImGui::Begin(title.c_str(), &open)) {
-      ImGui::TextWrapped("%s",error.c_str());
-      ImGui::TextUnformatted("Fix script, then press the configured reload key.");
-    }
-    ImGui::End();
   }
 };

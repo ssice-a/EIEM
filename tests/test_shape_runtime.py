@@ -11,6 +11,12 @@ PREFIX = r'''
 #include <cstdio>
 #include <cstring>
 #include "eiem_shape_state.h"
+#include "eiem_shape_binding.h"
+struct EiemShapeRuntimeBinding {bool initialized=false;};
+template<class Backend> static bool EiemPrepareShapeBinding(EiemShapeState &,void *,void *,const std::vector<EiemShapeBaseline> &,Backend &,std::string &) {return true;}
+static void EiemSyncShapeClaims(EiemShapeState &,const EiemModRule &) {}
+static bool EiemShapeBindingMatches(const EiemShapeState &,void *,void *) {return true;}
+static void EiemRetireShapeBinding(const std::shared_ptr<EiemShapeRuntimeBinding> &) {}
 static void Log(const char*,...) {}
 struct Mesh { std::vector<std::string> names; };
 struct Renderer { Mesh *mesh; std::vector<float> weights; int writes=0; };

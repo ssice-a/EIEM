@@ -19,6 +19,7 @@
 #include <utility>
 #include "eiem_expression.h"
 #include "eiem_keys.h"
+#include "eiem_physics_asset.h"
 
 // Authoring syntax -> typed resource declarations and Render actions. No
 // published configuration, Unity objects, hotkeys or lifecycle state live here.
@@ -33,8 +34,10 @@ struct EiemModRule {
   int32_t matchIndices = -1;
   int32_t matchSubMeshes = -1;
   char skeleton[192] = {};
+  char physics[192] = {};
   bool hasMesh = false;
   bool hasSkeleton = false;
+  bool hasPhysics = false;
   char materials[16][192] = {};
   int32_t materialSlots[16] = {};
   uint32_t materialCount = 0;
@@ -75,6 +78,7 @@ struct EiemModResource {
   int32_t textureWrap = 0;
   int32_t textureAniso = 1;
   float textureMipBias = 0.0f;
+  std::shared_ptr<const EiemPhysicsAsset> physicsAsset;
 };
 
 static void EiemModInitRule(EiemModRule *rule) {
@@ -144,20 +148,24 @@ struct EiemKeyAssignment {
   std::string variable;
   std::vector<double> values;
 };
+enum class EiemKeyScope { Game, Ui, Both };
+static bool EiemKeyInScope(EiemKeyScope scope, bool uiFocus) {
+  return scope == EiemKeyScope::Both || scope == (uiFocus ? EiemKeyScope::Ui : EiemKeyScope::Game);
+}
 struct EiemModKey {
   std::string section;
   EiemKeyChord chord;
   size_t line = 0;
   std::vector<EiemKeyAssignment> assignments;
+  EiemKeyScope scope = EiemKeyScope::Game;
 };
 struct EiemModUi {
   std::string section, path;
-  EiemKeyChord chord;
-  std::shared_ptr<EiemExpression> condition;
 };
 struct EiemModState {
   std::string path;
   EiemVariables defaults, variables;
+  std::unordered_set<std::string> persistent;
   std::vector<EiemModKey> keys;
   std::vector<EiemModUi> uis;
 };
@@ -195,6 +203,7 @@ static bool EiemSetRenderField(EiemModRule &rule, const std::string &key,
   }
   if (key == "mesh") { rule.hasMesh = !value.empty(); return copy(rule.mesh) || fail(); }
   if (key == "skeleton") { rule.hasSkeleton = !value.empty(); return copy(rule.skeleton) || fail(); }
+  if (key == "physics") { rule.hasPhysics = !value.empty(); return copy(rule.physics) || fail(); }
   if (key.compare(0, 6, "shape.") == 0) {
     const std::string name = key.substr(6);
     if (name.empty() || name.size() >= sizeof(rule.shapeNames[0])) return fail();
@@ -296,20 +305,21 @@ static std::string EiemModIdentifier(const char *file, const char *section) {
 
 static void EiemCompileModProgram(EiemModProgram &program) {
   program.standaloneRules.clear();
-  std::unordered_set<std::string> referenced;
-  for (const auto &prefab : program.prefabs)
-    for (uint32_t i = 0; i < prefab.renderCount; ++i)
-      if (prefab.renders[i][0]) referenced.insert(EiemModIdentifier(prefab.modPath, prefab.renders[i]));
-  // Inspect ALL branches: an inactive partner is still a template, not a
-  // standalone rule accidentally promoted when its condition becomes false.
+  std::unordered_set<std::string> partnerTemplates;
+  // A Prefab reference records related resources and an instance origin. It
+  // never scopes a Render: every source Render still matches every consumer
+  // of the selected Mesh. Only partner declarations are templates rather than
+  // source-Mesh actions. Inspect all branches so an inactive partner cannot be
+  // promoted when its condition becomes false.
   for (const auto &definition : program.definitions)
     EiemVisitStatements(definition.statements, [&](const EiemModStatement &statement) {
       if (statement.key.compare(0, 8, "partner.") == 0 && !statement.value.empty())
-        referenced.insert(EiemModIdentifier(definition.selector.modPath, statement.value.c_str()));
+        partnerTemplates.insert(EiemModIdentifier(definition.selector.modPath, statement.value.c_str()));
     });
   for (size_t i = 0; i < program.definitions.size(); ++i) {
     const auto &rule = program.definitions[i].selector;
-    if ((rule.path[0] || rule.asset[0]) && !referenced.count(EiemModIdentifier(rule.modPath, rule.section)))
+    if ((rule.path[0] || rule.asset[0]) &&
+        !partnerTemplates.count(EiemModIdentifier(rule.modPath, rule.section)))
       program.standaloneRules.push_back(i);
   }
   EiemEvaluateModProgram(program);
@@ -394,6 +404,7 @@ static bool EiemValidateModDocument(EiemModProgram &doc, std::string &error) {
         std::string kind;
         if (s.key == "mesh") kind = "Mesh";
         else if (s.key == "skeleton") kind = "Skeleton";
+        else if (s.key == "physics") kind = "Physics";
         else if (s.key.compare(0, 9, "material.") == 0) kind = "Material";
         if (!kind.empty()) {
           auto it = resources.find(EiemModIdentifier("", s.value.c_str()));
@@ -432,16 +443,22 @@ static bool EiemValidateModDocument(EiemModProgram &doc, std::string &error) {
     }
   }
   for (const auto &ui : state.uis) {
-    if (!EiemUiRelativePath(ui.path) || !ui.chord.vk || ui.chord.vk == VK_INSERT) {
-      error = "UI needs a relative script path and a non-INSERT key: " + ui.section; return false;
-    }
-    if (ui.condition && !ui.condition->Validate(state.defaults, error)) return false;
-    for (const auto &key : state.keys) if (key.chord == ui.chord) {
-      error = "UI key conflicts with Mod cycle key: " + ui.section; return false;
+    if (!EiemUiRelativePath(ui.path)) {
+      error = "UI needs a relative script path: " + ui.section; return false;
     }
   }
   state.variables = state.defaults;
   return true;
+}
+
+static void EiemAppendModDocument(EiemModProgram &output, EiemModProgram doc) {
+  const size_t stateIndex = output.states.size();
+  for (auto &definition : doc.definitions) definition.stateIndex += stateIndex;
+  output.states.insert(output.states.end(), doc.states.begin(), doc.states.end());
+  output.definitions.insert(output.definitions.end(), doc.definitions.begin(), doc.definitions.end());
+  output.prefabs.insert(output.prefabs.end(), doc.prefabs.begin(), doc.prefabs.end());
+  output.resources.insert(output.resources.end(), doc.resources.begin(), doc.resources.end());
+  EiemCompileModProgram(output);
 }
 
 static bool EiemModParseStream(std::istream &input, const char *path,
@@ -466,7 +483,7 @@ static bool EiemModParseStream(std::istream &input, const char *path,
   };
   std::vector<Frame> stack;
   std::vector<EiemModStatement> *body = nullptr;
-  bool keyTypeSeen = false;
+  bool keyTypeSeen = false, keyScopeSeen = false;
   size_t conditionNodes = 0;
   auto finishSection = [&]() {
     if (!stack.empty()) return fail("Missing endif before section end");
@@ -497,7 +514,7 @@ static bool EiemModParseStream(std::istream &input, const char *path,
         state.uis.back().section = name;
       }
       else if (_strnicmp(name.c_str(), "Key", 3) == 0) {
-        section = Key; keyTypeSeen = false;
+        section = Key; keyTypeSeen = keyScopeSeen = false;
         state.keys.push_back({});
         state.keys.back().section = name; state.keys.back().line = lineNumber;
       } else if (_strnicmp(name.c_str(), "Render", 6) == 0) {
@@ -518,7 +535,8 @@ static bool EiemModParseStream(std::istream &input, const char *path,
         const char *kind = _strnicmp(name.c_str(), "Mesh", 4) == 0 ? "Mesh" :
           _strnicmp(name.c_str(), "Material", 8) == 0 ? "Material" :
           _strnicmp(name.c_str(), "Texture", 7) == 0 ? "Texture" :
-          _strnicmp(name.c_str(), "Skeleton", 8) == 0 ? "Skeleton" : nullptr;
+          _strnicmp(name.c_str(), "Skeleton", 8) == 0 ? "Skeleton" :
+          _strnicmp(name.c_str(), "Physics", 7) == 0 ? "Physics" : nullptr;
         if (!kind) return fail("Unknown section: " + name);
         section = Resource; doc.resources.push_back({});
         auto &r = doc.resources.back();
@@ -570,8 +588,11 @@ static bool EiemModParseStream(std::istream &input, const char *path,
     EiemModTrim(key); EiemModTrim(value);
     if (section == Constants) {
       double number = 0;
+      const bool persist=key.compare(0,8,"persist ")==0;
+      if(persist){key.erase(0,8);EiemModTrim(key);}
       if (!EiemVariableName(key) || !EiemNumber(value, &number) || !state.defaults.emplace(key, number).second)
         return fail("Invalid/duplicate variable: " + key);
+      if(persist)state.persistent.insert(key);
       continue;
     }
     if (section == Key && EiemVariableName(key)) {
@@ -598,11 +619,6 @@ static bool EiemModParseStream(std::istream &input, const char *path,
       if (!uiFields.insert(key).second) return fail("Duplicate UI field: " + key);
       auto &ui = state.uis.back();
       if (key == "path" && EiemUiRelativePath(value)) ui.path = value;
-      else if (key == "key" && EiemParseKeyChord(value, &ui.chord)) {}
-      else if (key == "condition") {
-        std::string detail; ui.condition = EiemExpressionParser(value, detail).Parse();
-        if (!ui.condition) return fail(detail);
-      }
       else return fail("Invalid UI field: " + key);
       continue;
     }
@@ -610,6 +626,13 @@ static bool EiemModParseStream(std::istream &input, const char *path,
       if (key == "key") {
         if (state.keys.back().chord.vk || !EiemParseKeyChord(value, &state.keys.back().chord)) return fail("Invalid/duplicate key chord");
       } else if (key == "type" && EiemModEquals(value.c_str(), "cycle") && !keyTypeSeen) keyTypeSeen = true;
+      else if (key == "scope" && !keyScopeSeen) {
+        keyScopeSeen = true;
+        if (EiemModEquals(value.c_str(),"game")) state.keys.back().scope = EiemKeyScope::Game;
+        else if (EiemModEquals(value.c_str(),"ui")) state.keys.back().scope = EiemKeyScope::Ui;
+        else if (EiemModEquals(value.c_str(),"both")) state.keys.back().scope = EiemKeyScope::Both;
+        else return fail("Key scope must be game, ui or both");
+      }
       else return fail("Unsupported Key field: " + key);
       continue;
     }
@@ -677,31 +700,73 @@ static bool EiemModParseStream(std::istream &input, const char *path,
   if (!finishSection()) return false;
   std::string detail;
   if (!EiemValidateModDocument(doc, detail)) { if (error) *error = detail; return false; }
-  const size_t stateIndex = output.states.size();
-  for (auto &d : doc.definitions) d.stateIndex += stateIndex;
-  output.states.insert(output.states.end(), doc.states.begin(), doc.states.end());
-  output.definitions.insert(output.definitions.end(), doc.definitions.begin(), doc.definitions.end());
-  output.prefabs.insert(output.prefabs.end(), doc.prefabs.begin(), doc.prefabs.end());
-  output.resources.insert(output.resources.end(), doc.resources.begin(), doc.resources.end());
-  EiemCompileModProgram(output);
+  EiemAppendModDocument(output, std::move(doc));
   return true;
+}
+
+static bool EiemPrepareModPhysics(EiemModProgram &doc,std::string &error) {
+  std::unordered_map<std::string,std::shared_ptr<const EiemPhysicsAsset>> snapshots;
+  for (auto &resource:doc.resources) if (EiemModEquals(resource.kind,"Physics")) {
+    std::filesystem::path path;
+    auto base=std::filesystem::u8path(resource.modPath).parent_path();
+    if (base.empty()) base=".";
+    std::shared_ptr<const EiemPhysicsAsset> asset;
+    if (!EiemPhysicsResolveFile(base,resource.path,path,error)) return false;
+    const auto key=EiemModIdentifier("",path.u8string().c_str());
+    const auto found=snapshots.find(key);
+    if (found!=snapshots.end()) asset=found->second;
+    else if (!EiemLoadPhysicsAsset(path,asset,error)) {
+      error=std::string(resource.section)+": "+error; return false;
+    }
+    snapshots[key]=asset; resource.physicsAsset=std::move(asset);
+  }
+  // A Render's physical rig remains stable across its conditional branches.
+  // Validate inactive references too, before a later key can select them.
+  for (const auto &definition:doc.definitions) {
+    std::vector<const EiemModResource *> physics, skeletons;
+    EiemVisitStatements(definition.statements,[&](const EiemModStatement &s) {
+      if (s.value.empty() || (s.key!="physics" && s.key!="skeleton")) return;
+      for (const auto &r:doc.resources) if (EiemModEquals(r.section,s.value.c_str())) {
+        (s.key=="physics" ? physics:skeletons).push_back(&r); break;
+      }
+    });
+    if (physics.empty()) continue;
+    const auto &expected=physics.front()->physicsAsset->skeleton;
+    for (const auto *resource:physics)
+      if (!EiemSamePhysicsSkeleton(expected,resource->physicsAsset->skeleton)) {
+        error=std::string(definition.selector.section)+": Physics branches require one shared Skeleton"; return false;
+      }
+    for (const auto *resource:skeletons) {
+      std::filesystem::path path; EiemSkeletonDocument skeleton;
+      auto base=std::filesystem::u8path(resource->modPath).parent_path();
+      if (base.empty()) base=".";
+      if (!EiemPhysicsResolveFile(base,resource->path,path,error) || !EiemLoadPhysicsSkeleton(path,skeleton,error)) return false;
+      if (!EiemSamePhysicsSkeleton(expected,skeleton)) {
+        error=std::string(definition.selector.section)+": Render and Physics Skeleton data differ"; return false;
+      }
+    }
+  }
+  error.clear(); return true;
 }
 
 static bool EiemModParseFile(const char *path, EiemModProgram &output, std::string *error = nullptr) {
   if (error) error->clear();
   std::ifstream input(path, std::ios::binary);
   if (!input) return false;
-  return EiemModParseStream(input, path, output, error);
+  EiemModProgram doc; std::string detail;
+  if (!EiemModParseStream(input,path,doc,error)) return false;
+  if (!EiemPrepareModPhysics(doc,detail)) { if (error) *error=detail; return false; }
+  EiemAppendModDocument(output,std::move(doc)); return true;
 }
 
 // Every press is evaluated in event order; never collapse two presses into one.
 // Returns the mods whose variables actually changed, for scoped restoration.
-static std::vector<std::string> EiemCycleModKey(EiemModProgram &program, EiemKeyChord chord) {
+static std::vector<std::string> EiemCycleModKey(EiemModProgram &program, EiemKeyChord chord, bool uiFocus = false) {
   std::vector<std::string> changed;
   for (auto &state : program.states) {
     bool dirty = false;
     for (const auto &key : state.keys) {
-      if (!(key.chord == chord)) continue;
+      if (!(key.chord == chord) || !EiemKeyInScope(key.scope,uiFocus)) continue;
       size_t count = key.assignments.front().values.size(), selected = 0;
       for (size_t i = 0; i < count; ++i) {
         bool matches = true;

@@ -19,7 +19,8 @@ class BlenderRegistrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="eiem-registration-") as directory:
             package = Path(directory) / "EIEM_Blender"
             package.mkdir()
-            for name in ("__init__.py", "eiem_blender_addon.py"):
+            for name in ("__init__.py", "eiem_blender_addon.py", "eiem_physics_authoring.py", "eiem_physics_document.py",
+                         "eiem_physics_native.py", "eiem_physics_source.py"):
                 shutil.copy2(ROOT / "tools/Blender" / name, package / name)
             result = subprocess.run([
                 blender, "--background", "--factory-startup", "--python-exit-code", "1",

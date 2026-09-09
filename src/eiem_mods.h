@@ -1,12 +1,14 @@
 #pragma once
 
 #include "eiem_mod_document.h"
+#include "eiem_persistent_state.h"
 #include <utility>
 
 // Configuration publication and lookups; parsing has no runtime state.
 static SRWLOCK s_eiemModLock = SRWLOCK_INIT;
 static EiemModProgram s_eiemModProgram;
 static volatile LONG s_eiemModGeneration = 0;
+static EiemPersistentStore s_eiemPersistentStates;
 
 static bool EiemModAffected(const char *path, const std::vector<std::string> *mods) {
   if (!mods) return true;
@@ -14,12 +16,12 @@ static bool EiemModAffected(const char *path, const std::vector<std::string> *mo
   return false;
 }
 
-static std::vector<EiemKeyChord> EiemGetModKeyChords(LONG *generation) {
+static std::vector<EiemKeyChord> EiemGetModKeyChords(LONG *generation, bool uiFocus = false) {
   std::vector<EiemKeyChord> result;
   AcquireSRWLockShared(&s_eiemModLock);
   *generation = s_eiemModGeneration;
   for (const auto &state : s_eiemModProgram.states) for (const auto &key : state.keys)
-    if (std::find(result.begin(), result.end(), key.chord) == result.end()) result.push_back(key.chord);
+    if (EiemKeyInScope(key.scope,uiFocus) && std::find(result.begin(), result.end(), key.chord) == result.end()) result.push_back(key.chord);
   ReleaseSRWLockShared(&s_eiemModLock);
   return result;
 }
@@ -28,6 +30,7 @@ struct EiemModInputEvent {
   EiemKeyChord chord; LONG generation;
   std::string modPath, uiSection; // empty for a key event
   EiemVariables values; // one successful Lua frame, committed atomically
+  bool uiFocus = false; // focus at key dispatch; used only by generic Key scope
 };
 
 struct EiemUiSnapshot {
@@ -35,6 +38,24 @@ struct EiemUiSnapshot {
   EiemModUi ui;
   EiemVariables variables;
   LONG generation;
+  EiemVariables defaults;
+};
+
+// A Physics action is selected by the same Render rule that selected its Mesh
+// consumer.  It is nevertheless owned by the completed model instance, not by
+// an individual Renderer: several Renderer/LOD hits can reference one prepared
+// Physics snapshot and must produce one native instance when that adapter is
+// connected.
+struct EiemPhysicsIntent {
+  char modPath[MAX_PATH] = {};
+  char resourceSection[96] = {};
+  char firstRenderSection[96] = {};
+  EiemModRule firstRule = {};
+  std::shared_ptr<const EiemPhysicsAsset> asset;
+  // Rebuilt on every model pass. These are observation addresses only; the
+  // runtime adapter captures and validates its own weak references before use.
+  std::vector<void *> matchedRenderers;
+  uint32_t rendererMatches = 0;
 };
 
 static std::vector<EiemUiSnapshot> EiemGetModUis(LONG *generation) {
@@ -43,32 +64,8 @@ static std::vector<EiemUiSnapshot> EiemGetModUis(LONG *generation) {
   *generation = s_eiemModGeneration;
   for (const auto &state : s_eiemModProgram.states)
     for (const auto &ui : state.uis)
-      result.push_back({state.path, ui, state.variables, s_eiemModGeneration});
+      result.push_back({state.path, ui, state.variables, s_eiemModGeneration,state.defaults});
   ReleaseSRWLockShared(&s_eiemModLock);
-  return result;
-}
-
-static std::vector<EiemKeyChord> EiemGetUiKeyChords() {
-  std::vector<EiemKeyChord> result;
-  AcquireSRWLockShared(&s_eiemModLock);
-  for (const auto &state : s_eiemModProgram.states) for (const auto &ui : state.uis)
-    if (std::find(result.begin(), result.end(), ui.chord) == result.end()) result.push_back(ui.chord);
-  ReleaseSRWLockShared(&s_eiemModLock);
-  return result;
-}
-
-static SRWLOCK s_eiemUiKeyLock = SRWLOCK_INIT;
-static std::vector<std::pair<EiemKeyChord, LONG>> s_eiemUiKeys;
-static void EiemQueueUiKey(EiemKeyChord chord, LONG generation) {
-  AcquireSRWLockExclusive(&s_eiemUiKeyLock);
-  s_eiemUiKeys.push_back({chord, generation});
-  ReleaseSRWLockExclusive(&s_eiemUiKeyLock);
-}
-static std::vector<std::pair<EiemKeyChord, LONG>> EiemTakeUiKeys() {
-  std::vector<std::pair<EiemKeyChord, LONG>> result;
-  AcquireSRWLockExclusive(&s_eiemUiKeyLock);
-  result.swap(s_eiemUiKeys);
-  ReleaseSRWLockExclusive(&s_eiemUiKeyLock);
   return result;
 }
 
@@ -95,7 +92,7 @@ static bool EiemPrepareInputUpdate(const std::vector<EiemModInputEvent> &events,
   for (const auto &event : events) {
     if (event.generation != generation) continue; // queued before an F10 reset
     std::vector<std::string> changed;
-    if (event.uiSection.empty()) changed = EiemCycleModKey(*next, event.chord);
+    if (event.uiSection.empty()) changed = EiemCycleModKey(*next, event.chord, event.uiFocus);
     else {
       for (size_t i = 0; i < next->states.size(); ++i) {
         auto &state = next->states[i];
@@ -123,6 +120,7 @@ static bool EiemPrepareInputUpdate(const std::vector<EiemModInputEvent> &events,
 }
 
 static void EiemPublishModState(EiemModProgram next) {
+  s_eiemPersistentStates.Queue(next);
   AcquireSRWLockExclusive(&s_eiemModLock);
   s_eiemModProgram = std::move(next);
   ReleaseSRWLockExclusive(&s_eiemModLock);
@@ -131,6 +129,7 @@ static void EiemPublishModState(EiemModProgram next) {
 // Called before hooks at startup; subsequently only by the Unity-thread update
 // dispatcher, after restoring effects of the previously published program.
 static void EiemReloadMods() {
+  s_eiemPersistentStates.Flush(true);
   EiemModProgram next;
   std::vector<std::string> files;
   WIN32_FIND_DATAA data = {};
@@ -150,11 +149,14 @@ static void EiemReloadMods() {
   });
   files.push_back("plugin\\mods\\mod.ini");
   for (const auto &file : files) {
-    std::string error;
-    if (!EiemModParseFile(file.c_str(), next, &error) &&
-        !error.empty())
-      Log("[MOD] Invalid configuration %s:%s (file skipped)", file.c_str(), error.c_str());
+    std::string error; EiemModProgram document;
+    if (!EiemModParseFile(file.c_str(), document, &error)) {
+      if (!error.empty()) Log("[MOD] Invalid configuration %s:%s (file skipped)", file.c_str(), error.c_str());
+      continue;
+    }
+    EiemAppendModDocument(next,std::move(document));
   }
+  s_eiemPersistentStates.Load(next);
   EiemCompileModProgram(next);
   for (const auto &prefab : next.prefabs)
     Log("[MOD] prefab section=%s path=%s renders=%u", prefab.section, prefab.path, prefab.renderCount);
@@ -184,8 +186,9 @@ static void EiemFindModPrefabs(const char *path,
   ReleaseSRWLockShared(&s_eiemModLock);
 }
 
-// Top-level rules match Mesh identity on every live consumer. Referenced
-// Render sections are scoped PFB actions or partner templates, never promoted.
+// Source Render rules match Mesh identity on every live consumer. A PFB
+// reference is only a resource relationship and does not remove a rule from
+// this set. Only Render sections used as partner templates are excluded.
 static void EiemFindStandaloneRenderRules(std::vector<EiemModRule> *out) {
   if (!out) return;
   out->clear();
@@ -220,6 +223,45 @@ static bool EiemFindModResource(const char *modIni, const char *section,
   }
   ReleaseSRWLockShared(&s_eiemModLock);
   return found;
+}
+
+// Called only after a Render rule has won normal first-match precedence for a
+// concrete Renderer under a registered model root.  Aliases of the same
+// prepared file share a snapshot, so snapshot identity plus Mod identity is the
+// stable deduplication key.  The resource name of the first hit is retained for
+// diagnostics; it is not the runtime ownership key.
+static bool EiemCollectPhysicsIntent(
+    const EiemModRule &rule, std::vector<EiemPhysicsIntent> *out,
+    void *matchedRenderer = nullptr) {
+  if (!rule.hasPhysics) return true;
+  if (!out) return false;
+  EiemModResource resource = {};
+  if (!EiemFindModResource(rule.modPath, rule.physics, "Physics", &resource) ||
+      !resource.physicsAsset)
+    return false;
+  for (auto &intent : *out) {
+    if (!EiemModEquals(intent.modPath, rule.modPath) ||
+        intent.asset.get() != resource.physicsAsset.get())
+      continue;
+    ++intent.rendererMatches;
+    if (matchedRenderer &&
+        std::find(intent.matchedRenderers.begin(), intent.matchedRenderers.end(),
+                  matchedRenderer) == intent.matchedRenderers.end())
+      intent.matchedRenderers.push_back(matchedRenderer);
+    return true;
+  }
+  EiemPhysicsIntent intent = {};
+  strncpy_s(intent.modPath, sizeof(intent.modPath), rule.modPath, _TRUNCATE);
+  strncpy_s(intent.resourceSection, sizeof(intent.resourceSection),
+            rule.physics, _TRUNCATE);
+  strncpy_s(intent.firstRenderSection, sizeof(intent.firstRenderSection),
+            rule.section, _TRUNCATE);
+  intent.firstRule = rule;
+  intent.asset = std::move(resource.physicsAsset);
+  if (matchedRenderer) intent.matchedRenderers.push_back(matchedRenderer);
+  intent.rendererMatches = 1;
+  out->push_back(std::move(intent));
+  return true;
 }
 
 static bool EiemFindRenderRuleBySection(const char *modIni, const char *section,

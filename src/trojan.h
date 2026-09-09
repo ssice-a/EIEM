@@ -849,6 +849,7 @@ static void __fastcall Hooked_SolverManager_LateUpdate(void *self, void *methodI
   if (s_origLateUpdate) {
     ((fn)s_origLateUpdate)(self, methodInfo);
   }
+  EiemSampleChestMotionAfterLateUpdate();
 }
 
 static void *s_origOnUpdate = nullptr;
@@ -2310,6 +2311,8 @@ static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
   // the first message, before a later character load reaches the resource
   // proxy hooks.
   if (!s_eiemUnityThreadId) s_eiemUnityThreadId = GetCurrentThreadId();
+  EiemStartPhysicsAutoTraceOnUnityThread();
+  EiemPhysicsRuntimePeriodic("window-main-thread");
 
   // Capture the original procedure before signalling worker threads. The
   // hotkey thread restores the subclass asynchronously during shutdown.
@@ -2317,9 +2320,11 @@ static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
 
   if (msg == WM_CLOSE || msg == WM_DESTROY || msg == WM_NCDESTROY ||
       msg == WM_ENDSESSION) {
-    if (!g_shutdownRequested)
+    if (!g_shutdownRequested) {
       Log("[WNDPROC] Game window closing (msg=0x%X), signaling threads to exit",
           msg);
+      EiemFinishPhysicsAutoTraceOnUnityThread();
+    }
     g_shutdownRequested = true;
     g_guiRunning = false;
     g_trojanActive = false;

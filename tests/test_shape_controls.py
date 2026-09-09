@@ -18,7 +18,6 @@ static const char *ini = R"ini([Constants]
 $size=0
 [UISize]
 path=ui.lua
-key=F8
 [KeySize]
 key=F6
 type=cycle
@@ -64,7 +63,10 @@ int main() {
     "[UIA]\npath=ui.lua\nkey=INSERT\n",
     "[UIA]\npath=ui.lua\nkey=F8\ncondition=$missing\n",
     "[UIA]\npath=ui.lua\nkey=F8\nkey=F9\n",
-    "[UIA]\npath=ui.lua\n",
+    "[UIA]\n",
+    "[UIA]\npath=ui.lua\npath=other.lua\n",
+    "[Constants]\n$x=0\n[KeyX]\nkey=F8\ntype=cycle\nscope=invalid\n$x=0,1\n",
+    "[Constants]\n$x=0\n[KeyX]\nkey=F8\ntype=cycle\nscope=ui\nscope=both\n$x=0,1\n",
     "[Constants]\n$x=0\n[KeyX]\nkey=F8\ntype=cycle\n$x=0,1\n[UIX]\npath=ui.lua\nkey=F8\n",
     "[Constants]\n$x=0\n[SliderA]\nvariable=$x\nmin=1\nmax=0\n",
     "[Constants]\n$x=2\n[SliderA]\nvariable=$x\n",
@@ -78,7 +80,6 @@ int main() {
 $x=0
 [UIX]
 path=ui.lua
-key=F8
 [RenderA]
 asset=A
 shape.X=$x
@@ -89,15 +90,17 @@ endif
 )ini");
   EiemModProgram q;
   CHECK(EiemModParseStream(conditional,"c/mod.ini",q,&error));
-  // UI activation conditions reference this Mod's current variables, not names
-  // or values in another Mod.
-  std::istringstream conditions("[Constants]\n$show=0\n[UIA]\npath=ui.lua\nkey=F9\ncondition=$show == 1\n");
+  // UI declarations need no key. Any key can update a variable; script decides
+  // how to use it. Focus scope applies to ordinary keys, not special UI actions.
+  std::istringstream conditions("[Constants]\n$show=0\n[UIA]\npath=ui.lua\n"
+    "[KeyShow]\nkey=F9\ntype=cycle\nscope=both\n$show=0,1\n");
   EiemModProgram conditionDoc;
   CHECK(EiemModParseStream(conditions,"condition.ini",conditionDoc,&error));
-  const auto &ui=conditionDoc.states[0].uis[0];
-  CHECK(ui.condition->Evaluate(conditionDoc.states[0].variables)==0);
-  conditionDoc.states[0].variables["$show"]=1;
-  CHECK(ui.condition->Evaluate(conditionDoc.states[0].variables)==1);
+  CHECK(EiemCycleModKey(conditionDoc,{VK_F9,0},true).size()==1);
+  CHECK(conditionDoc.states[0].variables.at("$show")==1);
+  conditionDoc.states[0].keys[0].scope=EiemKeyScope::Game;
+  CHECK(EiemCycleModKey(conditionDoc,{VK_F9,0},true).empty());
+  CHECK(EiemCycleModKey(conditionDoc,{VK_F9,0},false).size()==1);
   EiemPublishModState(q);
   CHECK(EiemPrepareInputUpdate({{{},7,"c/mod.ini","UIX",{{"$x",1}}}},&next,&affected,&shapesOnly));
   CHECK(!shapesOnly && next.rules[0].shapeCount==0);

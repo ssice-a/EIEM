@@ -1628,4 +1628,36 @@ The production async hook now has an executable passthrough regression, includin
 inline/deferred completion and cancellation. It failed before the fix and passes
 afterwards. This proves the corrected native boundary, not in-game UI rendering;
 live crash/visibility acceptance is still pending. Full evidence and experiment
-limits: [UI callback crash record](../debugging/2026-09-05-ui-callback-crash.md).
+limits: [UI callback crash record](ui-callback-crash-v29.md).
+
+### v58 NPC miss and v59 concrete Renderer boundary (2026-09-07)
+
+The v58 live run confirmed that PFB references no longer scoped Render rules:
+the program published four source rules, and ordinary model and character-UI
+Typhoea Renderers received the replacement. It also disproved
+`SetSMRRootBone` as useful fallback coverage in that run. All 52 recorded calls
+reported zero matching Renderers.
+
+Two distinct Typhoea Renderers exposed the actual miss. Renderer
+`00000011E4D09F40` appeared at log lines 6430-6435 and renderer
+`0000001022369BA0` at lines 7729-7734/8183-8188. Both reached
+`EntityRenderHelperMaterialController.RendererInfo._Init` with the original
+917-vertex Mesh, original material, and enabled cloth Renderers. Neither object
+entered the public `SkinnedMeshRenderer.set_sharedMesh` hook, a registered
+model-root executor, or a successful final-bone replay. This is direct evidence
+of an NPC/direct-construction path omitted by v58; it is not an INI, PFB, or
+Mesh-name mismatch.
+
+v59 keeps `SetSMRRootBone` observation-only. After `RendererInfo._Init` has let
+the game capture clean source materials, the concrete SkinnedMeshRenderer is
+offered to the same global Mesh-identity executor used at the other lifecycle
+boundaries. Existing bound Renderers still use the material-commit reapply
+path when a new global match is unavailable. The relevant 63 MSVC/host checks
+and the full DLL build pass. The DLL with SHA-256
+`E5E11A9A51FDDBC1CD2BF8EBF7A0D9A39392F0268E1608367CFBFFA4813DA890`
+was deployed after the game stopped. The next v59 run showed
+`[MOD-RENDERER-INIT]` on multiple Typhoea body and cloth Renderers, with body
+replacement reporting `applied=true` and both cloth rules applying `skip`.
+The user also confirmed the NPC result visually. This accepts the v59 NPC
+Mesh/skip entry point for the declared LOD0 assets; it does not establish
+coverage for undeclared LOD assets or native Physics.

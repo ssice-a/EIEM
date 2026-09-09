@@ -8,7 +8,13 @@
 
 #include "eiem_mods.h"
 #include "eiem_mod_update.h"
+static bool EiemOnUnityThread();
+#include "eiem_unity_lifetime.h"
+#include "eiem_native_physics_parameters.h"
+#include "eiem_native_physics_config.h"
 #include "eiem_resource_backend.h"
+static size_t EiemManagedArrayLength(void *array);
+#include "eiem_skeleton_runtime.h"
 
 // Resource-loading hooks preserve the game's VFS/decryption pipeline and
 // observe logical identities. Only the Render executor applies declared
@@ -105,6 +111,19 @@ static bool TraceTakeBudget(volatile LONG *counter, LONG limit);
 static void TraceBuildRendererHierarchy(void *renderer, char *out,
                                         size_t outSize);
 static void TraceReadUnityObjectName(void *object, char *out, int outSize);
+static void EiemPhysicsOwnerProbeObserveRenderer(void *renderer,
+                                                 const char *stage);
+static void EiemPhysicsOwnerProbeObserveModel(const char *ownerKind,
+                                              void *owner, void *model,
+                                              const char *stage);
+static void EiemPhysicsOwnerProbeObserveOwnerActive(
+    const char *ownerKind, void *owner, bool active, const char *stage);
+static void EiemPhysicsOwnerProbeObserveRelease(
+    const char *ownerKind, void *owner, void *model, const char *stage);
+static void EiemReconcileModelPhysics(
+    void *model, const std::vector<EiemPhysicsIntent> &intents, bool active,
+    const char *stage);
+static void EiemReleaseModelPhysics(void *model, const char *stage);
 static void TraceLookupHashPath(int64_t hash, char *out, int outSize);
 static bool TraceResolveStringPathHashPath(int64_t hash, char *out,
                                            size_t outSize);
@@ -122,6 +141,8 @@ static void *s_origRendererInfoTrySetSharedMaterial = nullptr;
 static void *s_origRendererInfoTrySetSharedMaterials = nullptr;
 static void *s_origRendererInfoTryReplaceSharedMaterials = nullptr;
 static int s_materialRendererInfoRendererOffset = -1;
+static int s_eiemProbeSourceMaterialsOffset = -1, s_eiemProbeReplacingMaterialsOffset = -1;
+static void *s_origMaterialInfoInit = nullptr;
 typedef void (__fastcall *TraceSetBonesFn)(void *self, void *bones,
                                            void *methodInfo);
 static void *s_origSkinnedMeshSetBones = nullptr;
@@ -144,7 +165,8 @@ static void *s_origCreateSmsGo = nullptr;
 static void *s_origCreateSmsPost = nullptr;
 static void *s_origAssignSkinPost = nullptr;
 // NPCAvatarCreatorUtils assigns the final Animator bone palette after the
-// renderer array has been created. This remains observation-only.
+// renderer array has been created. This remains an ordering observation; the
+// concrete NPC Renderer is handled at RendererInfo._Init.
 typedef void(__fastcall *TraceSetSmrRootBoneFn)(
     void *animator, void *renderers, void *rootBoneInfos, void *methodInfo);
 static void *s_origSetSmrRootBone = nullptr;
@@ -368,7 +390,18 @@ enum class EiemModelOwnerKind : uint8_t {
   UIModelLoader,
   BaseModelPart,
   CharUIModel,
+  NpcAvatar,
 };
+static const char *EiemModelOwnerKindName(EiemModelOwnerKind kind) {
+  switch (kind) {
+    case EiemModelOwnerKind::PrefabProxy: return "PrefabProxy";
+    case EiemModelOwnerKind::UIModelLoader: return "UIModelLoader";
+    case EiemModelOwnerKind::BaseModelPart: return "BaseModelPart";
+    case EiemModelOwnerKind::CharUIModel: return "CharUIModel";
+    case EiemModelOwnerKind::NpcAvatar: return "NpcAvatar";
+  }
+  return "unknown";
+}
 static bool EiemRegisterAndApplyModelInstance(
     EiemModelOwnerKind ownerKind, void *owner, void *model,
     const char *prefabPath, uint32_t instanceUid, const char *stage);
@@ -379,8 +412,9 @@ static bool EiemRegisterCharUIModelInstance(void *component,
 static bool EiemReapplyRegisteredModelInstance(void *model,
                                                 const char *stage);
 static bool EiemApplyStandaloneRenderRules(void *model, const char *stage,
-                                          bool *matched = nullptr,
-                                          const std::vector<std::string> *affected = nullptr);
+                                           bool *matched = nullptr,
+                                           const std::vector<std::string> *affected = nullptr,
+                                           std::vector<EiemPhysicsIntent> *physicsIntents = nullptr);
 static bool EiemApplyStandaloneRenderRulesToRenderer(
     void *meshOwner, void *drawRenderer, void *mesh,
     const char *rendererType, void *methodInfo, const char *stage);
@@ -392,6 +426,8 @@ static bool EiemRenderRuleMatches(const EiemModRule &rule,
 static void EiemForgetModelOwner(EiemModelOwnerKind ownerKind, void *owner,
                                  const char *stage);
 static void EiemForgetModelInstance(void *model, const char *stage);
+static void EiemSetModelOwnerActive(EiemModelOwnerKind ownerKind, void *owner,
+                                    bool active, const char *stage);
 static void EiemQueueModReconcile(const char *reason);
 static void EiemRequestModUpdate(EiemModUpdate request, const char *reason);
 
@@ -416,6 +452,7 @@ static int32_t EiemTraceUnboxInt(void *boxed) {
     return -1;
   }
 }
+
 
 static void EiemSetOriginalSharedMesh(void *renderer, void *mesh,
                                       const char *rendererType,
@@ -512,21 +549,31 @@ static bool EiemManagedObjectArraySame(void *left, void *right);
 static size_t EiemManagedArrayLength(void *array);
 
 #include "eiem_shape_state.h"
+#include "eiem_shape_guard.h"
 
 // Runtime shape ownership is per Renderer, never per shared Mesh. No Unity
 // calls on ImGui's thread; mutation failures are reported through the adapter.
 struct EiemUnityShapes {
+  bool Names(void *mesh,std::vector<std::string> &names) {
+    void *boxed=nullptr;
+    if(!mesh || !InvokeChecked(g_mesh_get_blendShapeCount,mesh,nullptr,&boxed) || !boxed)return false;
+    const int count=*(int *)((char *)boxed+16);if(count<0)return false;
+    std::vector<std::string> result;
+    for(int i=0;i<count;++i){void *text=nullptr;void *args[]={&i};char name[192]={};
+      if(!InvokeChecked(g_mesh_GetBlendShapeName,mesh,args,&text) || !text)return false;
+      ReadStrUtf8(text,name,sizeof(name));if(strlen(name)>=sizeof(name)-1)return false;
+      result.emplace_back(name);
+    }
+    names=std::move(result);return true;
+  }
   bool Snapshot(void *renderer, void *mesh, std::vector<EiemShapeBaseline> &weights) {
-    void *boxed = nullptr;
-    if (!InvokeChecked(g_mesh_get_blendShapeCount, mesh, nullptr, &boxed) || !boxed) return false;
-    const int count = *(int *)((char *)boxed + 16);
-    if (count < 0) return false;
+    std::vector<std::string> names;
+    if (!Names(mesh,names)) return false;
     std::vector<EiemShapeBaseline> values;
-    for (int i = 0; i < count; ++i) {
-      void *text = nullptr; void *args[] = {&i}; float value = 0;
-      if (!InvokeChecked(g_mesh_GetBlendShapeName, mesh, args, &text) || !text || !Read(renderer, i, value)) return false;
-      char name[192] = {}; ReadStrUtf8(text, name, sizeof(name));
-      values.push_back({name, value});
+    for (int i = 0; i < (int)names.size(); ++i) {
+      float value = 0;
+      if (!Read(renderer, i, value)) return false;
+      values.push_back({names[i], value});
     }
     weights = std::move(values);
     return true;
@@ -544,12 +591,14 @@ struct EiemUnityShapes {
     return -1;
   }
   bool Read(void *renderer, int index, float &value) {
+    EiemShapeAuthorScope origin;
     void *boxed = nullptr; void *args[] = {&index};
     if (!InvokeChecked(g_smr_GetBlendShapeWeight, renderer, args, &boxed) || !boxed) return false;
     value = *(float *)((char *)boxed + 16);
     return std::isfinite(value);
   }
   bool Write(void *renderer, int index, float value) {
+    EiemShapeAuthorScope origin;
     void *result = nullptr; void *args[] = {&index, &value};
     return InvokeChecked(g_smr_SetBlendShapeWeight, renderer, args, &result);
   }
@@ -571,8 +620,22 @@ static void EiemUpdateRendererShapes(void *renderer, const char *type,
     EiemShapeMessage(rule, "Shape weights require SkinnedMeshRenderer"); return;
   }
   EiemUnityShapes backend; std::string error;
-  if (!EiemApplyShapeWeights(renderer, EiemReadSharedMesh(renderer, type), rule, state, backend, error))
+  EiemShapeAuthorScope author;
+  void *mesh=EiemReadSharedMesh(renderer,type);
+  if(rule.shapeCount && state.binding && !EiemShapeBindingMatches(state,renderer,mesh)) {
+    EiemRetireShapeBinding(state.binding);state={};
+  }
+  if(!state.binding && rule.shapeCount) {
+    std::vector<EiemShapeBaseline> baseline;
+    if(!backend.Snapshot(renderer,mesh,baseline) || !EiemPrepareShapeBinding(state,renderer,mesh,baseline,backend,error)) {
+      EiemShapeMessage(rule,error.empty()?"Cannot capture native shape state":error);return;
+    }
+    if(state.binding)state.binding->initialized=true; // No mesh assignment, keep current weights.
+  }
+  EiemSyncShapeClaims(state,rule);
+  if (!EiemApplyShapeWeights(renderer, mesh, rule, state, backend, error))
     EiemShapeMessage(rule, error);
+  EiemModRule none={};EiemSyncShapeClaims(state,none);
 }
 
 struct EiemRenderOverrideState {
@@ -583,8 +646,12 @@ struct EiemRenderOverrideState {
   void *drawRenderer = nullptr;
   void *originalMesh = nullptr;
   void *replacementMesh = nullptr;
+  EiemUnityRef rendererRef, drawRendererRef, sourceMeshRef;
+  std::shared_ptr<EiemSkeletonInstance> skeleton;
+  bool restorePending = false;
   uint32_t originalMaterialsHandle = 0;
   uint32_t originalBonesHandle = 0;
+  uint32_t replacementBonesHandle = 0;
   uint32_t originalRootBoneHandle = 0;
   bool originalEnabled = true;
   bool hasEnabled = false;
@@ -606,6 +673,24 @@ struct EiemBounds {
 };
 static SRWLOCK s_eiemOverrideLock = SRWLOCK_INIT;
 static std::vector<EiemRenderOverrideState> s_eiemOverrides;
+
+// A game controller must capture the game's materials, not our current output.
+// Suppress material reapplication only for the Renderer being initialized;
+// nested initialization of another model remains independent.
+static thread_local std::vector<void *> s_eiemMaterialSourceInitRenderers;
+static bool EiemMaterialSourceInitActive(void *renderer) {
+  return std::find(s_eiemMaterialSourceInitRenderers.begin(),
+                   s_eiemMaterialSourceInitRenderers.end(), renderer) !=
+         s_eiemMaterialSourceInitRenderers.end();
+}
+struct EiemMaterialSourceInitScope {
+  explicit EiemMaterialSourceInitScope(void *renderer) {
+    s_eiemMaterialSourceInitRenderers.push_back(renderer);
+  }
+  ~EiemMaterialSourceInitScope() { s_eiemMaterialSourceInitRenderers.pop_back(); }
+  EiemMaterialSourceInitScope(const EiemMaterialSourceInitScope &) = delete;
+  EiemMaterialSourceInitScope &operator=(const EiemMaterialSourceInitScope &) = delete;
+};
 
 static bool EiemReadRendererEnabled(void *renderer, bool *enabled) {
   if (enabled) *enabled = true;
@@ -662,9 +747,12 @@ static void EiemPreserveSourceDrawState(void *renderer,
   }
 }
 
+#include "eiem_residue_probe.h"
+
 static size_t EiemFindOverrideLocked(void *renderer) {
   for (size_t index = 0; index < s_eiemOverrides.size(); ++index)
-    if (s_eiemOverrides[index].renderer == renderer) return index;
+    if (s_eiemOverrides[index].renderer == renderer &&
+        s_eiemOverrides[index].rendererRef.Target() == renderer) return index;
   return SIZE_MAX;
 }
 
@@ -680,7 +768,31 @@ static void EiemPrepareRenderInput(void *renderer, void *mesh,
   // to happen, so reload restores exactly the objects we changed.
   if (index != SIZE_MAX) {
     EiemRenderOverrideState &state = s_eiemOverrides[index];
+    if (state.restorePending) {
+      if (identityMesh) *identityMesh = state.originalMesh;
+      ReleaseSRWLockExclusive(&s_eiemOverrideLock);
+      return;
+    }
     if (state.replacementMesh && state.replacementMesh != mesh) {
+      auto sourceRef = EiemUnityRef::Capture(mesh, false);
+      if (!sourceRef) {
+        ReleaseSRWLockExclusive(&s_eiemOverrideLock);
+        Log("[MOD] Cannot retain changed source Mesh renderer=%p", renderer);
+        return;
+      }
+      if (state.hasSourceShapeWeights) {
+        EiemUnityShapes shapes;std::vector<EiemShapeBaseline> baseline;
+        if (!shapes.Snapshot(renderer,mesh,baseline)) {
+          ReleaseSRWLockExclusive(&s_eiemOverrideLock);
+          Log("[SHAPE] Cannot capture changed game Mesh layout renderer=%p",renderer);
+          return;
+        }
+        // A game-assigned Mesh is a new source, not the old replacement's
+        // channels. Never carry its control claims or numeric mapping across.
+        EiemRetireShapeBinding(state.shapes.binding);state.shapes={};
+        state.sourceShapeWeights=std::move(baseline);
+      }
+      state.sourceMeshRef = std::move(sourceRef);
       state.originalMesh = mesh;
       state.replacementMesh = nullptr;
     }
@@ -699,6 +811,13 @@ static bool EiemCaptureOriginal(void *renderer, void *drawRenderer, void *mesh,
   size_t index = EiemFindOverrideLocked(renderer);
   if (index == SIZE_MAX) {
     EiemRenderOverrideState state = {};
+    state.rendererRef = EiemUnityRef::Capture(renderer);
+    state.drawRendererRef = drawRenderer == renderer ? state.rendererRef : EiemUnityRef::Capture(drawRenderer);
+    if (!state.rendererRef || !state.drawRendererRef) {
+      ReleaseSRWLockExclusive(&s_eiemOverrideLock);
+      Log("[MOD] Cannot observe Renderer lifetime; refusing mutation renderer=%p", renderer);
+      return false;
+    }
     state.renderer = renderer;
     state.drawRenderer = drawRenderer;
     state.originalMesh = mesh;
@@ -709,8 +828,21 @@ static bool EiemCaptureOriginal(void *renderer, void *drawRenderer, void *mesh,
     s_eiemOverrides.push_back(state);
   }
   auto &state = s_eiemOverrides[index];
-  if (!state.replacementMesh) state.originalMesh = mesh;
-  if (meshEdit && shapeEdit && !state.ownsMesh && !state.hasSourceShapeWeights &&
+  if (state.restorePending) {
+    ReleaseSRWLockExclusive(&s_eiemOverrideLock);
+    Log("[MOD] Restore incomplete; refusing new mutation renderer=%p", renderer);
+    return false;
+  }
+  if (!state.ownsMesh) state.originalMesh = mesh;
+  if (meshEdit && !state.sourceMeshRef) {
+    state.sourceMeshRef = EiemUnityRef::Capture(state.originalMesh, false);
+    if (!state.sourceMeshRef) {
+      ReleaseSRWLockExclusive(&s_eiemOverrideLock);
+      Log("[MOD] Cannot retain source Mesh; refusing assignment renderer=%p", renderer);
+      return false;
+    }
+  }
+  if ((meshEdit || shapeEdit) && !state.ownsMesh && !state.hasSourceShapeWeights &&
       EiemModEquals(rendererType, "SkinnedMeshRenderer")) {
     EiemUnityShapes shapes;
     if (!shapes.Snapshot(renderer, mesh, state.sourceShapeWeights)) {
@@ -789,7 +921,7 @@ static bool EiemFindBoundRenderRule(void *renderer, EiemModRule *out) {
   char section[96] = {};
   AcquireSRWLockShared(&s_eiemOverrideLock);
   const size_t index = EiemFindOverrideLocked(renderer);
-  if (index != SIZE_MAX) {
+  if (index != SIZE_MAX && !s_eiemOverrides[index].restorePending) {
     strncpy_s(modPath, sizeof(modPath), s_eiemOverrides[index].modPath,
               _TRUNCATE);
     strncpy_s(section, sizeof(section),
@@ -800,6 +932,35 @@ static bool EiemFindBoundRenderRule(void *renderer, EiemModRule *out) {
          EiemFindRenderRuleBySection(modPath, section, out);
 }
 
+static void EiemBeginMeshWrite(void *renderer) {
+  AcquireSRWLockExclusive(&s_eiemOverrideLock);
+  const size_t index = EiemFindOverrideLocked(renderer);
+  if (index != SIZE_MAX) s_eiemOverrides[index].ownsMesh = true;
+  ReleaseSRWLockExclusive(&s_eiemOverrideLock);
+}
+
+static bool EiemPrepareRendererShapeBinding(void *renderer,void *target,const char *type,char *error,size_t size) {
+  if(!EiemModEquals(type,"SkinnedMeshRenderer"))return true;
+  bool ok=false;std::string reason="Original shape baseline unavailable";
+  AcquireSRWLockExclusive(&s_eiemOverrideLock);
+  size_t index=EiemFindOverrideLocked(renderer);
+  if(index!=SIZE_MAX && s_eiemOverrides[index].hasSourceShapeWeights) {
+    auto &state=s_eiemOverrides[index];EiemUnityShapes backend;
+    ok=EiemPrepareShapeBinding(state.shapes,renderer,target,state.sourceShapeWeights,backend,reason);
+  }
+  ReleaseSRWLockExclusive(&s_eiemOverrideLock);
+  if(!ok && error)strncpy_s(error,size,reason.c_str(),_TRUNCATE);return ok;
+}
+static bool EiemInitializeRendererShapeBinding(void *renderer,const char *type,char *error,size_t size) {
+  if(!EiemModEquals(type,"SkinnedMeshRenderer"))return true;
+  bool ok=false;std::string reason="Shape state unavailable";
+  AcquireSRWLockExclusive(&s_eiemOverrideLock);
+  size_t index=EiemFindOverrideLocked(renderer);
+  if(index!=SIZE_MAX) {EiemUnityShapes backend;ok=EiemInitializeBoundShapes(s_eiemOverrides[index].shapes,renderer,backend,reason);}
+  ReleaseSRWLockExclusive(&s_eiemOverrideLock);
+  if(!ok && error)strncpy_s(error,size,reason.c_str(),_TRUNCATE);return ok;
+}
+
 static void EiemRememberReplacement(void *renderer, void *replacementMesh,
                                     const char *rendererType) {
   if (!renderer) return;
@@ -807,7 +968,6 @@ static void EiemRememberReplacement(void *renderer, void *replacementMesh,
   size_t index = EiemFindOverrideLocked(renderer);
   if (index != SIZE_MAX) {
     s_eiemOverrides[index].replacementMesh = replacementMesh;
-    if (replacementMesh) s_eiemOverrides[index].ownsMesh = true;
   }
   ReleaseSRWLockExclusive(&s_eiemOverrideLock);
 }
@@ -821,7 +981,8 @@ static void *EiemReplacementForSourceMesh(void *renderer, void *mesh) {
   void *replacement = nullptr;
   AcquireSRWLockShared(&s_eiemOverrideLock);
   const size_t index = EiemFindOverrideLocked(renderer);
-  if (index != SIZE_MAX && s_eiemOverrides[index].originalMesh == mesh)
+  if (index != SIZE_MAX && !s_eiemOverrides[index].restorePending &&
+      s_eiemOverrides[index].originalMesh == mesh)
     replacement = s_eiemOverrides[index].replacementMesh;
   ReleaseSRWLockShared(&s_eiemOverrideLock);
   return replacement;
@@ -858,40 +1019,84 @@ static bool EiemSetRendererEnabled(void *renderer, bool enabled) {
   }
 }
 
+static void EiemReleaseOverrideHandles(const EiemRenderOverrideState &state) {
+  EiemRetireShapeBinding(state.shapes.binding);
+  if (state.originalMaterialsHandle && il2cpp_gchandle_free)
+    il2cpp_gchandle_free(state.originalMaterialsHandle);
+  if (state.originalBonesHandle && il2cpp_gchandle_free)
+    il2cpp_gchandle_free(state.originalBonesHandle);
+  if (state.replacementBonesHandle && il2cpp_gchandle_free)
+    il2cpp_gchandle_free(state.replacementBonesHandle);
+  if (state.originalRootBoneHandle && il2cpp_gchandle_free)
+    il2cpp_gchandle_free(state.originalRootBoneHandle);
+}
+
 static void EiemRestoreRenderOverrides(const std::vector<std::string> *affected = nullptr) {
   std::vector<EiemRenderOverrideState> states;
   AcquireSRWLockExclusive(&s_eiemOverrideLock);
-  for (size_t i = 0; i < s_eiemOverrides.size();) {
-    if (!EiemModAffected(s_eiemOverrides[i].modPath, affected)) { ++i; continue; }
-    states.push_back(s_eiemOverrides[i]);
-    s_eiemOverrides.erase(s_eiemOverrides.begin() + i);
+  for (auto &state : s_eiemOverrides) {
+    if (!EiemModAffected(state.modPath, affected)) continue;
+    state.restorePending = true; // stop re-entrant commits from reinstating old rules
+    states.push_back(state);
   }
   ReleaseSRWLockExclusive(&s_eiemOverrideLock);
+  size_t completed = 0;
   for (auto &state : states) {
+    auto finish = [&](bool success) {
+      bool removed = false;
+      AcquireSRWLockExclusive(&s_eiemOverrideLock);
+      for (size_t i = 0; i < s_eiemOverrides.size(); ++i) {
+        if (s_eiemOverrides[i].renderer != state.renderer) continue;
+        if (success) { s_eiemOverrides.erase(s_eiemOverrides.begin() + i); removed = true; }
+        else s_eiemOverrides[i].shapes = state.shapes;
+        break;
+      }
+      ReleaseSRWLockExclusive(&s_eiemOverrideLock);
+      if (removed) { EiemReleaseOverrideHandles(state); ++completed; }
+      if (!success) Log("[MOD] Restore incomplete; baseline retained renderer=%p mod=%s", state.renderer, state.modPath);
+    };
+    const int rendererStatus = state.rendererRef.Status();
+    if (rendererStatus != 1) { finish(rendererStatus == 0); continue; }
+    bool restoredAll = true;
+    EiemProbeTrackedRenderer("restore-before", state.renderer);
+    Log("[DEBUG-residue-v39] restore-plan renderer=%p original=%p replacement=%p ownsMesh=%d ownsMaterials=%d ownsEnabled=%d owner=%p",
+        state.renderer, state.originalMesh, state.replacementMesh, state.ownsMesh,
+        state.hasMaterials, state.hasEnabled, (void *)state.ownerPrefabInstance);
     EiemModRule noShapes = {};
     EiemUpdateRendererShapes(state.renderer, state.rendererType, noShapes, state.shapes);
+    if (!state.shapes.owned.empty()) restoredAll = false;
     Log("[DEBUG-hr1] restore renderer=%p original=%p replacement=%p restoreEnabled=%d originalEnabled=%d",
         state.renderer, state.originalMesh, state.replacementMesh,
         state.hasEnabled ? 1 : 0,
         state.originalEnabled ? 1 : 0);
-    if (state.ownsMesh && state.renderer && state.originalMesh &&
+    const bool sourceAlive = !state.ownsMesh ||
+        (state.sourceMeshRef.Target() == state.originalMesh && state.sourceMeshRef.Status() == 1);
+    if (!sourceAlive) restoredAll = false;
+    if (state.ownsMesh && sourceAlive &&
         EiemReadSharedMesh(state.renderer, state.rendererType) != state.originalMesh)
       EiemSetSharedMesh(state.renderer, state.originalMesh, state.rendererType, nullptr);
     if (state.ownsMesh && state.renderer) {
       void *restored = EiemReadSharedMesh(state.renderer, state.rendererType);
-      if (restored == state.originalMesh && state.hasSourceShapeWeights) {
+      if (restored != state.originalMesh) restoredAll = false;
+      if (sourceAlive && restored == state.originalMesh && state.hasSourceShapeWeights) {
         EiemUnityShapes shapes;
-        for (const auto &entry : state.sourceShapeWeights) {
+        for (const auto &entry : EiemShapeSourceWeights(state.shapes,state.sourceShapeWeights)) {
           const int index = shapes.Index(restored, entry.name);
-          if (index < 0 || !shapes.Write(state.renderer, index, entry.value))
+          float actual=0;
+          if (index < 0 || !shapes.Write(state.renderer, index, entry.value) ||
+              !shapes.Read(state.renderer,index,actual) || std::abs(actual-entry.value)>.0001f) {
+            restoredAll = false;
             Log("[SHAPE] Cannot restore source channel renderer=%p name=%s", state.renderer, entry.name.c_str());
+          }
         }
       }
       Log("[DEBUG-hr1] restore result renderer=%p actual=%p expected=%p ok=%d",
           state.renderer, restored, state.originalMesh,
           restored == state.originalMesh ? 1 : 0);
     }
-    if (state.drawRenderer && state.hasMaterials &&
+    const int drawStatus = state.drawRendererRef.Status();
+    if (drawStatus < 0 && (state.hasMaterials || state.hasEnabled)) restoredAll = false;
+    if (drawStatus == 1 && state.hasMaterials &&
         state.originalMaterialsHandle &&
         s_eiemRendererSetSharedMaterials && il2cpp_gchandle_get_target) {
       void *original = il2cpp_gchandle_get_target(state.originalMaterialsHandle);
@@ -903,56 +1108,55 @@ static void EiemRestoreRenderOverrides(const std::vector<std::string> *affected 
         std::vector<void *> live(currentItems, currentItems + currentCount);
         std::vector<void *> baseline(originalItems, originalItems + originalCount);
         auto restored = EiemRestoreOwnedSlots(live, baseline, state.materialSlots);
-        if (restored != live) {
+        bool valid = true;
+        for (size_t slot : state.materialSlots)
+          if (slot < restored.size() && restored[slot] && EiemNativeObjectStatus(restored[slot]) != 1) valid = false;
+        if (!valid) restoredAll = false;
+        if (valid && restored != live) {
           void *array = il2cpp_array_new(s_eiemMaterialClass, restored.size());
           if (array) {
             if (!restored.empty()) memcpy((char *)array + IL2CPP_ARRAY_DATA, restored.data(), restored.size() * sizeof(void *));
             void *params[] = {array};
             Invoke(s_eiemRendererSetSharedMaterials, state.drawRenderer, params);
-          } else Log("[MOD] Cannot allocate restored material slots renderer=%p", state.drawRenderer);
+            if (!EiemManagedObjectArraySame(array, Invoke(g_renderer_get_sharedMaterials, state.drawRenderer))) restoredAll = false;
+          } else { restoredAll = false; Log("[MOD] Cannot allocate restored material slots renderer=%p", state.drawRenderer); }
         }
-      }
-    }
-    if (state.drawRenderer && state.hasEnabled && g_renderer_set_enabled) {
+      } else restoredAll = false;
+    } else if (drawStatus == 1 && state.hasMaterials) restoredAll = false;
+    if (drawStatus == 1 && state.hasEnabled && g_renderer_set_enabled) {
       bool enabled = state.originalEnabled;
       void *params[] = {&enabled};
       Invoke(g_renderer_set_enabled, state.drawRenderer, params);
-    }
-    if (state.ownsMesh && state.renderer && state.hasSkinning &&
+      bool actual = !enabled;
+      if (!EiemReadRendererEnabled(state.drawRenderer, &actual) || actual != enabled) restoredAll = false;
+    } else if (drawStatus == 1 && state.hasEnabled) restoredAll = false;
+    if (sourceAlive && state.ownsMesh &&
+        EiemReadSharedMesh(state.renderer, state.rendererType) == state.originalMesh && state.hasSkinning &&
         il2cpp_gchandle_get_target) {
-      if (state.originalBonesHandle && g_smr_set_bones) {
+      if (state.originalBonesHandle) {
         void *bones = il2cpp_gchandle_get_target(state.originalBonesHandle);
-        if (bones && g_smr_get_bones && !EiemManagedObjectArraySame(bones, Invoke(g_smr_get_bones, state.renderer))) {
+        if (!bones || !g_smr_get_bones || !g_smr_set_bones) restoredAll = false;
+        else if (!EiemManagedObjectArraySame(bones, Invoke(g_smr_get_bones, state.renderer))) {
           void *params[] = {bones};
           Invoke(g_smr_set_bones, state.renderer, params);
+          if (!EiemManagedObjectArraySame(bones, Invoke(g_smr_get_bones, state.renderer))) restoredAll = false;
         }
       }
-      if (state.originalRootBoneHandle && g_smr_set_rootBone) {
+      if (state.originalRootBoneHandle) {
         void *rootBone = il2cpp_gchandle_get_target(state.originalRootBoneHandle);
-        if (rootBone && g_smr_get_rootBone && rootBone != Invoke(g_smr_get_rootBone, state.renderer)) {
+        if (!rootBone || !g_smr_get_rootBone || !g_smr_set_rootBone || EiemNativeObjectStatus(rootBone) != 1) restoredAll = false;
+        else if (rootBone != Invoke(g_smr_get_rootBone, state.renderer)) {
           void *params[] = {rootBone};
           Invoke(g_smr_set_rootBone, state.renderer, params);
+          if (rootBone != Invoke(g_smr_get_rootBone, state.renderer)) restoredAll = false;
         }
       }
     }
-    if (state.originalMaterialsHandle && il2cpp_gchandle_free)
-      il2cpp_gchandle_free(state.originalMaterialsHandle);
-    if (state.originalBonesHandle && il2cpp_gchandle_free)
-      il2cpp_gchandle_free(state.originalBonesHandle);
-    if (state.originalRootBoneHandle && il2cpp_gchandle_free)
-      il2cpp_gchandle_free(state.originalRootBoneHandle);
+    EiemProbeTrackedRenderer("restore-after", state.renderer);
+    finish(restoredAll);
   }
   if (!states.empty())
-    Log("[MOD] Restored %zu renderer override(s) before reload", states.size());
-}
-
-static void EiemReleaseOverrideHandles(const EiemRenderOverrideState &state) {
-  if (state.originalMaterialsHandle && il2cpp_gchandle_free)
-    il2cpp_gchandle_free(state.originalMaterialsHandle);
-  if (state.originalBonesHandle && il2cpp_gchandle_free)
-    il2cpp_gchandle_free(state.originalBonesHandle);
-  if (state.originalRootBoneHandle && il2cpp_gchandle_free)
-    il2cpp_gchandle_free(state.originalRootBoneHandle);
+    Log("[MOD] Restore complete: released=%zu pending=%zu", completed, states.size() - completed);
 }
 
 // The game is about to unload this Prefab. Its Renderer objects must not be
@@ -971,7 +1175,17 @@ static void EiemForgetRenderOverrides(uintptr_t ownerPrefabInstance) {
     s_eiemOverrides.erase(s_eiemOverrides.begin() + index);
   }
   ReleaseSRWLockExclusive(&s_eiemOverrideLock);
-  for (const auto &state : forgotten) EiemReleaseOverrideHandles(state);
+  for (const auto &state : forgotten) {
+    // No extra dereference of objects already entering teardown.
+    // An owner can release a pooled or deferred-destroy Renderer while its
+    // native bones array still references our nodes. Preserve that dependency
+    // without calling any native method from this teardown callback.
+    if (state.skeleton && state.ownsMesh)
+      EiemRetainSkeletonConsumer(*state.skeleton,state.rendererRef);
+    Log("[DEBUG-residue-v39] forget owner=%p renderer=%p original=%p replacement=%p ownsMesh=%d",
+        (void *)ownerPrefabInstance, state.renderer, state.originalMesh, state.replacementMesh, state.ownsMesh);
+    EiemReleaseOverrideHandles(state);
+  }
   if (!forgotten.empty())
     Log("[MOD-PREFAB] forgot %zu Renderer override(s) for instance=%p",
         forgotten.size(), (void *)ownerPrefabInstance);
@@ -984,6 +1198,7 @@ struct EiemResolvedRenderRule {
 };
 
 struct EiemPartnerState {
+  std::shared_ptr<EiemSkeletonInstance> skeleton;
   void *sourceRenderer = nullptr;
   void *sourceDrawRenderer = nullptr;
   void *partnerObject = nullptr;
@@ -1080,76 +1295,207 @@ static bool EiemAssignRendererMaterials(void *renderer, void *materials,
   return true;
 }
 
-// A replacement Mesh carries its own bindpose/weight palette, but the
-// SkinnedMeshRenderer still owns the live Transform palette used by Unity's
-// skinning job.  Endfield can rebuild that palette while assigning a Mesh;
-// restore it only when the game actually changed it, because reassigning an
-// unchanged palette itself can force the renderer back to bind pose.
-static void EiemPreserveSourceSkinning(void *renderer) {
-  if (!renderer) return;
-  void *bones = nullptr;
-  void *rootBone = nullptr;
-  bool capturedBones = false;
-  bool capturedRootBone = false;
+// Expose the existing per-instance baseline while RendererInfo._Init reads
+// Renderer.sharedMaterials into its sourceMaterials table. No controller field
+// offsets are written and no baseline/ownership record is released here.
+static bool EiemExposeSourceMaterialsForInit(void *renderer) {
+  if (!renderer || !EiemOnUnityThread()) return false;
+  EiemUnityRef originalRef;
+  std::vector<size_t> owned;
+  bool hasBaseline = false;
   AcquireSRWLockShared(&s_eiemOverrideLock);
-  const size_t overrideIndex = EiemFindOverrideLocked(renderer);
-  if (overrideIndex != SIZE_MAX && il2cpp_gchandle_get_target) {
-    const EiemRenderOverrideState &state = s_eiemOverrides[overrideIndex];
-    if (state.originalBonesHandle) {
-      bones = il2cpp_gchandle_get_target(state.originalBonesHandle);
-      capturedBones = bones != nullptr;
-    }
-    if (state.originalRootBoneHandle) {
-      rootBone = il2cpp_gchandle_get_target(state.originalRootBoneHandle);
-      capturedRootBone = rootBone != nullptr;
-    }
+  for (const auto &state : s_eiemOverrides) {
+    if (state.drawRenderer != renderer || state.drawRendererRef.Target() != renderer ||
+        !state.hasMaterials) continue;
+    hasBaseline = true;
+    void *original = state.originalMaterialsHandle && il2cpp_gchandle_get_target
+                         ? il2cpp_gchandle_get_target(state.originalMaterialsHandle) : nullptr;
+    originalRef = EiemUnityRef::Capture(original, false);
+    owned = state.materialSlots;
+    break;
   }
   ReleaseSRWLockShared(&s_eiemOverrideLock);
-  if (g_smr_get_bones) {
-    if (!capturedBones) __try { bones = Invoke(g_smr_get_bones, renderer); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { bones = nullptr; }
+  if (!hasBaseline) return true; // not modified by EIEM
+  if (!originalRef || EiemNativeObjectStatus(renderer) != 1 ||
+      !g_renderer_get_sharedMaterials || !s_eiemMaterialClass) {
+    Log("[MOD-MATERIAL-SOURCE] cannot expose source slots before init renderer=%p", renderer);
+    return false;
   }
-  if (g_smr_get_rootBone) {
-    if (!capturedRootBone) __try { rootBone = Invoke(g_smr_get_rootBone, renderer); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { rootBone = nullptr; }
+  void *original = originalRef.Target();
+  void *current = Invoke(g_renderer_get_sharedMaterials, renderer);
+  if (!original || !current) {
+    Log("[MOD-MATERIAL-SOURCE] source/current slots unavailable renderer=%p", renderer);
+    return false;
   }
-  // Assigning these properties is not a harmless readback in Endfield: its
-  // skin setup observes the setter and can rebuild the pose palette at bind
-  // pose.  The replacement Mesh does not change the renderer's palette, so
-  // leave it alone unless the game actually replaced the array/root bone.
-  bool bonesChanged = false;
-  bool rootBoneChanged = false;
-  if (bones && g_smr_get_bones && g_smr_set_bones) {
-    void *current = nullptr;
-    __try { current = Invoke(g_smr_get_bones, renderer); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { current = nullptr; }
-    bonesChanged = !EiemManagedObjectArraySame(current, bones);
-    if (bonesChanged) {
-      void *params[] = {bones};
-      __try { Invoke(g_smr_set_bones, renderer, params); }
-      __except (EXCEPTION_EXECUTE_HANDLER) {}
+  const size_t originalCount = EiemManagedArrayLength(original);
+  const size_t currentCount = EiemManagedArrayLength(current);
+  void **originalItems = (void **)((char *)original + IL2CPP_ARRAY_DATA);
+  void **currentItems = (void **)((char *)current + IL2CPP_ARRAY_DATA);
+  std::vector<void *> baseline(originalItems, originalItems + originalCount);
+  std::vector<void *> live(currentItems, currentItems + currentCount);
+  auto restored = EiemRestoreOwnedSlots(live, baseline, owned);
+  for (size_t slot : owned) {
+    if (slot < restored.size() && restored[slot] && EiemNativeObjectStatus(restored[slot]) != 1) {
+      Log("[MOD-MATERIAL-SOURCE] source material unavailable renderer=%p slot=%zu", renderer, slot);
+      return false;
     }
   }
-  if (rootBone && g_smr_get_rootBone && g_smr_set_rootBone) {
-    void *current = nullptr;
-    __try { current = Invoke(g_smr_get_rootBone, renderer); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { current = nullptr; }
-    rootBoneChanged = current != rootBone;
-    if (rootBoneChanged) {
-      void *params[] = {rootBone};
-      __try { Invoke(g_smr_set_rootBone, renderer, params); }
-      __except (EXCEPTION_EXECUTE_HANDLER) {}
-    }
+  if (restored == live) return true;
+  void *array = il2cpp_array_new(s_eiemMaterialClass, restored.size());
+  char error[256] = {};
+  if (!array) {
+    Log("[MOD-MATERIAL-SOURCE] cannot allocate source slots renderer=%p", renderer);
+    return false;
   }
-  Log("[DEBUG-SKIN-STATE] renderer=%p bones=%zu rootBone=%p changed=%d/%d",
-      renderer, EiemManagedArrayLength(bones), rootBone,
-      bonesChanged ? 1 : 0, rootBoneChanged ? 1 : 0);
-  EiemLogRendererBoneFingerprint("after-assignment", renderer);
+  if (!restored.empty())
+    memcpy((char *)array + IL2CPP_ARRAY_DATA, restored.data(), restored.size() * sizeof(void *));
+  if (!EiemAssignRendererMaterials(renderer, array, error, sizeof(error))) {
+    Log("[MOD-MATERIAL-SOURCE] source exposure failed renderer=%p error=%s", renderer, error);
+    return false;
+  }
+  Log("[MOD-MATERIAL-SOURCE] exposed source before controller init renderer=%p ownedSlots=%zu", renderer, owned.size());
+  return true;
 }
 
-// The game may assign the Renderer bone palette after sharedMesh.  This is
-// observation-only: record the final palette for an actively replaced
-// renderer so a twisted result can be distinguished from bad mesh weights.
+// Resolve resource-local slots against the current instance's shared skeleton.
+// This does not change any Renderer; callers prepare everything before writing.
+static bool EiemResolveMeshBones(const EiemSkinIdentity &identity, void *renderer,
+                                  void **out, char *error, size_t errorSize) {
+  if (out) *out = nullptr;
+  auto reject = [&](const std::string &reason) {
+    if (error) strncpy_s(error, errorSize, reason.c_str(), _TRUNCATE);
+    return false;
+  };
+  if (!EiemOnUnityThread() || !g_smr_get_bones || !g_transform_get_parent ||
+      !g_object_get_name || !il2cpp_array_new || !g_transformClass)
+    return reject("Shared skeleton APIs are unavailable");
+  void *current = EiemBackendInvokeNoThrow(g_smr_get_bones, renderer);
+  const size_t count = EiemManagedArrayLength(current);
+  if (!current || !count || count > 4096) return reject("Source renderer has no valid bone palette");
+  void **items = (void **)((char *)current + IL2CPP_ARRAY_DATA);
+  std::vector<void *> resolved;
+  if (identity.paths.empty()) {
+    // Pathless source packages retain hash identity. No count equality or
+    // index-order guess: each slot must resolve uniquely within this palette.
+    for (uint32_t hash : identity.hashes) {
+      void *found = nullptr;
+      for (size_t i=0; i<count; ++i) {
+        std::vector<uint32_t> hashes; EiemCollectBonePathHashes(items[i], &hashes);
+        if (std::find(hashes.begin(), hashes.end(), hash) == hashes.end()) continue;
+        if (found && found != items[i]) return reject("Ambiguous source bone hash");
+        found=items[i];
+      }
+      if (!found) return reject("Source bone hash not found; re-export with bone paths");
+      resolved.push_back(found);
+    }
+  } else {
+    if (!g_transform_get_childCount || !g_transform_GetChild)
+      return reject("Shared skeleton traversal APIs are unavailable");
+    std::vector<std::string> sourcePaths;
+    std::unordered_map<std::string, void *> ancestors;
+    for (size_t i=0; i<count; ++i) {
+      std::vector<std::pair<std::string,void *>> chain;
+      for (void *bone=items[i]; bone; bone=EiemBackendInvokeNoThrow(g_transform_get_parent,bone)) {
+        if (chain.size() >= 128 || EiemNativeObjectStatus(bone) != 1)
+          return reject("Source skeleton ancestor is invalid");
+        char name[256]={};
+        ReadStrUtf8(EiemBackendInvokeNoThrow(g_object_get_name,bone),name,sizeof(name));
+        if (!name[0]) return reject("Source skeleton node has no name");
+        chain.emplace_back(name,bone);
+      }
+      std::string full;
+      for (auto it=chain.rbegin(); it!=chain.rend(); ++it) {
+        if (!full.empty()) full+='/';
+        full+=it->first;
+        auto inserted=ancestors.emplace(full,it->second);
+        if (!inserted.second && inserted.first->second!=it->second)
+          return reject("Ambiguous skeleton ancestor path");
+      }
+      sourcePaths.push_back(full);
+    }
+    std::string root, why;
+    if (!EiemSkinRootPath(sourcePaths,identity.paths,root,why)) return reject(why);
+    auto ancestor=ancestors.find(root);
+    if (ancestor==ancestors.end()) return reject("Shared skeleton root is absent");
+    std::vector<void *> nodes{ancestor->second};
+    std::vector<std::string> paths{root.substr(root.find_last_of('/')+1)};
+    for (size_t index=0; index<nodes.size(); ++index) {
+      if (nodes.size()>16384) return reject("Skeleton hierarchy exceeds traversal limit");
+      void *boxed=EiemBackendInvokeNoThrow(g_transform_get_childCount,nodes[index]);
+      if (!boxed) return reject("Cannot read shared skeleton children");
+      const int children=*(int *)((char *)boxed+16);
+      if (children<0 || children>16384) return reject("Invalid skeleton child count");
+      for (int child=0; child<children; ++child) {
+        void *params[]={&child};
+        void *node=Invoke(g_transform_GetChild,nodes[index],params);
+        if (!node || EiemNativeObjectStatus(node)!=1) return reject("Shared skeleton child is unavailable");
+        char name[256]={};
+        ReadStrUtf8(EiemBackendInvokeNoThrow(g_object_get_name,node),name,sizeof(name));
+        if (!name[0]) return reject("Shared skeleton child has no name");
+        paths.push_back(paths[index]+"/"+name); nodes.push_back(node);
+      }
+    }
+    std::vector<size_t> slots;
+    if (!EiemResolveSkinPathIndices(identity.paths,paths,slots,why)) return reject(why);
+    for (size_t index:slots) resolved.push_back(nodes[index]);
+  }
+  if (resolved.empty()) return reject("Replacement mesh has no resolved bones");
+  bool same=count==resolved.size();
+  for (size_t i=0; same && i<count; ++i) same=items[i]==resolved[i];
+  if (same) { if (out) *out=current; return true; }
+  void *array=il2cpp_array_new(g_transformClass,resolved.size());
+  if (!array) return reject("Cannot allocate expanded bone palette");
+  memcpy((char *)array+IL2CPP_ARRAY_DATA,resolved.data(),resolved.size()*sizeof(void *));
+  if (out) *out=array;
+  return true;
+}
+
+// Mesh bindings are instance state. Store the exact replacement array for
+// later game setter refreshes; the original array remains separate for F10.
+static bool EiemPreserveSourceSkinning(void *renderer, void *bones,
+                                        char *error, size_t errorSize) {
+  if (!renderer || !bones || !g_smr_get_bones || !g_smr_set_bones ||
+      !il2cpp_gchandle_new || !il2cpp_gchandle_free) return false;
+  const size_t boneCount=EiemManagedArrayLength(bones);
+  void **boneItems=(void **)((char *)bones+IL2CPP_ARRAY_DATA);
+  for (size_t i=0; i<boneCount; ++i) if (EiemNativeObjectStatus(boneItems[i])!=1) {
+    if (error) strncpy_s(error,errorSize,"Replacement skeleton instance is no longer alive",_TRUNCATE);
+    return false;
+  }
+  const uint32_t handle=il2cpp_gchandle_new(bones,false);
+  if (!handle) return false;
+  bool same=EiemManagedObjectArraySame(bones,Invoke(g_smr_get_bones,renderer));
+  bool ok=true;
+  if (!same) {
+    void *params[]={bones};
+    const bool previous=s_eiemApplyingModMeshAssignment;
+    s_eiemApplyingModMeshAssignment=true;
+    void *result=nullptr;
+    ok=InvokeChecked(g_smr_set_bones,renderer,params,&result);
+    s_eiemApplyingModMeshAssignment=previous;
+    ok=ok && EiemManagedObjectArraySame(bones,Invoke(g_smr_get_bones,renderer));
+  }
+  uint32_t old=0;
+  if (ok) {
+    AcquireSRWLockExclusive(&s_eiemOverrideLock);
+    const size_t index=EiemFindOverrideLocked(renderer);
+    if (index!=SIZE_MAX) {
+      old=s_eiemOverrides[index].replacementBonesHandle;
+      s_eiemOverrides[index].replacementBonesHandle=handle;
+    } else ok=false;
+    ReleaseSRWLockExclusive(&s_eiemOverrideLock);
+  }
+  if (!ok) {
+    il2cpp_gchandle_free(handle);
+    if (error) strncpy_s(error,errorSize,"Replacement bone palette assignment failed",_TRUNCATE);
+  }
+  if (old) il2cpp_gchandle_free(old);
+  Log("[MOD-SKIN] renderer=%p slots=%zu changed=%d applied=%d",renderer,EiemManagedArrayLength(bones),!same,ok);
+  return ok;
+}
+
+// A later game skin refresh must not shrink an extended palette back to the
+// source slots. Reassert only this instance's owned replacement binding.
 static void TraceSkinnedMeshSetBones(void *self, void *bones,
                                      void *methodInfo) {
   auto original = (TraceSetBonesFn)s_origSkinnedMeshSetBones;
@@ -1158,11 +1504,22 @@ static void TraceSkinnedMeshSetBones(void *self, void *bones,
     return;
   }
   bool tracked = false;
+  uint32_t binding = 0;
   AcquireSRWLockShared(&s_eiemOverrideLock);
   const size_t index = EiemFindOverrideLocked(self);
-  if (index != SIZE_MAX && s_eiemOverrides[index].replacementMesh)
+  if (index != SIZE_MAX && !s_eiemOverrides[index].restorePending && s_eiemOverrides[index].replacementMesh) {
     tracked = true;
+    binding = s_eiemOverrides[index].replacementBonesHandle;
+  }
   ReleaseSRWLockShared(&s_eiemOverrideLock);
+  if (tracked && binding && EiemOnUnityThread() && il2cpp_gchandle_get_target) {
+    void *expected = il2cpp_gchandle_get_target(binding);
+    if (expected && !EiemManagedObjectArraySame(bones, expected)) {
+      char error[256] = {};
+      if (!EiemPreserveSourceSkinning(self, expected, error, sizeof(error)))
+        Log("[MOD-SKIN] game refresh binding failed renderer=%p error=%s", self, error);
+    }
+  }
   if (!tracked || !TraceTakeBudget(&s_traceBonesSetterCount, 80)) return;
 
   const size_t count = EiemManagedArrayLength(bones);
@@ -1270,6 +1627,7 @@ static bool EiemSetPartnerLodMembership(void *sourceRenderer,
 }
 
 static void EiemRetirePartner(const EiemPartnerState &state) {
+  EiemRetireShapeBinding(state.shapes.binding);
   if (state.partnerRenderer) {
     EiemSetRendererEnabled(state.partnerRenderer, false);
     EiemSetPartnerLodMembership(state.sourceDrawRenderer, state.partnerRenderer, false);
@@ -1355,7 +1713,9 @@ static void *EiemCreatePartnerRenderer(void *sourceMeshOwner,
   }
   void *partnerMeshOwner = nullptr;
   void *partnerDrawRenderer = nullptr;
+  EiemShapeState partnerShapes;
   auto cleanupPartner = [&]() {
+    EiemRetireShapeBinding(partnerShapes.binding);
     if (partnerGo && g_object_destroy) {
       void *params[] = {partnerGo};
       Invoke(g_object_destroy, nullptr, params);
@@ -1430,17 +1790,58 @@ static void *EiemCreatePartnerRenderer(void *sourceMeshOwner,
   }
 
   void *assignedMesh = sourceMesh;
+  std::shared_ptr<EiemSkeletonInstance> partnerSkeleton;
+  if (partnerRule.hasSkeleton &&
+      (!EiemModEquals(rendererType,"SkinnedMeshRenderer") ||
+       !EiemAcquireSkeleton(partnerRule,sourceMeshOwner,partnerSkeleton,error,errorSize))) {
+    cleanupPartner(); return nullptr;
+  }
+  if (partnerSkeleton && !EiemWatchSkeletonPartner(*partnerSkeleton,partnerMeshOwner)) {
+    if (error) strncpy_s(error,errorSize,"Cannot retain Skeleton partner lifetime",_TRUNCATE);
+    cleanupPartner(); return nullptr;
+  }
+  std::shared_ptr<const EiemSkinIdentity> partnerSkin;
   char buildError[256] = {};
   if (partnerRule.hasMesh &&
       !EiemBuildMeshResource(partnerRule, &assignedMesh, buildError,
-                             sizeof(buildError), sourceMesh,
-                             EiemModEquals(rendererType,
-                                           "SkinnedMeshRenderer")
-                                 ? sourceMeshOwner
-                                 : nullptr)) {
+                             sizeof(buildError), sourceMesh, &partnerSkin)) {
     if (error) strncpy_s(error, errorSize, buildError, _TRUNCATE);
     cleanupPartner();
     return nullptr;
+  }
+  void *partnerBones = nullptr;
+  EiemUnityRef partnerBonesRoot;
+  if (partnerSkin && !EiemModEquals(rendererType, "SkinnedMeshRenderer")) {
+    if (error) strncpy_s(error, errorSize, "Skinned partner mesh requires a source skeleton", _TRUNCATE);
+    cleanupPartner();
+    return nullptr;
+  }
+  if (partnerSkin && !(partnerSkeleton
+      ? EiemSkeletonMeshBones(*partnerSkin,*partnerSkeleton,&partnerBones,buildError,sizeof(buildError))
+      : EiemResolveMeshBones(*partnerSkin, sourceMeshOwner, &partnerBones, buildError, sizeof(buildError)))) {
+    if (error) strncpy_s(error, errorSize, buildError, _TRUNCATE);
+    cleanupPartner();
+    return nullptr;
+  }
+  if (partnerBones) {
+    partnerBonesRoot=EiemUnityRef::Capture(partnerBones,false);
+    if (!partnerBonesRoot) { cleanupPartner(); return nullptr; }
+  }
+  if(EiemModEquals(rendererType,"SkinnedMeshRenderer")) {
+    std::vector<EiemShapeBaseline> baseline;bool captured=false;
+    AcquireSRWLockShared(&s_eiemOverrideLock);
+    size_t index=EiemFindOverrideLocked(sourceMeshOwner);
+    if(index!=SIZE_MAX && s_eiemOverrides[index].hasSourceShapeWeights) {
+      const auto &original=s_eiemOverrides[index];baseline=EiemShapeSourceWeights(original.shapes,original.sourceShapeWeights);captured=true;
+    }
+    ReleaseSRWLockShared(&s_eiemOverrideLock);
+    EiemUnityShapes backend;std::string reason;
+    if(!captured && EiemReadSharedMesh(sourceMeshOwner,rendererType)==sourceMesh)
+      captured=backend.Snapshot(sourceMeshOwner,sourceMesh,baseline);
+    if(!captured || !EiemPrepareShapeBinding(partnerShapes,partnerMeshOwner,assignedMesh,baseline,backend,reason)) {
+      if(error)strncpy_s(error,errorSize,reason.empty()?"Partner source shape baseline unavailable":reason.c_str(),_TRUNCATE);
+      cleanupPartner();return nullptr;
+    }
   }
   if (assignedMesh && !EiemSetSharedMesh(partnerMeshOwner, assignedMesh,
                                           rendererType, nullptr)) {
@@ -1449,9 +1850,26 @@ static void *EiemCreatePartnerRenderer(void *sourceMeshOwner,
     return nullptr;
   }
   if (EiemModEquals(rendererType, "SkinnedMeshRenderer")) {
+    EiemUnityShapes shapeBackend;std::string shapeError;
+    if(!EiemInitializeBoundShapes(partnerShapes,partnerMeshOwner,shapeBackend,shapeError)) {
+      if(error)strncpy_s(error,errorSize,shapeError.c_str(),_TRUNCATE);cleanupPartner();return nullptr;
+    }
     if (g_smr_get_bones && g_smr_set_bones) {
-      void *bones = Invoke(g_smr_get_bones, sourceMeshOwner);
-      if (bones) { void *params[] = {bones}; Invoke(g_smr_set_bones, partnerMeshOwner, params); }
+      void *bones = partnerBones ? partnerBones : Invoke(g_smr_get_bones, sourceMeshOwner);
+      if (bones) {
+        void *params[] = {bones};
+        void *result = nullptr;
+        if (!InvokeChecked(g_smr_set_bones, partnerMeshOwner, params, &result) ||
+            !EiemManagedObjectArraySame(bones, Invoke(g_smr_get_bones, partnerMeshOwner))) {
+          if (error) strncpy_s(error, errorSize, "Partner bone palette assignment failed", _TRUNCATE);
+          cleanupPartner();
+          return nullptr;
+        }
+      }
+    } else if (partnerSkin) {
+      if (error) strncpy_s(error, errorSize, "Partner skin binding APIs are unavailable", _TRUNCATE);
+      cleanupPartner();
+      return nullptr;
     }
     if (g_smr_get_rootBone && g_smr_set_rootBone) {
       void *rootBone = Invoke(g_smr_get_rootBone, sourceMeshOwner);
@@ -1527,10 +1945,12 @@ static void *EiemCreatePartnerRenderer(void *sourceMeshOwner,
       EiemReadSharedMesh(partnerMeshOwner, rendererType), partnerMaterials);
 
   EiemPartnerState state = {};
+  state.skeleton=std::move(partnerSkeleton);
   state.sourceRenderer = sourceMeshOwner;
   state.sourceDrawRenderer = sourceDrawRenderer;
   state.partnerObject = partnerGo;
   state.partnerRenderer = partnerDrawRenderer;
+  state.shapes=std::move(partnerShapes);
   strncpy_s(state.rendererType, sizeof(state.rendererType), rendererType, _TRUNCATE);
   EiemUpdateRendererShapes(partnerDrawRenderer, rendererType, partnerRule, state.shapes);
   state.generation = InterlockedCompareExchange(&s_eiemModGeneration, 0, 0);
@@ -1978,6 +2398,9 @@ static void TraceCharUIModelSetVisible(void *self, bool visible,
   if (original) original(self, visible, methodInfo);
   if (visible)
     EiemRegisterCharUIModelInstance(self, "CharUIModelMono.SetVisible");
+  else
+    EiemSetModelOwnerActive(EiemModelOwnerKind::CharUIModel, self, false,
+                            "CharUIModelMono.SetVisible(false)");
 }
 
 static void TraceCharUIModelOnRelease(void *self, void *methodInfo) {
@@ -2250,18 +2673,42 @@ static bool EiemApplyResolvedRenderRule(void *renderer, void *drawRenderer,
   // game's setter unchanged.
   const bool skipOriginal = EiemModEquals(rule.handling, "skip");
   const bool applyMesh = allowMeshReplacement && rule.hasMesh;
-  if (!applyMesh && !skipOriginal && !rule.materialCount && !rule.submeshCount && !rule.shapeCount &&
+  if (!applyMesh && !(allowMeshReplacement && rule.hasSkeleton) && !skipOriginal && !rule.materialCount && !rule.submeshCount && !rule.shapeCount &&
       !(allowMeshReplacement && rule.partnerCount))
     return false;
 
+  EiemProbeRememberRule(rule, mesh);
+  EiemProbeRenderer("apply-before", renderer, drawRenderer, rendererType, mesh, true);
   if (!EiemCaptureOriginal(renderer, drawRenderer, mesh, rendererType, applyMesh, nullptr, rule.shapeCount != 0)) return false;
   EiemRememberRuleBinding(renderer, rule);
+
+  std::shared_ptr<EiemSkeletonInstance> skeleton;
+  bool skeletonReady=true;
+  if (allowMeshReplacement && rule.hasSkeleton) {
+    char skeletonError[256]={};
+    skeletonReady=EiemModEquals(rendererType,"SkinnedMeshRenderer") &&
+        EiemAcquireSkeleton(rule,renderer,skeleton,skeletonError,sizeof(skeletonError));
+    if (skeletonReady) {
+      AcquireSRWLockExclusive(&s_eiemOverrideLock);
+      const auto index=EiemFindOverrideLocked(renderer);
+      if (index!=SIZE_MAX) {
+        auto &owned=s_eiemOverrides[index].skeleton;
+        if (owned && owned!=skeleton) {
+          // A later conflicting rule must not drop nodes still referenced by
+          // the previously assigned Mesh. Restore its binding first (F10).
+          skeletonReady=false;
+          Log("[SKELETON] Conflicting Skeleton on renderer=%p; restore before rebinding",renderer);
+        } else owned=skeleton;
+      } else skeletonReady=false;
+      ReleaseSRWLockExclusive(&s_eiemOverrideLock);
+    } else Log("[SKELETON] %s / %s: %s",rule.modPath,rule.section,
+        skeletonError[0]?skeletonError:"Skeleton requires a skinned source Renderer");
+  }
 
   // `handling=skip` owns only the source Renderer state. It is intentionally
   // independent from every resource mount below.
   if (skipOriginal) {
     EiemCaptureEnabledForSkip(renderer, drawRenderer);
-    EiemRememberReplacement(renderer, nullptr, rendererType);
     if (g_renderer_set_enabled)
       EiemSetRendererEnabled(drawRenderer, false);
     Log("[MOD] %s resource skip applied: source=%s asset=%s", rendererType,
@@ -2272,14 +2719,27 @@ static bool EiemApplyResolvedRenderRule(void *renderer, void *drawRenderer,
   // create another Renderer; an additional Renderer must be declared and
   // referenced explicitly through `partner.N`.
   bool meshApplied = false;
-  if (applyMesh) {
+  if (applyMesh && skeletonReady) {
     void *assignedMesh = nullptr;
+    void *assignedBones = nullptr;
+    std::shared_ptr<const EiemSkinIdentity> skin;
+    EiemUnityRef assignedBonesRoot;
     char meshError[256] = {};
-    meshApplied = EiemBuildMeshResource(rule, &assignedMesh, meshError,
-                                        sizeof(meshError), mesh, renderer) &&
-                  assignedMesh &&
-                  EiemSetSharedMesh(renderer, assignedMesh, rendererType,
-                                    nullptr);
+    if (EiemBuildMeshResource(rule, &assignedMesh, meshError,
+                              sizeof(meshError), mesh, &skin) && assignedMesh &&
+        (!skin || (EiemModEquals(rendererType,"SkinnedMeshRenderer") &&
+                   (skeleton ? EiemSkeletonMeshBones(*skin,*skeleton,&assignedBones,meshError,sizeof(meshError))
+                             : EiemResolveMeshBones(*skin,renderer,&assignedBones,meshError,sizeof(meshError))))) &&
+        (!assignedBones || (assignedBonesRoot=EiemUnityRef::Capture(assignedBones,false))) &&
+        EiemPrepareRendererShapeBinding(renderer,assignedMesh,rendererType,meshError,sizeof(meshError))) {
+      // A failed native setter can already have cleared the field. Own the
+      // restoration BEFORE calling it, independently of skip and success.
+      EiemBeginMeshWrite(renderer);
+      meshApplied = EiemSetSharedMesh(renderer, assignedMesh, rendererType, nullptr);
+      if(meshApplied)meshApplied=EiemInitializeRendererShapeBinding(renderer,rendererType,meshError,sizeof(meshError));
+      if (meshApplied && assignedBones)
+        meshApplied = EiemPreserveSourceSkinning(renderer, assignedBones, meshError, sizeof(meshError));
+    }
     if (meshApplied) EiemRememberReplacement(renderer, assignedMesh, rendererType);
     if (!meshApplied)
       Log("[MOD] %s resource mesh replacement failed: source=%s asset=%s mesh=%s error=%s",
@@ -2290,8 +2750,6 @@ static bool EiemApplyResolvedRenderRule(void *renderer, void *drawRenderer,
         rendererType, source, asset, rule.mesh,
         meshApplied ? "true" : "false",
         EiemReadSharedMesh(renderer, rendererType));
-    if (meshApplied && EiemModEquals(rendererType, "SkinnedMeshRenderer"))
-      EiemPreserveSourceSkinning(renderer);
     if (meshApplied)
       EiemPreserveSourceDrawState(renderer, rendererType);
   }
@@ -2299,7 +2757,7 @@ static bool EiemApplyResolvedRenderRule(void *renderer, void *drawRenderer,
   // Material edits remain source-Renderer edits and are likewise independent
   // of skip/mesh. They are applied after the two resource actions above.
   char error[256] = {};
-  if (rule.materialCount || rule.submeshCount) {
+  if ((rule.materialCount || rule.submeshCount) && !EiemMaterialSourceInitActive(drawRenderer)) {
     void *materials = nullptr;
     if (!EiemBuildRendererMaterialsForSource(rule, drawRenderer, &materials,
                                              error,
@@ -2345,6 +2803,7 @@ static bool EiemApplyResolvedRenderRule(void *renderer, void *drawRenderer,
   }
   if (allowMeshReplacement)
     EiemApplyPartners(renderer, drawRenderer, mesh, rendererType, rule);
+  EiemProbeRenderer("apply-after", renderer, drawRenderer, rendererType, nullptr, true);
   return true;
 }
 
@@ -2370,7 +2829,8 @@ static bool EiemApplyRenderRuleSetToRenderer(
     const char *rendererType, void *methodInfo,
     const std::vector<EiemModRule> &rules, const char *sourceLabel,
     bool *referenced = nullptr, bool *matched = nullptr,
-    const std::vector<std::string> *affected = nullptr) {
+    const std::vector<std::string> *affected = nullptr,
+    std::vector<EiemPhysicsIntent> *physicsIntents = nullptr) {
   if (!meshOwner || !drawRenderer || !mesh || !rendererType) return false;
   if (s_eiemCreatingPartner || EiemIsPartnerRenderer(drawRenderer)) return false;
   void *identityMesh = mesh;
@@ -2402,6 +2862,10 @@ static bool EiemApplyRenderRuleSetToRenderer(
       continue;
     if (referenced) referenced[ruleIndex] = true;
     if (matched) *matched = true;
+    if (rule.hasPhysics && physicsIntents &&
+        !EiemCollectPhysicsIntent(rule, physicsIntents, drawRenderer))
+      Log("[PHYSICS] Cannot resolve matched intent: mod=%s render=%s resource=%s",
+          rule.modPath, rule.section, rule.physics);
     // Preserve first-match precedence even during a mod-scoped key update.
     // Filtering the rule list before matching would promote a lower-priority mod.
     if (!EiemModAffected(rule.modPath, affected)) return false;
@@ -2421,9 +2885,10 @@ static bool EiemApplyRenderRuleSetToRenderer(
 static bool EiemApplyRenderRuleSet(void *model,
                                    const std::vector<EiemModRule> &rules,
                                    const char *sourceLabel,
-                                   const char *stage, bool *referenced = nullptr,
-                                   bool *matched = nullptr,
-                                   const std::vector<std::string> *affected = nullptr) {
+                                    const char *stage, bool *referenced = nullptr,
+                                    bool *matched = nullptr,
+                                    const std::vector<std::string> *affected = nullptr,
+                                    std::vector<EiemPhysicsIntent> *physicsIntents = nullptr) {
   if (!model || rules.empty() || !EiemOnUnityThread() ||
       !g_gameObject_GetComponentsInChildren || !il2cpp_class_get_type ||
       !il2cpp_type_get_object)
@@ -2459,7 +2924,8 @@ static bool EiemApplyRenderRuleSet(void *model,
       void *mesh = EiemReadSharedMesh(meshOwner, rendererType);
       if (mesh && EiemApplyRenderRuleSetToRenderer(
                       root, meshOwner, drawRenderer, mesh, rendererType,
-                      nullptr, rules, sourceLabel, referenced, matched, affected))
+                      nullptr, rules, sourceLabel, referenced, matched, affected,
+                      physicsIntents))
         ++applied;
     }
   };
@@ -2473,10 +2939,12 @@ static bool EiemApplyRenderRuleSet(void *model,
 }
 
 static bool EiemApplyStandaloneRenderRules(void *model, const char *stage,
-                                           bool *matched, const std::vector<std::string> *affected) {
+                                           bool *matched, const std::vector<std::string> *affected,
+                                           std::vector<EiemPhysicsIntent> *physicsIntents) {
   std::vector<EiemModRule> rules;
   EiemFindStandaloneRenderRules(&rules);
-  return EiemApplyRenderRuleSet(model, rules, "<mesh identity>", stage, nullptr, matched, affected);
+  return EiemApplyRenderRuleSet(model, rules, "<mesh identity>", stage, nullptr,
+                                matched, affected, physicsIntents);
 }
 
 static bool EiemApplyStandaloneRenderRulesToRenderer(
@@ -2494,17 +2962,82 @@ static bool EiemApplyStandaloneRenderRulesToRenderer(
 struct EiemModelOwnerRef {
   EiemModelOwnerKind kind = EiemModelOwnerKind::PrefabProxy;
   void *owner = nullptr;
+  bool active = true;
 };
 
 struct EiemModelInstanceState {
   void *model = nullptr;
+  EiemUnityRef modelRef;
   uint32_t instanceUid = 0;
   char path[768] = {};
   EiemModelOwnerRef owners[4] = {};
   uint32_t ownerCount = 0;
+  // Declarative snapshots only. Native component handles and retirement
+  // state live in the Physics runtime adapter, not in this match plan.
+  std::vector<EiemPhysicsIntent> physicsIntents;
 };
 static SRWLOCK s_eiemModelInstanceLock = SRWLOCK_INIT;
 static std::vector<EiemModelInstanceState> s_eiemModelInstances;
+
+static bool EiemModelHasActiveOwner(const EiemModelInstanceState &state) {
+  for (uint32_t index = 0; index < state.ownerCount; ++index)
+    if (state.owners[index].active) return true;
+  return false;
+}
+
+static void EiemStoreModelPhysicsIntents(
+    void *model, std::vector<EiemPhysicsIntent> intents, const char *stage) {
+  if (!model) return;
+  const auto currentIntents = intents;
+  const size_t current = intents.size();
+  size_t previous = 0;
+  bool found = false;
+  bool active = false;
+  AcquireSRWLockExclusive(&s_eiemModelInstanceLock);
+  for (auto &state : s_eiemModelInstances) {
+    if (state.model != model) continue;
+    previous = state.physicsIntents.size();
+    state.physicsIntents = std::move(intents);
+    active = EiemModelHasActiveOwner(state);
+    found = true;
+    break;
+  }
+  ReleaseSRWLockExclusive(&s_eiemModelInstanceLock);
+  if (found && (previous || current))
+    Log("[PHYSICS-PLAN] model=%p previous=%zu current=%zu active=%d stage=%s",
+        model, previous, current, active ? 1 : 0,
+        stage ? stage : "unknown");
+  if (found)
+    EiemReconcileModelPhysics(model, currentIntents, active, stage);
+}
+
+static void EiemSetModelOwnerActive(EiemModelOwnerKind ownerKind, void *owner,
+                                    bool active, const char *stage) {
+  if (!owner) return;
+  size_t changed = 0;
+  size_t matched = 0;
+  size_t planned = 0;
+  AcquireSRWLockExclusive(&s_eiemModelInstanceLock);
+  for (auto &state : s_eiemModelInstances) {
+    for (uint32_t index = 0; index < state.ownerCount; ++index) {
+      auto &candidate = state.owners[index];
+      if (candidate.kind != ownerKind || candidate.owner != owner) continue;
+      ++matched;
+      if (candidate.active != active) {
+        candidate.active = active;
+        ++changed;
+      }
+      planned += state.physicsIntents.size();
+    }
+  }
+  ReleaseSRWLockExclusive(&s_eiemModelInstanceLock);
+  EiemPhysicsOwnerProbeObserveOwnerActive(
+      EiemModelOwnerKindName(ownerKind), owner, active, stage);
+  if (changed || planned)
+    Log("[PHYSICS-PLAN] owner=%p active=%d models=%zu changed=%zu intents=%zu stage=%s",
+        owner, active ? 1 : 0, matched, changed, planned,
+        stage ? stage : "unknown");
+}
 
 static bool EiemSameRelativePath(const char *left, const char *right) {
   const bool leftEmpty = !left || !left[0];
@@ -2566,48 +3099,16 @@ static bool EiemRenderRuleMatches(const EiemModRule &rule,
   return true;
 }
 
-static bool EiemApplyPrefabRules(void *model, const EiemModPrefab &prefab,
-                                 const char *stage) {
-  // A PFB only scopes a rule set. Static and skinned consumers must execute
-  // through the same code as standalone Mesh-identity actions.
-  std::vector<EiemModRule> rules;
-  for (uint32_t ref = 0; ref < prefab.renderCount; ++ref) {
-    if (!prefab.renders[ref][0]) continue;
-    EiemModRule rule = {};
-    if (EiemFindRenderRuleBySection(prefab.modPath, prefab.renders[ref], &rule))
-      rules.push_back(rule);
-    else
-      Log("[MOD-PREFAB] Render declaration not found: prefab=%s render=%s",
-          prefab.path, prefab.renders[ref]);
-  }
-  bool referenced[_countof(prefab.renders)] = {};
-  const bool applied = EiemApplyRenderRuleSet(model, rules, prefab.path, stage, referenced);
-  for (size_t index = 0; index < rules.size(); ++index)
-    if (!referenced[index])
-      Log("[MOD-PREFAB] Render target not found: prefab=%s render=%s stage=%s",
-          prefab.path, rules[index].section, stage ? stage : "unknown");
-  return applied;
-}
-
 static bool EiemRegisterAndApplyModelInstance(
     EiemModelOwnerKind ownerKind, void *owner, void *model,
     const char *prefabPath, uint32_t instanceUid, const char *stage) {
   if (!model) return false;
-  std::vector<EiemModPrefab> prefabs;
-  if (prefabPath && prefabPath[0]) EiemFindModPrefabs(prefabPath, &prefabs);
-  const bool hasStandaloneRules = EiemHasStandaloneRenderRules();
-  if (prefabs.empty() && !hasStandaloneRules) return false;
-
-  bool applied = false;
-  bool matched = false;
-  if (hasStandaloneRules)
-    applied = EiemApplyStandaloneRenderRules(model, stage, &matched) || applied;
-  for (const auto &prefab : prefabs)
-    applied = EiemApplyPrefabRules(model, prefab, stage) || applied;
-  // Register by selector, including a currently inactive conditional body. A scoped
-  // Prefab declaration is retained even before its target Renderer appears so
-  // F10 can replay it after deferred hierarchy construction.
-  if (!matched && prefabs.empty()) return false;
+  EiemProbeObserveModel(model, stage);
+  auto modelRef = EiemUnityRef::Capture(model);
+  if (!modelRef) {
+    Log("[MOD-LIFECYCLE] Cannot observe model lifetime model=%p stage=%s", model, stage);
+    return false;
+  }
 
   std::vector<uintptr_t> releasedModels;
   AcquireSRWLockExclusive(&s_eiemModelInstanceLock);
@@ -2642,6 +3143,12 @@ static bool EiemRegisterAndApplyModelInstance(
   size_t slot = SIZE_MAX;
   for (size_t index = 0; index < s_eiemModelInstances.size(); ++index) {
     if (s_eiemModelInstances[index].model == model) {
+      if (s_eiemModelInstances[index].modelRef.Target() != model) {
+        // Wrapper addresses can be reused; do not inherit stale owners.
+        releasedModels.push_back((uintptr_t)model);
+        s_eiemModelInstances.erase(s_eiemModelInstances.begin() + index);
+        break;
+      }
       slot = index;
       break;
     }
@@ -2649,6 +3156,7 @@ static bool EiemRegisterAndApplyModelInstance(
   if (slot == SIZE_MAX) {
     EiemModelInstanceState state = {};
     state.model = model;
+    state.modelRef = modelRef;
     s_eiemModelInstances.push_back(state);
     slot = s_eiemModelInstances.size() - 1;
   }
@@ -2661,6 +3169,7 @@ static bool EiemRegisterAndApplyModelInstance(
     for (uint32_t index = 0; index < state.ownerCount; ++index) {
       if (state.owners[index].kind == ownerKind &&
           state.owners[index].owner == owner) {
+        state.owners[index].active = true;
         knownOwner = true;
         break;
       }
@@ -2668,13 +3177,31 @@ static bool EiemRegisterAndApplyModelInstance(
     if (!knownOwner && state.ownerCount < _countof(state.owners)) {
       state.owners[state.ownerCount].kind = ownerKind;
       state.owners[state.ownerCount].owner = owner;
+      state.owners[state.ownerCount].active = true;
       ++state.ownerCount;
     }
   }
   ReleaseSRWLockExclusive(&s_eiemModelInstanceLock);
   for (uintptr_t released : releasedModels) {
+    EiemReleaseModelPhysics((void *)released, "owner moved to another model");
+    EiemPhysicsOwnerProbeObserveRelease(
+        EiemModelOwnerKindName(ownerKind), owner, (void *)released,
+        "owner moved to another model");
     EiemDestroyPartnerObjects(released);
     EiemForgetRenderOverrides(released);
+  }
+  // Existence is recorded before consulting the current program. An empty
+  // INI must not make an already-created model undiscoverable at the next F10.
+  if (modelRef.Status() != 1) return false;
+  bool applied = false;
+  std::vector<EiemPhysicsIntent> physicsIntents;
+  if (EiemHasStandaloneRenderRules())
+    applied = EiemApplyStandaloneRenderRules(model, stage, nullptr, nullptr,
+                                             &physicsIntents);
+  EiemStoreModelPhysicsIntents(model, std::move(physicsIntents), stage);
+  if (applied) {
+    EiemPhysicsOwnerProbeObserveModel(
+        EiemModelOwnerKindName(ownerKind), owner, model, stage);
   }
   return applied;
 }
@@ -2723,6 +3250,7 @@ static bool EiemRegisterCharUIModelInstance(void *component,
 static bool EiemReapplyRegisteredModelInstance(void *model,
                                                 const char *stage) {
   if (!model) return false;
+  EiemProbeObserveModel(model, stage); // Observe pooled arrivals even if not registered.
   EiemModelInstanceState state = {};
   bool found = false;
   AcquireSRWLockShared(&s_eiemModelInstanceLock);
@@ -2734,12 +3262,11 @@ static bool EiemReapplyRegisteredModelInstance(void *model,
     }
   }
   ReleaseSRWLockShared(&s_eiemModelInstanceLock);
-  if (!found) return false;
-  std::vector<EiemModPrefab> prefabs;
-  EiemFindModPrefabs(state.path, &prefabs);
-  bool applied = EiemApplyStandaloneRenderRules(model, stage);
-  for (const auto &prefab : prefabs)
-    applied = EiemApplyPrefabRules(model, prefab, stage) || applied;
+  if (!found || state.modelRef.Status() != 1) return false;
+  std::vector<EiemPhysicsIntent> physicsIntents;
+  bool applied = EiemApplyStandaloneRenderRules(model, stage, nullptr, nullptr,
+                                                &physicsIntents);
+  EiemStoreModelPhysicsIntents(model, std::move(physicsIntents), stage);
   return applied;
 }
 
@@ -2769,6 +3296,9 @@ static void EiemForgetModelOwner(EiemModelOwnerKind ownerKind, void *owner,
   }
   ReleaseSRWLockExclusive(&s_eiemModelInstanceLock);
   for (uintptr_t modelOwner : releasedModels) {
+    EiemReleaseModelPhysics((void *)modelOwner, stage);
+    EiemPhysicsOwnerProbeObserveRelease(
+        EiemModelOwnerKindName(ownerKind), owner, (void *)modelOwner, stage);
     EiemDestroyPartnerObjects(modelOwner);
     EiemForgetRenderOverrides(modelOwner);
   }
@@ -2790,10 +3320,22 @@ static void EiemForgetModelInstance(void *model, const char *stage) {
   ReleaseSRWLockExclusive(&s_eiemModelInstanceLock);
   if (!removed) return;
   const uintptr_t modelOwner = (uintptr_t)model;
+  EiemReleaseModelPhysics(model, stage);
+  EiemPhysicsOwnerProbeObserveRelease("model", nullptr, model, stage);
   EiemDestroyPartnerObjects(modelOwner);
   EiemForgetRenderOverrides(modelOwner);
   Log("[MOD-LIFECYCLE] released model=%p stage=%s", model,
       stage ? stage : "unknown");
+}
+
+static void EiemPruneModelInstances() {
+  std::vector<EiemModelInstanceState> observed;
+  AcquireSRWLockShared(&s_eiemModelInstanceLock);
+  observed = s_eiemModelInstances;
+  ReleaseSRWLockShared(&s_eiemModelInstanceLock);
+  for (const auto &state : observed)
+    if (state.modelRef.Status() == 0)
+      EiemForgetModelInstance(state.model, "observed model expired");
 }
 
 // Endfield owns source/replacement material arrays in
@@ -2802,24 +3344,24 @@ static void EiemForgetModelInstance(void *model, const char *stage) {
 // Mesh identity remains the rule key, so enforce only the material portion at
 // that game-owned final commit boundary.  This is not a UI-specific rule and
 // does not re-run mesh, skip, or partner actions.
-static bool EiemReapplyRendererMaterialsAfterCommit(void *renderer,
-                                                     const char *stage) {
-  if (!renderer || !EiemOnUnityThread() || !il2cpp_object_get_class ||
-      !il2cpp_class_get_parent || !g_skinnedMeshRendererClass)
+static bool EiemIsSkinnedRenderer(void *renderer) {
+  if (!renderer || !il2cpp_object_get_class || !g_skinnedMeshRendererClass)
     return false;
-
-  bool isSkinnedRenderer = false;
   void *klass = nullptr;
   __try { klass = il2cpp_object_get_class(renderer); }
   __except (EXCEPTION_EXECUTE_HANDLER) { klass = nullptr; }
   for (int depth = 0; klass && depth < 10; ++depth) {
-    if (klass == g_skinnedMeshRendererClass) {
-      isSkinnedRenderer = true;
-      break;
-    }
-    klass = il2cpp_class_get_parent(klass);
+    if (klass == g_skinnedMeshRendererClass) return true;
+    klass = il2cpp_class_get_parent ? il2cpp_class_get_parent(klass) : nullptr;
   }
-  if (!isSkinnedRenderer) return false;
+  return false;
+}
+
+static bool EiemReapplyRendererMaterialsAfterCommit(void *renderer,
+                                                     const char *stage) {
+  if (!renderer || EiemMaterialSourceInitActive(renderer) ||
+      !EiemOnUnityThread() || !EiemIsSkinnedRenderer(renderer))
+    return false;
 
   void *mesh = EiemReadSharedMesh(renderer, "SkinnedMeshRenderer");
   if (!mesh) return false;
@@ -2872,13 +3414,75 @@ static void *EiemReadRendererFromMaterialInfo(void *rendererInfo) {
   }
 }
 
+static void EiemProbeMaterialInfo(void *info, const char *stage) {
+  EiemProbeReadScope scope;
+  if (!scope.entered) return;
+  void *renderer = EiemReadRendererFromMaterialInfo(info);
+  if (EiemProbeNativeAlive(renderer) != 1 || !il2cpp_object_get_class) return;
+  void *klass = il2cpp_object_get_class(renderer);
+  while (klass && klass != g_skinnedMeshRendererClass)
+    klass = il2cpp_class_get_parent ? il2cpp_class_get_parent(klass) : nullptr;
+  if (!klass) return;
+  void *mesh = EiemReadSharedMesh(renderer, "SkinnedMeshRenderer");
+  if (!EiemProbeMatches(renderer, mesh)) return;
+  char infoText[48] = {};
+  snprintf(infoText, sizeof(infoText), "info=%p ", info);
+  const std::string owner = std::string(infoText) + "renderer=" + EiemProbeObjectText(renderer);
+  EiemProbeRendererRead(stage, renderer, renderer, "SkinnedMeshRenderer", nullptr, true);
+  EiemProbeMaterials(stage, TraceReadObjectField(info, s_eiemProbeSourceMaterialsOffset), owner + " sourceMaterials");
+  EiemProbeMaterials(stage, TraceReadObjectField(info, s_eiemProbeReplacingMaterialsOffset), owner + " replacingMaterials");
+}
+
+static void TraceMaterialInfoInit(void *self, void *renderer, void *configs, void *methodInfo) {
+  using InitFn = void (*)(void *, void *, void *, void *);
+  auto original = (InitFn)s_origMaterialInfoInit;
+  EiemProbeTrackedRenderer("material-info-init-before", renderer);
+  bool sourceReady = false;
+  {
+    EiemMaterialSourceInitScope scope(renderer);
+    sourceReady = EiemExposeSourceMaterialsForInit(renderer);
+    // Never skip game initialization, including when source exposure failed.
+    if (original) original(self, renderer, configs, methodInfo);
+  }
+  EiemProbeMaterialInfo(self, "material-info-init-after");
+  if (sourceReady) {
+    // NPC avatar construction can populate SkinnedMeshRenderer.sharedMesh
+    // without entering Unity's public setter and without publishing a model
+    // root through the Prefab/UI adapters. RendererInfo._Init is the observed
+    // per-Renderer boundary shared by those instances. The game has now
+    // captured its clean material source table, so offer the concrete Renderer
+    // to the same global Mesh-identity executor used by every other consumer.
+    bool applied = false;
+    if (EiemIsSkinnedRenderer(renderer)) {
+      void *mesh = EiemReadSharedMesh(renderer, "SkinnedMeshRenderer");
+      if (mesh)
+        applied = EiemApplyStandaloneRenderRulesToRenderer(
+            renderer, renderer, mesh, "SkinnedMeshRenderer", methodInfo,
+            "RendererInfo._Init");
+    }
+    // Path-qualified rules cannot be newly resolved without a model root, but
+    // a previously bound Renderer still needs its material slots restored
+    // after the controller has refreshed them.
+    if (!applied)
+      EiemReapplyRendererMaterialsAfterCommit(renderer, "RendererInfo._Init");
+    else {
+      Log("[MOD-RENDERER-INIT] global rule applied renderer=%p", renderer);
+      EiemPhysicsOwnerProbeObserveRenderer(renderer, "RendererInfo._Init");
+    }
+  } else
+    Log("[MOD-MATERIAL-SOURCE] init source unresolved; mod reapply not attempted renderer=%p", renderer);
+}
+
 static bool TraceRendererInfoTrySetSharedMaterial(void *self, void *material,
                                                   void *methodInfo) {
   auto original = (TraceRendererInfoMaterialCommitFn)
       s_origRendererInfoTrySetSharedMaterial;
+  EiemProbeMaterialInfo(self, "material-commit-before-single");
   const bool result = original ? original(self, material, methodInfo) : false;
+  EiemProbeMaterialInfo(self, "material-commit-game-after-single");
   EiemReapplyRendererMaterialsAfterCommit(
       EiemReadRendererFromMaterialInfo(self), "TrySetSharedMaterial");
+  EiemProbeMaterialInfo(self, "material-commit-mod-after-single");
   return result;
 }
 
@@ -2887,9 +3491,12 @@ static bool TraceRendererInfoTrySetSharedMaterials(void *self,
                                                    void *methodInfo) {
   auto original = (TraceRendererInfoMaterialCommitFn)
       s_origRendererInfoTrySetSharedMaterials;
+  EiemProbeMaterialInfo(self, "material-commit-before-array");
   const bool result = original ? original(self, materials, methodInfo) : false;
+  EiemProbeMaterialInfo(self, "material-commit-game-after-array");
   EiemReapplyRendererMaterialsAfterCommit(
       EiemReadRendererFromMaterialInfo(self), "TrySetSharedMaterials");
+  EiemProbeMaterialInfo(self, "material-commit-mod-after-array");
   return result;
 }
 
@@ -2898,9 +3505,12 @@ static bool TraceRendererInfoTryReplaceSharedMaterials(void *self,
                                                        void *methodInfo) {
   auto original = (TraceRendererInfoMaterialCommitFn)
       s_origRendererInfoTryReplaceSharedMaterials;
+  EiemProbeMaterialInfo(self, "material-commit-before-replace");
   const bool result = original ? original(self, materials, methodInfo) : false;
+  EiemProbeMaterialInfo(self, "material-commit-game-after-replace");
   EiemReapplyRendererMaterialsAfterCommit(
       EiemReadRendererFromMaterialInfo(self), "TryReplaceSharedMaterials");
+  EiemProbeMaterialInfo(self, "material-commit-mod-after-replace");
   return result;
 }
 
@@ -3197,6 +3807,7 @@ static void EiemReapplyShapeControls(const std::vector<std::string> &affected) {
   ReleaseSRWLockExclusive(&s_eiemPartnerLock);
 }
 
+
 static EiemModUpdateQueue s_eiemModUpdates;
 // One ordered queue for window-thread keys and render-thread ImGui controls.
 static SRWLOCK s_eiemInputLock = SRWLOCK_INIT;
@@ -3220,8 +3831,9 @@ static void EiemQueueModKey(EiemKeyChord chord, LONG generation) {
   if (!EiemOnUnityThread() || !g_pluginActive) return;
   HWND foreground = GetForegroundWindow();
   if (foreground != g_gameHwnd && foreground != g_guiHwnd && foreground != g_modUiHwnd) return;
-  EiemQueueUiKey(chord, generation);
-  if (foreground == g_gameHwnd) EiemQueueModInput({chord, generation});
+  EiemModInputEvent event{chord,generation};
+  event.uiFocus = foreground != g_gameHwnd;
+  EiemQueueModInput(std::move(event));
 }
 
 static void EiemRequestModUpdate(EiemModUpdate request, const char *reason) {
@@ -3267,6 +3879,7 @@ static void EiemRunModReconcile() {
   inputs.swap(s_eiemPendingInputs);
   ReleaseSRWLockExclusive(&s_eiemInputLock);
   const bool reload = (requests & (uint32_t)EiemModUpdate::Reload) != 0;
+  if (reload) EiemProbeCheckpoint("reload-before", true);
   EiemModProgram next;
   std::vector<std::string> affectedMods;
   const std::vector<std::string> *affected = nullptr;
@@ -3284,13 +3897,19 @@ static void EiemRunModReconcile() {
   EiemDispatchModUpdate(requests, [&] {
     EiemDestroyPartnerObjects(affected);
     EiemRestoreRenderOverrides(affected);
+    EiemCollectSkeletonInstances();
     // Configuration reload must not release Unity Mesh objects that may still
     // be referenced by a Renderer. The resource backend reuses unchanged files
     // and creates a new rooted object only when the file stamp changes.
-  }, [] { LoadEiemConfig(); EiemReportCameraFade(); EiemReloadMods(); }, [&] {
+  }, [] {
+    EiemProbeCheckpoint("reload-restored-old-program");
+    LoadEiemConfig(); EiemReportCameraFade(); EiemReloadMods();
+    EiemProbeCheckpoint("reload-published");
+  }, [&] {
   if (affected) EiemPublishModState(std::move(next));
   const char *stage = reload ? "global reload" : affected ? "control state change" : "lifecycle reconcile";
   const ULONGLONG started = GetTickCount64();
+  EiemPruneModelInstances();
   std::vector<EiemModelInstanceState> instances;
   AcquireSRWLockShared(&s_eiemModelInstanceLock);
   instances = s_eiemModelInstances;
@@ -3298,17 +3917,22 @@ static void EiemRunModReconcile() {
   uint32_t matched = 0;
   for (const auto &instance : instances) {
     if (!instance.model) continue;
-    std::vector<EiemModPrefab> prefabs;
-    EiemFindModPrefabs(instance.path, &prefabs);
-    bool applied = EiemApplyStandaloneRenderRules(instance.model, stage, nullptr, affected);
-    for (const auto &prefab : prefabs)
-      if (EiemModAffected(prefab.modPath, affected))
-        applied = EiemApplyPrefabRules(instance.model, prefab, stage) || applied;
+    if (instance.modelRef.Status() != 1) {
+      Log("[MOD-LIFECYCLE] Cannot validate observed model=%p; not applying rules", instance.model);
+      continue;
+    }
+    std::vector<EiemPhysicsIntent> physicsIntents;
+    bool applied = EiemApplyStandaloneRenderRules(
+        instance.model, stage, nullptr, affected, &physicsIntents);
+    EiemStoreModelPhysicsIntents(instance.model, std::move(physicsIntents),
+                                 stage);
     if (applied) ++matched;
   }
   const ULONGLONG elapsed = GetTickCount64() - started;
   Log("[MOD] Reconcile complete: registeredModels=%zu matchedModels=%u elapsed=%llums",
       instances.size(), matched, elapsed);
+  EiemCollectSkeletonInstances();
+  if (reload) EiemProbeCheckpoint("reload-complete");
   });
 }
 
@@ -4751,6 +5375,7 @@ static void TraceSkinnedMeshSetSharedMesh(void *self, void *mesh,
     Log("[DEBUG-thread] SkinnedMeshRenderer setter tid=%lu recordedUnityTid=%lu",
         (unsigned long)GetCurrentThreadId(), (unsigned long)s_eiemUnityThreadId);
   TraceRememberMeshObservation(self, mesh, "SkinnedMeshRenderer");
+  EiemProbeRenderer("game-mesh-set-before", self, self, "SkinnedMeshRenderer", mesh);
   void *sourceMesh = mesh;
   // A later game-side LOD/skin refresh may assign the original Mesh again.
   // Preserve an existing binding; otherwise this assignment is also a precise
@@ -4762,6 +5387,7 @@ static void TraceSkinnedMeshSetSharedMesh(void *self, void *mesh,
     EiemApplyStandaloneRenderRulesToRenderer(
         self, self, sourceMesh, "SkinnedMeshRenderer", methodInfo,
         "SkinnedMeshRenderer.set_sharedMesh");
+  EiemProbeRenderer("game-mesh-set-after", self, self, "SkinnedMeshRenderer", sourceMesh);
   if (!s_traceReentrant && TraceTakeBudget(&s_traceSharedMeshCount, 500)) {
     s_traceReentrant = true;
     char rendererText[512] = {};
@@ -4783,6 +5409,7 @@ static void TraceMeshFilterSetSharedMesh(void *self, void *mesh,
     return;
   }
   TraceRememberMeshObservation(self, mesh, "MeshFilter");
+  EiemProbeRenderer("game-mesh-set-before", self, nullptr, "MeshFilter", mesh);
   void *sourceMesh = mesh;
   void *retained = EiemReplacementForSourceMesh(self, sourceMesh);
   if (retained) mesh = retained;
@@ -4804,6 +5431,7 @@ static void TraceMeshFilterSetSharedMesh(void *self, void *mesh,
         rendererText, meshText);
     s_traceReentrant = false;
   }
+  EiemProbeRenderer("game-mesh-set-after", self, nullptr, "MeshFilter", sourceMesh);
 }
 
 static void HookTraceMethod(void *klass, const char *methodName, int paramCount,
@@ -4970,14 +5598,24 @@ static void *FindMaterialRendererInfoClass(void **assemblies,
       if (rendererOffset < 0) continue;
 
       s_materialRendererInfoRendererOffset = rendererOffset;
+      const char *sourceFields[] = {"sourceMaterials"};
+      const char *replacingFields[] = {"replacingMaterials"};
+      s_eiemProbeSourceMaterialsOffset = FindFieldInHierarchy(klass, sourceFields, 1, nullptr);
+      s_eiemProbeReplacingMaterialsOffset = FindFieldInHierarchy(klass, replacingFields, 1, nullptr);
       return klass;
     }
   }
   return nullptr;
 }
 
+#include "eiem_native_physics_runtime.h"
+#include "eiem_npc_model_owner.h"
+
 static void InitIl2CppResourceTrace(void **assemblies, size_t assemblyCount) {
   if (!assemblies || assemblyCount == 0) return;
+  EiemInitUnityLifetime(assemblies, assemblyCount);
+  EiemProbeInit(assemblies, assemblyCount);
+  EiemInstallNpcModelOwner(assemblies, assemblyCount);
 
   void *assetBundleClass = FindClass("UnityEngine", "AssetBundle", assemblies,
                                      assemblyCount);
@@ -5021,6 +5659,13 @@ static void InitIl2CppResourceTrace(void **assemblies, size_t assemblyCount) {
   void *materialRendererInfoClass =
       FindMaterialRendererInfoClass(assemblies, assemblyCount);
   if (materialRendererInfoClass) {
+    const char *infoInitTypes[] = {"UnityEngine.Renderer", "System.Collections.Generic.List<Beyond.Rendering.EntityRendererTypeConfig>"};
+    void *infoInit = FindMethodWithParamTypesAndReturnType(materialRendererInfoClass, "_Init", infoInitTypes, 2, "System.Void");
+    if (!infoInit || !Hook(infoInit, "RendererInfo._Init source isolation", (void *)TraceMaterialInfoInit,
+                          &s_origMaterialInfoInit))
+      Log("[MOD-MATERIAL-SOURCE] RendererInfo._Init source isolation unavailable");
+    Log("[DEBUG-residue-v39] material controller fields source=%d replacing=%d",
+        s_eiemProbeSourceMaterialsOffset, s_eiemProbeReplacingMaterialsOffset);
     Log("[RES-TRACE] Material RendererInfo renderer field: 0x%X",
         s_materialRendererInfoRendererOffset);
     HookTraceMethod(materialRendererInfoClass, "TrySetSharedMaterial", 1,
@@ -5041,6 +5686,8 @@ static void InitIl2CppResourceTrace(void **assemblies, size_t assemblyCount) {
 
   void *smrClass = FindClass("UnityEngine", "SkinnedMeshRenderer", assemblies,
                             assemblyCount);
+  EiemInitShapeGuard(FindClass("Beyond.Gameplay.Core", "SkeletalMorphCore",
+                              assemblies, assemblyCount));
   HookTraceMethod(smrClass, "set_sharedMesh", 1,
                   "SkinnedMeshRenderer.set_sharedMesh",
                   (void *)TraceSkinnedMeshSetSharedMesh,

@@ -40,7 +40,9 @@ static void *Invoke(void *method, void *self, void **args = nullptr) {
 }
 static void EiemSetRendererEnabled(void *r, bool enabled) { valid &= r == (void*)2 && !enabled; calls += 'H'; }
 static void EiemSetPartnerLodMembership(void *s, void *r, bool add) { valid &= s == (void*)4 && r == (void*)2 && !add; calls += 'L'; }
-struct EiemPartnerState { void *partnerObject; void *partnerRenderer; void *sourceDrawRenderer; };
+struct ShapeState { int binding=17; };
+struct EiemPartnerState { void *partnerObject; void *partnerRenderer; void *sourceDrawRenderer; ShapeState shapes; };
+static void EiemRetireShapeBinding(int binding) { valid &= binding==17; calls += 'S'; }
 static SRWLOCK s_eiemPartnerLock = SRWLOCK_INIT;
 static std::vector<EiemPartnerState> s_eiemPartners;
 static bool s_eiemCreatingPartner = false;
@@ -69,7 +71,7 @@ int main() {
   CHECK(!EiemApplyRenderRuleSetToRenderer(nullptr, (void*)6, (void*)6, (void*)5, "SkinnedMeshRenderer", nullptr, rules, "test"));
   CHECK(!prepared);
   EiemRetirePartner(s);
-  CHECK(valid && calls == "HLDX");
+  CHECK(valid && calls == "SHLDX");
 }
 '''
         with tempfile.TemporaryDirectory(prefix="eiem-partner-test-") as directory:
@@ -78,7 +80,7 @@ int main() {
             source.write_text(code, encoding="utf-8")
             build = subprocess.run(["cl", "/nologo", "/EHsc", "/std:c++17", "/utf-8",
                                     f"/I{ROOT / 'src'}", str(source), f"/Fe{exe}"],
-                                   cwd=folder, capture_output=True, text=True)
+                                   cwd=folder, capture_output=True, text=True, encoding="utf-8", errors="replace")
             self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
             result = subprocess.run([str(exe)], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

@@ -23,13 +23,12 @@ class RuntimeHookContracts(unittest.TestCase):
         self.assertIn("TraceUIModelLoaderLoadModelAsync", self.trace)
         self.assertNotIn("EiemUIModelLoadedCallback", self.trace)
         self.assertIn("EiemRegisterAndApplyModelInstance", self.trace)
-        self.assertIn("EiemApplyPrefabRules", self.trace)
         self.assertIn("EiemApplyStandaloneRenderRules", self.trace)
         self.assertNotIn("UnityEngine.Object.Instantiate", self.trace)
         self.assertNotIn("TraceApplyLoadedModelRenderers", self.trace)
         self.assertNotIn("EiemResolveRenderRuleForAsset", self.trace)
 
-    def test_prefab_lifecycle_releases_scoped_state(self):
+    def test_prefab_lifecycle_releases_instance_state(self):
         for method in ("Unload", "Clear", "Dispose"):
             self.assertIn("TracePrefabInstantiate" + method, self.trace)
         self.assertIn("EiemDestroyPartnerObjects(modelOwner)", self.trace)
@@ -64,7 +63,7 @@ class RuntimeHookContracts(unittest.TestCase):
         end = self.trace.index("\n}\n", start)
         body = self.trace[start:end]
         self.assertIn("s_eiemModelInstances", body)
-        self.assertIn("EiemApplyPrefabRules", body)
+        self.assertIn("EiemApplyStandaloneRenderRules", body)
         self.assertNotIn("find_objects_of_type", body.lower())
 
     def test_submesh_hooks_do_not_replace_resources(self):
@@ -130,10 +129,57 @@ class RuntimeHookContracts(unittest.TestCase):
         )
         self.assertNotIn("EiemFindModPrefabPathByModelName", body)
 
-    def test_npc_avatar_boundary_is_observation_only(self):
+    def test_npc_owner_registers_completed_model_and_releases_by_component(self):
+        owner = (ROOT / "src" / "eiem_npc_model_owner.h").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("EiemModelOwnerKind::NpcAvatar", owner)
+        start = owner[
+            owner.index("static void EiemPhysicsOwnerTraceStartNpc") :
+            owner.index("static bool EiemPhysicsOwnerReleaseInfo")
+        ]
+        self.assertIn("EiemRegisterAndApplyModelInstance", start)
+        release = owner[
+            owner.index("static void EiemPhysicsOwnerTraceReleaseAvatar") :
+            owner.index("static bool EiemPhysicsOwnerHookExact")
+        ]
+        self.assertEqual(
+            release.count("EiemForgetModelOwner(EiemModelOwnerKind::NpcAvatar"),
+            2,
+        )
+
+    def test_physics_intents_follow_render_hits_but_are_owned_by_the_model(self):
+        match_start = self.trace.index("static bool EiemApplyRenderRuleSetToRenderer")
+        match_body = self.trace[match_start : match_start + 5200]
+        self.assertIn("EiemCollectPhysicsIntent(rule, physicsIntents, drawRenderer)", match_body)
+        self.assertLess(
+            match_body.index("EiemCollectPhysicsIntent(rule, physicsIntents, drawRenderer)"),
+            match_body.index("EiemModAffected(rule.modPath, affected)"),
+        )
+        setter_start = self.trace.rindex("static bool EiemApplyStandaloneRenderRulesToRenderer")
+        setter_body = self.trace[setter_start : setter_start + 800]
+        self.assertNotIn("EiemCollectPhysicsIntent", setter_body)
+        self.assertIn("std::vector<EiemPhysicsIntent> physicsIntents", self.trace)
+        self.assertIn("EiemStoreModelPhysicsIntents", self.trace)
+
+    def test_character_ui_visibility_keeps_plan_and_tracks_activity(self):
+        start = self.trace.rindex("static void TraceCharUIModelSetVisible")
+        end = self.trace.rindex("static void TraceCharUIModelOnRelease")
+        body = self.trace[start:end]
+        self.assertIn("EiemRegisterCharUIModelInstance", body)
+        self.assertIn("EiemSetModelOwnerActive", body)
+        self.assertNotIn("EiemForgetModelOwner", body)
+        release_start = self.trace.rindex("static void TraceCharUIModelOnRelease")
+        release_body = self.trace[release_start : release_start + 500]
+        self.assertIn("EiemForgetModelOwner", release_body)
+
+    def test_npc_final_bone_boundary_remains_observation_only(self):
         start = self.trace.rindex("static void TraceSetSmrRootBone")
         body = self.trace[start : start + 900]
-        self.assertNotIn("EiemApplyAvatarRenderRules", body)
+        self.assertIn(
+            "original(animator, renderers, rootBoneInfos, methodInfo)", body
+        )
+        self.assertNotIn("EiemApplyStandaloneRenderRules", body)
         self.assertNotIn("EiemFindPrefabRenderRuleByAsset", self.mods)
 
     def test_prefab_parser_supports_multiple_mods_for_one_path(self):
@@ -157,6 +203,18 @@ class RuntimeHookContracts(unittest.TestCase):
         self.assertIn("TraceRendererInfoTrySetSharedMaterials", self.trace)
         self.assertIn("TraceRendererInfoTryReplaceSharedMaterials", self.trace)
         self.assertIn("EiemFindBoundRenderRule", self.trace)
+
+    def test_renderer_info_init_covers_npc_direct_mesh_construction(self):
+        start = self.trace.index("static void TraceMaterialInfoInit")
+        end = self.trace.index("static bool TraceRendererInfoTrySetSharedMaterial", start)
+        body = self.trace[start:end]
+        self.assertLess(
+            body.index("original(self, renderer, configs, methodInfo)"),
+            body.index("EiemApplyStandaloneRenderRulesToRenderer"),
+        )
+        self.assertIn('"RendererInfo._Init"', body)
+        self.assertIn("EiemReapplyRendererMaterialsAfterCommit", body)
+        self.assertNotIn("EiemApplyPrefabRules", body)
 
     def test_value_type_asset_handle_is_unboxed_before_instance_methods(self):
         self.assertIn("il2cpp_object_unbox", self.api)
@@ -225,13 +283,14 @@ class RuntimeHookContracts(unittest.TestCase):
         self.assertNotIn("EiemReloadMods();", hotkey_body)
         self.assertIn("EiemRequestModUpdate(EiemModUpdate::Reload", hotkey_body)
 
-    def test_prefab_uses_the_same_executor_as_standalone_rules(self):
-        start = self.trace.rindex("static bool EiemApplyPrefabRules(")
-        end = self.trace.index("static bool EiemRegisterAndApplyModelInstance(", start)
-        body = self.trace[start:end]
-        self.assertIn("EiemApplyRenderRuleSet(model, rules", body)
-        self.assertNotIn("g_skinnedMeshRendererClass", body)
-        self.assertNotIn("EiemApplyResolvedRenderRule", body)
+    def test_prefab_reference_does_not_scope_a_mesh_identity_rule(self):
+        start = self.mods.index("static void EiemCompileModProgram")
+        end = self.mods.index("static bool EiemValidShapeExpression", start)
+        body = self.mods[start:end]
+        self.assertNotIn("for (const auto &prefab", body)
+        self.assertIn('statement.key.compare(0, 8, "partner.")', body)
+        self.assertIn("program.standaloneRules.push_back(i)", body)
+        self.assertNotIn("EiemApplyPrefabRules", self.trace)
 
     def test_reload_is_dispatched_only_on_unity_thread(self):
         body = self.trace[self.trace.index("static void EiemRunModReconcile()") :][:2700]
@@ -253,6 +312,9 @@ class BlenderExportContracts(unittest.TestCase):
             "EiemPackageWriter.cs"
         )
         cls.writer = writer_path.read_text(encoding="utf-8") if writer_path.exists() else None
+        physics_writer_path = writer_path.with_name("EiemPhysicsSourceWriter.cs")
+        cls.physics_writer = (physics_writer_path.read_text(encoding="utf-8")
+                              if physics_writer_path.exists() else None)
 
     def test_export_is_rooted_at_selected_eiem_meshes(self):
         self.assertIn("selected_objects", self.addon)
@@ -263,8 +325,11 @@ class BlenderExportContracts(unittest.TestCase):
         self.assertIn("referenced_images", self.addon)
 
     def test_blender_emits_standalone_render_identity_without_prefab_scope(self):
-        start = self.addon.index("def export_package")
-        body = self.addon[start : start + 14000]
+        import ast
+        tree = ast.parse(self.addon)
+        body = "\n".join(ast.get_source_segment(self.addon, node) for node in tree.body
+                         if isinstance(node, ast.FunctionDef) and
+                         node.name in ("export_package", "write_export_package"))
         self.assertIn('asset = str(first.get("eiem_render_asset"', body)
         self.assertIn('"eiem_target_asset", first.data.get("eiem_asset"', body)
         self.assertNotIn("has no Prefab/Render identity", body)
@@ -284,6 +349,17 @@ class BlenderExportContracts(unittest.TestCase):
         self.assertIn("renderedMeshes", self.writer)
         self.assertIn("if (!renderedMeshes.Add(mesh))", self.writer)
         self.assertIn('ini.Add($"render.{index}={renderSections[index]}")', self.writer)
+
+    def test_animestudio_normal_package_embeds_optional_native_source(self):
+        if self.writer is None or self.physics_writer is None:
+            self.skipTest("AnimeStudio is a separately managed checkout")
+        self.assertIn("EiemPhysicsSourceWriter.Write", self.writer)
+        self.assertIn('Path.Combine(rootDirectory, "physics")', self.writer)
+        for component in ("BeyondBoneCloth", "BeyondBoneSphereCollider",
+                          "BeyondBoneCapsuleCollider", "BeyondBonePlaneCollider"):
+            self.assertIn(component, self.physics_writer)
+        self.assertIn('purpose = "raw-component-evidence-not-a-physics-package"',
+                      self.physics_writer)
 
     def test_blender_has_ordered_left_aligned_eiem_property_panels(self):
         self.assertIn("class EIEM_PT_material_properties", self.addon)

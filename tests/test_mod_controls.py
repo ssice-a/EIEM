@@ -31,29 +31,63 @@ static void Log(const char *, ...) {}
 #include "eiem_mods.h"
 #include "eiem_render_state.h"
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "FAIL %d: %s\n", __LINE__, #x); return 1; } } while (false)
-enum class EiemModelOwnerKind { PrefabProxy, UIModelLoader, BaseModelPart, CharUIModel };
-struct EiemModelOwnerRef { EiemModelOwnerKind kind; void *owner; };
+enum class EiemModelOwnerKind { PrefabProxy, UIModelLoader, BaseModelPart, CharUIModel, NpcAvatar };
+struct EiemModelOwnerRef { EiemModelOwnerKind kind; void *owner; bool active=true; };
+struct EiemUnityRef {
+  void *p=nullptr;
+  static EiemUnityRef Capture(void *p,bool=true) { return {p}; }
+  explicit operator bool() const { return p!=nullptr; }
+  void *Target() const { return p; }
+  int Status() const { return p?1:0; }
+};
 struct EiemModelInstanceState {
+  EiemUnityRef modelRef;
   void *model = nullptr; uint32_t instanceUid = 0; char path[768] = {};
   EiemModelOwnerRef owners[4] = {}; uint32_t ownerCount = 0;
+  std::vector<EiemPhysicsIntent> physicsIntents;
 };
 static std::vector<EiemModelInstanceState> s_eiemModelInstances;
 static SRWLOCK s_eiemModelInstanceLock = SRWLOCK_INIT;
 static bool simulateMatch = true;
-static bool EiemApplyStandaloneRenderRules(void *, const char *, bool *matched) {
-  *matched = simulateMatch;
+static bool EiemApplyStandaloneRenderRules(
+    void *, const char *, bool *matched=nullptr,
+    const std::vector<std::string> * = nullptr,
+    std::vector<EiemPhysicsIntent> * = nullptr) {
+  if (matched) *matched = simulateMatch;
   return false; // selector matches, but the conditional body is OFF
 }
-static bool EiemApplyPrefabRules(void *, const EiemModPrefab &, const char *) { return false; }
+static void EiemStoreModelPhysicsIntents(
+    void *, std::vector<EiemPhysicsIntent>, const char *) {}
 static void EiemDestroyPartnerObjects(uintptr_t) {}
 static void EiemForgetRenderOverrides(uintptr_t) {}
+static int observedModels = 0;
+static void EiemProbeObserveModel(void *, const char *) { ++observedModels; }
+static const char *EiemModelOwnerKindName(EiemModelOwnerKind kind) {
+  switch (kind) {
+    case EiemModelOwnerKind::PrefabProxy: return "PrefabProxy";
+    case EiemModelOwnerKind::UIModelLoader: return "UIModelLoader";
+    case EiemModelOwnerKind::BaseModelPart: return "BaseModelPart";
+    case EiemModelOwnerKind::CharUIModel: return "CharUIModel";
+    case EiemModelOwnerKind::NpcAvatar: return "NpcAvatar";
+  }
+  return "Unknown";
+}
+static void EiemReleaseModelPhysics(void *, const char *) {}
+static void EiemPhysicsOwnerProbeObserveModel(
+    const char *, void *, void *, const char *) {}
+static void EiemPhysicsOwnerProbeObserveRelease(
+    const char *, void *, void *, const char *) {}
 '''
 
 MAIN = r'''
 int main(int argc, char **argv) {
   CHECK(argc == 2);
   std::string scenario = argv[1], error;
-  if (scenario == "global") {
+  if (scenario == "empty_rules_observed") {
+    CHECK(s_eiemModelInstances.empty());
+    CHECK(!EiemRegisterAndApplyModelInstance(EiemModelOwnerKind::BaseModelPart, (void *)1, (void *)2, nullptr, 0, "empty-rules"));
+    CHECK(observedModels == 1 && s_eiemModelInstances.size() == 1);
+  } else if (scenario == "global") {
     EiemGlobalConfig config;
     std::istringstream valid("\xEF\xBB\xBF[Hotkeys]\r\nreload=Ctrl+F8\r\ngui=INSERT\r\n");
     CHECK(EiemParseGlobalConfig(valid, &config, error));
@@ -113,7 +147,7 @@ int main(int argc, char **argv) {
     CHECK(s_eiemModelInstances.size() == 2); // recycled owner releases previous instance
     simulateMatch = false;
     EiemRegisterAndApplyModelInstance(EiemModelOwnerKind::BaseModelPart, (void *)3, (void *)14, nullptr, 0, "test");
-    CHECK(s_eiemModelInstances.size() == 2); // unrelated instance not registered
+    CHECK(s_eiemModelInstances.size() == 3); // future rules may target this observed instance
   } else return 2;
   return 0;
 }
@@ -137,17 +171,20 @@ class ModControlsTests(unittest.TestCase):
         cls.exe = cls.folder / "controls.exe"
         result = subprocess.run(["cl", "/nologo", "/EHsc", "/std:c++17", "/utf-8",
                                  f"/I{ROOT / 'src'}", str(source), f"/Fe{cls.exe}"],
-                                cwd=cls.folder, capture_output=True, text=True)
+                                cwd=cls.folder, capture_output=True, text=True,
+                                errors="replace")
         if result.returncode: raise AssertionError(result.stdout + result.stderr)
 
     def run_case(self, name):
-        result = subprocess.run([str(self.exe), name], cwd=self.folder, capture_output=True, text=True)
+        result = subprocess.run([str(self.exe), name], cwd=self.folder,
+                                capture_output=True, text=True, errors="replace")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_global_config_default_edit_and_invalid_transaction(self): self.run_case("global")
     def test_only_owned_slots_restore_and_only_owned_tail_removed(self): self.run_case("slots")
     def test_press_order_stale_generation_and_publish_after_restore(self): self.run_case("events")
     def test_actual_runtime_registers_default_off_multi_instances(self): self.run_case("default_off_instances")
+    def test_empty_program_still_registers_observed_instances(self): self.run_case("empty_rules_observed")
 
 
 if __name__ == "__main__": unittest.main()

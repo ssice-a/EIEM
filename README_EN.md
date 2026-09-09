@@ -1,5 +1,7 @@
 # EIEM Importing Endfield MMD
 
+Mod authoring tools, current contracts and implementation status: [documentation index](docs/README.md).
+
 English | [中文](README.md)
 
 Brings MMD animation playback to *Arknights: Endfield*. Supports muscle-driven body motion, facial expressions, finger animation, camera motion, and synced background music, all controlled through an in-game GUI panel.
@@ -40,7 +42,6 @@ example: [bilibili](https://www.bilibili.com/video/BV1YdEC6bEfP/)
 
 ### In Progress
 - **Direct VMD playback mode**
-- 
 
 ### Planned
 - Multi-character screen playback

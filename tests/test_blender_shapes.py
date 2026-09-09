@@ -45,7 +45,8 @@ class BlenderShapeTests(unittest.TestCase):
 
             # Execute the generated UI with the actual Lua VM and ImGui bindings.
             ui_exe = build_harness(folder)
-            run = subprocess.run([str(ui_exe), str(folder / "package/mod.ini"), str(folder / "partner/mod.ini")],
+            run = subprocess.run([str(ui_exe), str(folder / "package/mod.ini"), str(folder / "partner/mod.ini"),
+                                  str(folder / "always-ui/mod.ini"), str(folder / "no-ui/mod.ini")],
                                  cwd=folder, capture_output=True, text=True, encoding="utf-8",
                                  errors="replace", timeout=30)
             self.assertEqual(run.returncode, 0, run.stdout + run.stderr)

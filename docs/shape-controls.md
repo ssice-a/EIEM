@@ -1,16 +1,19 @@
 # 形态键与 ImGui 控制
 
-状态：v36 建立作者入口、导出、INI 求值和 Renderer 权重接口；v37 将固定滑条页迁移为独立 Lua UI。
-现行窗口与脚本约定见 [Lua UI](lua-ui.md)。下方 v36 测试/部署段为历史记录，不表示 v37 游戏验收。
+状态：v36 建立作者入口、导出、INI 求值和 Renderer 权重接口；v38 的 UI 完全由用户 Lua 组织。
+现行窗口与脚本约定见 [Lua UI](lua-ui.md)。历史测试/部署已移至档案，当前验证状态见[文档索引](README.md)。
 形态键进入 EIEMESH 不代表终末地自定义 GPU 管线已参与变形；API 写入/回读与游戏画面验收分开记录。
-本轮不修改用户现有模型、Mod 配置或场景。游戏画面尚未验收。
+游戏画面尚未验收。
+
+动作期间意外变形的证据与修正记录见 [形态键权重诊断](archive/shape-weight-diagnosis.md)。
+v45 实机已确认游戏 Apply 路径向新增通道按索引赋值；v46 改为按源通道归属转发，游戏画面验收另行记录。
 
 ## 职责
 
 - Mesh 资源包含形态键的名称、帧、顶点/法线/切线增量；不包含运行时实例权重。
 - Render 的 `shape.名称=数值或变量` 控制命中实例或 partner 的形态键。名称区分大小写。
-- UI `[UI...]` 指定 Lua 文件与独立开关键；Lua 只写当前 Mod 的变量，不持有 Unity 对象，不独立实现资源替换。
-- 快捷键与滑条进入同一有序输入队列。F10 重载会丢弃旧代事件，恢复旧效果并重置默认值。
+- UI `[UI...]` 只指定 Lua 文件；按键是普通 Key，窗口开关与布局由 Lua 决定，不持有 Unity 对象，不独立实现资源替换。
+- 快捷键与滑条进入同一有序输入队列。F10 重载会丢弃旧代事件，恢复旧效果；普通变量重置默认值，persist 变量保留玩家值。
 - 纯权重变化不重载磁盘，不重设 sharedMesh、骨架或材质；如果同一变量使 if 分支改变装配，走现有重应用流程。
 - 通道新增、移除、改名同样重应用，以覆盖之前仅登记命中、尚未持有形态键状态的实例。
 - 同一 Mesh 被多个实例共享时，权重逐 Renderer 设置；不会往共享 Mesh 写一个全局权重。
@@ -19,11 +22,10 @@
 
 ```ini
 [Constants]
-$size=0
+persist $size=0
 
 [UISize]
 path=ui.lua
-key=F8
 
 [MeshCloth]
 path=meshes/cloth.mesh
@@ -41,28 +43,54 @@ shape.Inflate=$size
 `shape.Inflate=` 撤销本规则对此通道的控制；可以放在 if/endif 中。
 INI 不重新描述形态键的几何数据。FrameWeight 是形态帧的位置，不是滑条当前权重。
 
-F8（上例配置）打开独立 Mod 窗口；INSERT 只打开插件管理面板。相同变量名在不同 Mod 中隔离。
+没有默认 Mod UI 快捷键；上例不声明按键，是否常显/如何打开由 ui.lua 决定。相同变量名在不同 Mod 中隔离。
 `ui.lua` 的完整绘制例子见 [Lua UI](lua-ui.md)。旧 `[Slider...]` 不再解析，旧工程重新导出即可。
 所有 Unity 调用仅在现有 Unity 线程调度中执行；ImGui 绘制线程仅提交变量值。
 按键可以继续用 `type=cycle` 写同一变量；当前输入顺序决定最终值。
 
 ## 生命周期与错误
 
+### 通道归属修正（v46，2026-09-06）
+
+v45 已确认游戏 Apply 路径以原生数字索引写入新增通道。本次修正不改变 INI 或资产格式：
+
+- 每次 SMR Mesh 替换都保存原生名称、顺序和权重，不再依赖 `shape.*` 是否存在。
+- 源通道按名称映射到目标通道；首版要求原生通道完整、名称唯一，不静默替补缺失通道。
+- 只在已验证的 SkeletalMorphCore Apply 同步调用链中提供原生权重视图。原生 getter/setter 成对处理，
+  新增通道不接收游戏按原索引发出的更新；EIEM 自己的读写使用当前 Mesh 的索引。
+- 显式控制原生通道期间，继续记录游戏最新要求值；撤销控制恢复此值，而非首次控制时的旧快照。
+- 新绑定初始化目标权重一次；新增通道初始化为 0，原生通道使用源权重，随后应用显式规则。
+  不每帧清零、不禁用整个控制器、不按角色或形态键名称特判。
+- 绑定由现有 Renderer/partner 状态拥有，Hook 仅持弱索引，验证对象生命周期和当前 Mesh。
+  F10、换图和失败恢复沿用现有状态清理；游戏 Hook 不回头获取替换状态锁，
+  查表锁和通道锁在转发原生调用之前释放，内部装配仍使用现有状态锁。
+- 同一 Renderer 被游戏重新赋予另一个源 Mesh 时，重新读取源名称/权重并退役旧通道绑定；
+  只改形态键、不替换 Mesh 的规则也会建立原生通道绑定。
+- 此版本只保护已证实的 Apply 同步路径，不声称覆盖尚未观察的其他游戏写入器。
+  意外工作线程调用会报告并阻止受保护的原生写入，不从工作线程执行 Unity Mesh getter。
+- 移除 v44/v45 临时观察定时器与调用栈日志，保留归档证据。正式入口按运行时名称解析，无固定 RVA。
+
+通道归属修正的游戏验收尚未完成。
+
 只恢复本规则拥有的形态键通道。新增实例使用当前变量；销毁随现有实例清理；
 换 Mesh 后按名称重新解析索引，不跨 Mesh 复用索引。
 源游戏没有对应形态键不妨碍替换 Mesh 新增通道。静态 MeshFilter 不提供 SMR 权重接口，明确报错。
 找不到通道、调用失败、回读不一致要报告，不能回退成索引 0，不能报告画面成功。
 Mesh 构建使用显式异常通道检查 AddBlendShapeFrame；完成后核对通道数、名称与帧数。
-Renderer 权重写入后也要读回验证。原生权重错误写入日志 `[SHAPE]`；Lua UI 自身错误在独立窗口与 `[UI]` 日志报告。
-替换 Mesh 且带形态键控制时先保存源 Renderer 权重；撤销时分别恢复替换 Mesh 的受控通道和源 Mesh 的原权重。
+Renderer 权重写入后也要读回验证。原生权重错误写入日志 `[SHAPE]`；Lua UI 自身错误在 `[UI]` 日志报告。
+SMR 替换 Mesh 时无论是否带形态键控制，均先保存源通道信息；撤销时恢复替换 Mesh 的受控通道，
+并将最新记录的游戏要求权重写回源 Mesh 的对应通道。源权重写入也必须回读通过才释放恢复记录。
 形态键可能改变包围盒；超出原包围盒、游戏自定义形态键 GPU 通道及游戏动画后续覆写仍需真实渲染验证。
 
 ## Blender 作者流程
 
-在原生形态键面板制作 Basis 与相对 Basis 的形态键，选中要控制的键（不能是 Basis）。
-进入网格数据属性（绿色三角图标）→“EIEM 形态键控制”→“为当前形态键生成控制滑条”。
-面板显式提供通道选择、标签、默认值和范围；不要求用户手写 INI。
-保存 .blend 保留作者数据；导出选中 Mesh 时生成 Constants、UI、ui.lua 和对应 Render 的 shape 绑定。
+在原生形态键面板制作 Basis 与相对 Basis 的形态键。Blender 0.9 在导出时自动为新增键生成 persist 变量，
+作者默认值直接取当前 Blender 权重；不需要 UI，也不需要手写 INI。
+网格数据属性（绿色三角图标）→“EIEM 形态键控制”→“刷新新增形态键列表”可查看、禁用控制。
+源游戏已有通道默认不接管；选中后用“接管当前形态键”显式添加，填写默认值、标签与范围。
+保存及恢复默认值的完整约定见 [作者状态与材质导入](author-state-materials.md)。
+保存 .blend 保留作者数据；导出选中 Mesh 时生成 Constants 和 Render 的 shape 绑定；
+勾选“生成简单 UI”才额外生成 UI、ui.lua，具体交互属于可编辑的 Lua 模板。
 同源拆分自动生成 partner 时，绑定属于使用该 Mesh 的 partner，而非被 skip 的源 Render。
 共享 Mesh 数据只导出一份资源/滑条；不同 Mesh 的同名形态键分别控制。
 V1 不伪装支持绝对形态键、非 Basis 相对键或顶点组遮罩：遇到这些明确拒绝导出，避免静默变形错误。
@@ -72,29 +100,9 @@ V1 不伪装支持绝对形态键、非 Basis 相对键或顶点组遮罩：遇�
 因此当前不能承诺大幅变形后的光照与游戏一致。不要把顶点位置成功当成着色全部通过。
 控制数据保存在 Mesh 数据块，旧 .blend 更新插件后重新导出即可；无需用户手写 INI。
 
-## 验证记录（2026-09-05）
+## 验证
 
-- `tests/test_shape_controls.py`：实际解析/求值、跨 Mod 隔离、按键/滑条输入顺序、旧代事件丢弃、
-  通道归属、原始权重恢复、Mesh 换索引、部分写入失败可恢复、极小数值精度、坏字段/坏范围拒绝。
-- `tests/test_shape_runtime.py`：抽取实际 IL2CPP 适配代码，模拟原生对象测试写入/回读、线程限制、
-  静态 MeshFilter 拒绝、异常与空返回、静默写入失败、通道元数据不一致。
-- `tests/test_blender_shapes.py`：独立后台 Blender 5.0 临时工程新增形态键，绘制控制面板，保存重开，
-  导出形态键顶点增量/INI，再由 DLL 的真实解析器读取；覆盖共享资源、拆分 partner、同名键隔离。
-- `build.bat`：编译 `resource-runtime-v36-shape-controls`。这不是 GPU 画面测试。
-
-待游戏验收：0 → 1 → 0、同变量快捷键/if 分支、F10、同资源多实例、地图/UI 切换。
-如果权重回读正确而画面不动，说明还未证明游戏自定义 GPU 变形阶段消费这些数据；
-下一步必须查实际变形输入，而不是重复添加 setter、换骨架或猜测索引。
-
-## 部署（2026-09-05）
-
-- 全量 `unittest discover -s tests -q`：61 项通过（设置 `EIEM_BLENDER=G:\blender5.0\blender.exe`，含后台 Blender）。
-- `build.bat` 构建成功；`git diff --check` 无空白错误。
-- 已确认游戏进程未运行，更新 `D:\Hypergryph Launcher\games\Endfield Game\plugin\eiem.dll`。
-  SHA256：`B4BFA0CBA05D7BD9DFD1DDF545459819A715057862CFEE914B239F345309450F`。
-- `E:\vscode\EIEM_Blender` 的 `__init__.py`、`eiem_blender_addon.py`、`README.md` 已同步 0.6.0 并逐文件核对哈希。
-- 旧 DLL、全局 INI 及上述三个旧插件文件备份到
-  `E:\EIEM_Workspace\plugin-releases\before-v36-shape-controls-20260905`。
-- 全局 INI 哈希未变，未覆盖用户 Mod、模型或 Blender 工程；没有提交 Git。
-- 更新 DLL 后启动游戏加载；Blender 开发环境执行 Reload Addons。
-  Mod 文件修改使用全局刷新（默认 F10）；运行时拖动滑条不需要刷新。
+`tests/test_shape_controls.py`、`test_shape_runtime.py`、`test_shape_ownership.py` 与
+`test_blender_shapes.py` 覆盖资源、权重、游戏通道归属和 Blender 作者流程。
+游戏 GPU 形变、动作期间权重、F10 和多实例画面仍需独立验收。
+历史测试和部署结果见[版本记录](archive/release-records.md)。v44～v46 根因证据见[诊断档案](archive/shape-weight-diagnosis.md)。

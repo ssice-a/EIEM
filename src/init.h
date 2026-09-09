@@ -193,6 +193,7 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
     registered.clear();
   };
   while (g_guiRunning && !g_shutdownRequested && IsWindowAlive(hwnd)) {
+    s_eiemPersistentStates.Flush(); // batched writes only; no disk polling or Unity calls
     HWND foreground = GetForegroundWindow();
     LONG modGeneration = InterlockedCompareExchange(&s_eiemModGeneration, 0, 0);
     LONG configGeneration = InterlockedCompareExchange(&s_eiemGlobalConfigGeneration, 0, 0);
@@ -202,11 +203,7 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
       // Discard messages from the old registration before reusing OS IDs.
       while (PeekMessageW(&message, nullptr, WM_HOTKEY, WM_HOTKEY, PM_REMOVE)) {}
       EiemGlobalConfig config = EiemGetGlobalConfig();
-      std::vector<EiemKeyChord> modKeys = EiemGetModKeyChords(&modGeneration);
-      const auto uiKeys = EiemGetUiKeyChords();
-      if (foreground != hwnd) modKeys.clear(); // don't cycle models while typing in a UI
-      for (const auto &key : uiKeys)
-        if (std::find(modKeys.begin(),modKeys.end(),key) == modKeys.end()) modKeys.push_back(key);
+      std::vector<EiemKeyChord> modKeys = EiemGetModKeyChords(&modGeneration, foreground != hwnd);
       int nextId = 1;
       auto bind = [&](EiemKeyChord chord, KeyAction action) {
         int id = nextId++;
@@ -266,6 +263,7 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
     SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)g_origWndProc);
     g_origWndProc = nullptr;
   }
+  s_eiemPersistentStates.Flush(true);
   g_guiRunning = false;
   Log("[INFO] Game window closed, hotkey thread exiting");
   return 0;
@@ -574,7 +572,7 @@ static DWORD WINAPI InitThread(LPVOID) {
       CreateFileA("plugin\\eiem_log.txt", GENERIC_WRITE, FILE_SHARE_READ, NULL,
                   CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
   Log("=== EIEM Phase 1: Skeleton Discovery ===");
-  Log("[BUILD] resource-runtime-v37-lua-ui dll=%s %s", __DATE__,
+  Log("[BUILD] resource-runtime-v70-physics-npc-owner dll=%s %s", __DATE__,
       __TIME__);
 
   if (!Resolve()) {

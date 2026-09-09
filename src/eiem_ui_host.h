@@ -35,10 +35,9 @@ class EiemUiHost {
       ContextScope scope(self->context);
       if (ImGui_ImplWin32_WndProcHandler(window,message,wp,lp)) return 1;
     }
-    if (message == WM_CLOSE && self) {
-      for (auto &entry : self->entries) entry.script->open = false;
-      return 0;
-    }
+    // This transparent host is infrastructure, not an authored Mod window.
+    // Script-owned Begin/open values govern application windows.
+    if (message == WM_CLOSE) return 0;
     if (message == WM_ERASEBKGND) return 1;
     return DefWindowProcW(window,message,wp,lp);
   }
@@ -131,9 +130,6 @@ public:
     ContextScope restore(ImGui::GetCurrentContext());
     LONG nextGeneration; auto snapshots = EiemGetModUis(&nextGeneration);
     if (nextGeneration != generation) {
-      std::unordered_set<std::string> opened;
-      for (const auto &entry : entries) if (entry.script->open)
-        opened.insert(EiemModIdentifier(entry.snapshot.modPath.c_str(),entry.snapshot.ui.section.c_str()));
       if (failed) Shutdown(); // a failed device is rebuilt, never reused as a fallback
       entries.clear(); generation = nextGeneration; failed = false;
       // Full context replacement removes active widgets, drag state and backend
@@ -141,7 +137,7 @@ public:
       if (context) { DeleteContext(); if (!NewContext()) failed = true; }
       for (const auto &snapshot : snapshots) {
         std::string id = EiemModIdentifier(snapshot.modPath.c_str(),snapshot.ui.section.c_str());
-        auto script = std::make_unique<EiemLuaUi>(id); script->open = opened.count(id) != 0;
+        auto script = std::make_unique<EiemLuaUi>(id);
         bool loaded = script->LoadFile(snapshot.modPath,snapshot.ui.path);
         if (!loaded)
           Log("[UI] %s/%s: %s",snapshot.modPath.c_str(),snapshot.ui.section.c_str(),script->error.c_str());
@@ -151,21 +147,9 @@ public:
       for (size_t i = 0; i < entries.size() && i < snapshots.size(); ++i)
         entries[i].snapshot.variables = std::move(snapshots[i].variables);
     }
-    const auto global = EiemGetGlobalConfig();
-    auto keys = EiemTakeUiKeys();
-    bool any = false;
-    for (auto &entry : entries) {
-      auto &s = entry.snapshot;
-      bool eligible = !s.ui.condition || s.ui.condition->Evaluate(s.variables) != 0;
-      if (!eligible) entry.script->open = false;
-      for (const auto &key : keys)
-        if (eligible && key.second == generation && key.first == s.ui.chord &&
-            !(key.first == global.gui) && !(key.first == global.reload)) entry.script->open = !entry.script->open;
-      any |= entry.script->open;
-    }
     HWND foreground = GetForegroundWindow();
     const bool owned = foreground == g_gameHwnd || foreground == g_guiHwnd || foreground == hwnd;
-    if (!any || !g_pluginActive || !owned || IsIconic(g_gameHwnd)) { Visible(false); return; }
+    if (entries.empty() || !g_pluginActive || !owned || IsIconic(g_gameHwnd)) { Visible(false); return; }
     if (failed) return;
     if (!hwnd && !InitializeHidden()) {
       Log("[UI] Native host creation failed err=%lu; retry with Reload",GetLastError());
@@ -177,11 +161,10 @@ public:
     if (rect.right <= 0 || rect.bottom <= 0) { Visible(false); return; }
     if (!Resize(rect.right,rect.bottom)) { Log("[UI] Resize failed; retry with Reload"); Visible(false); failed = true; return; }
     SetWindowPos(hwnd,HWND_TOPMOST,origin.x,origin.y,rect.right,rect.bottom,SWP_NOACTIVATE);
-    Visible(true);
     ImGui_ImplDX11_NewFrame(); ImGui_ImplWin32_NewFrame(); ImGui::NewFrame();
     for (auto &entry : entries) {
       EiemVariables values;
-      if (entry.script->Draw(entry.snapshot.variables,values) && !values.empty()) {
+      if (entry.script->Draw(entry.snapshot.variables,values,entry.snapshot.defaults) && !values.empty()) {
         // Validation at submission gives script authors immediate diagnostics;
         // publication validates again against the actual generation/state.
         std::string error;
@@ -195,13 +178,15 @@ public:
         if (valid) EiemQueueModInput({{},generation,entry.snapshot.modPath,entry.snapshot.ui.section,std::move(values)});
         else entry.script->error = error.empty() ? "UI Mod is no longer available" : error;
       }
-      entry.script->DrawError();
       if (!entry.script->error.empty() && !entry.reported) {
         Log("[UI] %s/%s: %s",entry.snapshot.modPath.c_str(),entry.snapshot.ui.section.c_str(),entry.script->error.c_str());
         entry.reported = true;
       }
     }
     ImGui::Render();
+    // Run callbacks even while nothing is shown: Lua decides whether to emit
+    // windows. No private DLL "open" state can prevent a script from opening one.
+    Visible(ImGui::GetDrawData()->TotalVtxCount > 0);
     POINT mouse; GetCursorPos(&mouse); ScreenToClient(hwnd,&mouse);
     bool hit = context->ActiveId != 0;
     for (auto *window : context->Windows)

@@ -1,10 +1,14 @@
 #pragma once
 #include "eiem_mod_document.h"
+#include "eiem_shape_binding.h"
+
+struct EiemShapeRuntimeBinding;
 
 struct EiemShapeBaseline { std::string name; float value; };
 struct EiemShapeState {
   void *mesh = nullptr;
   std::vector<EiemShapeBaseline> owned;
+  std::shared_ptr<EiemShapeRuntimeBinding> binding;
 };
 
 // Per Renderer ownership. Resolve names against the CURRENT Mesh; an index is

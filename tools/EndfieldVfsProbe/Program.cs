@@ -3,6 +3,12 @@ using System.Security.Cryptography;
 using AnimeStudio;
 using AnimeStudio.GUI;
 
+if (args.Length > 0 && args[0] == "--inspect-prefab-components")
+    return PrefabComponentProbe.Run(args);
+
+if (args.Length > 0 && args[0] == "--inspect-prefab-animation")
+    return PrefabAnimationProbe.Run(args);
+
 if (args.Length == 3 && args[0] == "--find-index")
 {
     var index = EndfieldIndexStore.Load(args[1]).Assets;
