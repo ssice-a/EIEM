@@ -46,6 +46,7 @@ for cycle in range(3):
     assert bpy.ops.eiem.export_physics.get_rna_type() is not None
     assert bpy.ops.eiem.organize_physics.get_rna_type() is not None
     assert bpy.ops.eiem.physics_parameters.get_rna_type() is not None
+    assert bpy.ops.eiem.physics_curve_key.get_rna_type() is not None
     assert bpy.ops.eiem.switch_key_record.get_rna_type() is not None
     assert hasattr(bpy.types, "OBJECT_PT_eiem_physics")
     assert hasattr(bpy.types, "EIEM_MT_physics_create")

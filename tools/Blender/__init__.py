@@ -5,7 +5,7 @@
 bl_info = {
     "name": "EIEM Resource Package",
     "author": "EIEM",
-    "version": (0, 26, 0),
+    "version": (0, 26, 1),
     "blender": (3, 0, 0),
     "location": "File > Import/Export > EIEM package",
     "category": "Import-Export",

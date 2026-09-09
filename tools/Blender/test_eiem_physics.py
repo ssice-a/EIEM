@@ -23,6 +23,10 @@ tip.head, tip.tail = extra.tail, (0,0,1.4)
 bpy.ops.object.mode_set(mode="OBJECT")
 group = physics.create_group(rig, [rig.data.bones["Extra"],rig.data.bones["Tip"]], "尾链")
 group.eiem_physics.gravity = 5
+extra_sample = physics.author_bone_sample(group, rig.data.bones["Extra"])
+tip_sample = physics.author_bone_sample(group, rig.data.bones["Tip"])
+assert extra_sample["role"] == "FIXED" and abs(extra_sample["depth"]) < 1e-8
+assert tip_sample["role"] == "MOVE" and abs(tip_sample["depth"] - 1.0) < 1e-8
 assert abs(group.eiem_physics.node_radius - .006) < 1e-8
 radius_node = physics.native.curve_mapping_node(group, physics.native.NODE_RADIUS_PARAMETER)
 assert radius_node is not None and len(radius_node.mapping.curves[0].points) == 2

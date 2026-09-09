@@ -405,6 +405,38 @@ def remove_generated_visuals(owner):
             native.remove_visual(child)
 
 
+def author_bone_sample(group, bone):
+    """Return one authored node's role and normalized root distance."""
+    if not group or group.eiem_physics.kind != "GROUP" or not group.eiem_physics.rig:
+        return None
+    lookup = {str(item.get("eiem_physics_id")): item for item in group.eiem_physics.rig.data.bones
+              if item.get("eiem_physics_id")}
+    roles = {lookup[node.bone_id].name: node.role for node in group.eiem_physics.nodes
+             if node.bone_id in lookup}
+    if bone.name not in roles:
+        return None
+    distances = {}
+
+    def distance(item):
+        if item.name in distances:
+            return distances[item.name]
+        parent = item.parent
+        if roles[item.name] != "MOVE" or not parent or parent.name not in roles:
+            value = 0.0
+        else:
+            value = float((item.head_local - parent.head_local).length)
+            if roles[parent.name] == "MOVE":
+                value += distance(parent)
+        distances[item.name] = value
+        return value
+
+    maximum = max((distance(item) for item in lookup.values()
+                   if item.name in roles and roles[item.name] == "MOVE"), default=0.0)
+    depth = distance(bone) / maximum if maximum > 1e-9 else 0.0
+    return {"bone": bone, "path": str(bone.get("eiem_path", bone.name)),
+            "depth": depth, "role": roles[bone.name]}
+
+
 def rebuild_group(obj):
     """Draw an authored group from its explicit bone references."""
     global _REBUILDING_GROUPS
@@ -1663,6 +1695,55 @@ class EIEM_MT_physics_create(bpy.types.Menu):
         layout.operator("eiem.import_physics", text="导入 Physics 作者包", icon="IMPORT")
 
 
+def active_group_node_sample(context, group):
+    rig = group.eiem_physics.rig if group else None
+    if not rig or context.object != rig:
+        return None
+    bone = rig.data.bones.active
+    if not bone or not bone.select:
+        return None
+    if native.is_native(group):
+        return native.native_bone_sample(group, bone)
+    return author_bone_sample(group, bone)
+
+
+def draw_active_group_node(layout, context, group):
+    sample = active_group_node_sample(context, group)
+    if sample is None:
+        return
+    box = layout.box()
+    role = {"FIXED": "固定", "MOVE": "运动", "IGNORE": "忽略"}.get(
+        sample["role"], sample["role"])
+    box.label(text="当前节点：%s · %s" % (sample["bone"].name, role),
+              icon="BONE_DATA")
+    depth = float(sample["depth"])
+    if native.is_parameter_group(group):
+        parameter = native.active_curve_parameter(group.eiem_native_physics)
+        label = dict(native.CURVE_PARAMETERS)[parameter]
+        base = float(native.native_number(group, parameter + ".value"))
+        enabled = bool(native.native_number(group, parameter + ".useCurve"))
+        multiplier = native.curve_parameter_multiplier(group, parameter, depth)
+    else:
+        parameter = native.NODE_RADIUS_PARAMETER
+        label = "节点半径"
+        base = float(group.eiem_physics.node_radius)
+        enabled = bool(group.eiem_physics.radius_use_curve)
+        curve_node = native.curve_mapping_node(group, parameter)
+        multiplier = (float(curve_node.mapping.evaluate(curve_node.mapping.curves[0], depth))
+                      if enabled and curve_node else 1.0)
+    box.label(text="链位置 %.3f · %s倍率 %.4g" % (depth, label, multiplier))
+    box.label(text="基础值 %.5g · 当前实际值 %.5g" % (base, base * multiplier))
+    curve_node = native.curve_mapping_node(group, parameter)
+    exists = curve_node is not None and any(
+        abs(point.location.x - depth) < 1e-5 for point in native.curve_mapping_points(curve_node))
+    row = box.row()
+    row.enabled = bool(enabled and curve_node is not None and not exists)
+    op = row.operator("eiem.physics_curve_key", text="在此位置增加关键点", icon="ADD")
+    op.action, op.parameter, op.position = "ADD", parameter, depth
+    if exists:
+        box.label(text="此链位置已有关键点")
+
+
 class EIEM_PT_physics(bpy.types.Panel):
     bl_label = "物理骨骼"
     bl_idname = "EIEM_PT_physics"
@@ -1679,6 +1760,7 @@ class EIEM_PT_physics(bpy.types.Panel):
             op = row.operator("eiem.physics_parameters", text="粘贴参数", icon="PASTEDOWN"); op.action = "PASTE"
             row.operator("eiem.physics_edit", text="查看", icon="RESTRICT_VIEW_OFF").action = "FOCUS_GROUP"
             layout.label(text="参数：选中 Empty → 对象属性 → EIEM 物理参数", icon="INFO")
+            draw_active_group_node(layout, context, group)
         structure_header, structure = layout.panel("eiem_physics_structure_tools", default_closed=True)
         structure_header.label(text="链与碰撞体", icon="BONE_DATA")
         if structure:
@@ -1741,10 +1823,9 @@ class EIEM_PT_physics_object(bpy.types.Panel):
                 radius_box.prop(data, "radius_use_curve")
                 node = native.curve_mapping_node(obj, native.NODE_RADIUS_PARAMETER)
                 if node is not None:
-                    column = radius_box.column()
-                    column.enabled = bool(data.radius_use_curve)
-                    column.template_curve_mapping(node, "mapping", type="NONE", use_negative_slope=True)
-                    radius_box.label(text="横轴：根部 0 → 末端 1　纵轴：基础半径倍率")
+                    native.draw_curve_distribution(
+                        radius_box, obj, native.NODE_RADIUS_PARAMETER,
+                        bool(data.radius_use_curve))
             lookup = {str(b.get("eiem_physics_id")): b for b in data.rig.data.bones
                       if b.get("eiem_physics_id")} if data.rig else {}
             names = [lookup[node.bone_id].name if node.bone_id in lookup else "骨骼已删除"

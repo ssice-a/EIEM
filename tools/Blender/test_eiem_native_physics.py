@@ -53,6 +53,16 @@ for group in groups:
             top = visual.data.vertices[offset * 62].co
             assert abs((top - center).length - radius) < 1e-5
 
+# A selected Rig bone can be resolved back to its group role and normalized
+# curve position without exposing SelectionData array order to the UI.
+sample_group = groups[0]
+bone_samples = [native.native_bone_sample(sample_group, bone)
+                for bone in sample_group.eiem_physics.rig.data.bones]
+bone_samples = [sample for sample in bone_samples if sample is not None]
+assert bone_samples and native.NODE_SAMPLE_CACHE in sample_group
+assert all(sample["role"] in {"FIXED", "MOVE", "IGNORE"} and
+           0.0 <= sample["depth"] <= 1.0 for sample in bone_samples)
+
 # The four source groups that actually enable angle limiting receive one
 # generated preview object. Each cone belongs to a MOVE edge and samples the
 # group curve at the game's normalized accumulated root distance.
@@ -140,6 +150,23 @@ damping_original = copy.deepcopy(damping_original)
 damping_original_enabled = damping_fields["useCurve"].integer
 damping_fields["useCurve"].integer = "1"
 damping_node = native.curve_mapping_node(curve_group, damping_parameter)
+damping_points = native.curve_mapping_points(damping_node)
+assert native.curve_mapping_endpoints(damping_node) == (damping_points[0], damping_points[-1])
+native.set_curve_mapping_interpolation(damping_node, "LINEAR")
+assert all(point.handle_type == "VECTOR" for point in damping_points)
+native.set_curve_mapping_interpolation(damping_node, "SMOOTH")
+assert all(point.handle_type == "AUTO" for point in damping_points)
+inserted = native.insert_curve_mapping_point(damping_node, .5)
+assert abs(inserted.location.x - .5) < 1e-6 and inserted.select
+assert len(native.curve_mapping_points(damping_node)) == len(damping_points) + 1
+native.remove_curve_mapping_point(damping_node, inserted)
+assert len(native.curve_mapping_points(damping_node)) == len(damping_points)
+try:
+    native.remove_curve_mapping_point(damping_node, native.curve_mapping_points(damping_node)[0])
+except ValueError:
+    pass
+else:
+    raise AssertionError("Curve endpoint deletion should be rejected")
 damping_end = max(damping_node.mapping.curves[0].points, key=lambda point: point.location.x)
 damping_end.location = (damping_end.location.x, damping_end.location.y + .25)
 damping_node.mapping.update()

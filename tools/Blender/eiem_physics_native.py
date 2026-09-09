@@ -101,6 +101,7 @@ NODE_RADIUS_VISUAL_FIELDS = {NODE_RADIUS_BASE_FIELD,
                              NODE_RADIUS_PARAMETER + ".useCurve"}
 NODE_RADIUS_CURVE_FIELD_PREFIX = NODE_RADIUS_PARAMETER + ".curve."
 NODE_RADIUS_PREVIEW_MARKER = "native-node-radius"
+NODE_SAMPLE_CACHE = "eiem_physics_node_samples"
 CURVE_MAPPING_TREE_MARKER = "eiem_physics_curve_mapping_tree"
 CURVE_MAPPING_PARAMETER = "eiem_physics_curve_parameter"
 CURVE_MAPPING_SIGNATURE = "eiem_physics_curve_mapping_signature"
@@ -626,6 +627,63 @@ def curve_mapping_node(obj, parameter, create=False):
     return node
 
 
+def curve_mapping_points(node):
+    """Return curve keys in root-to-tip order."""
+    if node is None:
+        return []
+    return sorted(node.mapping.curves[0].points, key=lambda point: point.location.x)
+
+
+def curve_mapping_endpoints(node):
+    points = curve_mapping_points(node)
+    source.require(len(points) >= 2, "浮点曲线至少需要两个关键点")
+    return points[0], points[-1]
+
+
+def curve_mapping_is_linear(node):
+    points = curve_mapping_points(node)
+    return bool(points) and all(point.handle_type == "VECTOR" for point in points)
+
+
+def set_curve_mapping_interpolation(node, interpolation):
+    """Apply one predictable interpolation style to the editable projection."""
+    source.require(interpolation in ("LINEAR", "SMOOTH"), "未知的曲线插值方式")
+    handle = "VECTOR" if interpolation == "LINEAR" else "AUTO"
+    for point in curve_mapping_points(node):
+        point.handle_type = handle
+    node.mapping.update()
+
+
+def insert_curve_mapping_point(node, position):
+    """Insert a key without changing the currently displayed curve shape."""
+    source.require(node is not None, "物理曲线尚未建立")
+    position = min(1.0, max(0.0, float(position)))
+    points = curve_mapping_points(node)
+    linear = curve_mapping_is_linear(node)
+    source.require(not any(abs(point.location.x - position) < 1e-5 for point in points),
+                   "此链位置已有关键点")
+    curve = node.mapping.curves[0]
+    node.mapping.update()
+    value = float(node.mapping.evaluate(curve, position))
+    for point in points:
+        point.select = False
+    point = curve.points.new(position, value)
+    point.handle_type = "VECTOR" if linear else "AUTO"
+    point.select = True
+    node.mapping.update()
+    return point
+
+
+def remove_curve_mapping_point(node, point):
+    points = curve_mapping_points(node)
+    source.require(point in points, "曲线关键点已改变")
+    index = points.index(point)
+    source.require(0 < index < len(points) - 1, "根端和末端关键点不能删除")
+    source.require(len(points) > 2, "物理曲线至少保留两个关键点")
+    node.mapping.curves[0].points.remove(point)
+    node.mapping.update()
+
+
 def curve_mapping_signature(node):
     if node is None:
         return ""
@@ -644,6 +702,20 @@ def source_curve_signature(keys):
     return json.dumps(keys, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
+def source_curve_is_linear(keys):
+    if any(int(key.get("weightedMode", 0)) != 0 for key in keys):
+        return False
+    for first, second in zip(keys, keys[1:]):
+        duration = float(second["time"]) - float(first["time"])
+        if duration <= 1e-9:
+            return False
+        slope = (float(second["value"]) - float(first["value"])) / duration
+        if (abs(float(first["outSlope"]) - slope) > 1e-5 or
+                abs(float(second["inSlope"]) - slope) > 1e-5):
+            return False
+    return True
+
+
 def load_curve_mapping(obj, parameter, keys):
     """Project source keys into Blender's compact Float Curve widget."""
     source.require(2 <= len(keys) <= 64, "浮点曲线需要 2..64 个控制点")
@@ -656,10 +728,11 @@ def load_curve_mapping(obj, parameter, keys):
     ordered = sorted(keys, key=lambda item: item["time"])
     points[0].location = (float(ordered[0]["time"]), float(ordered[0]["value"]))
     points[1].location = (float(ordered[-1]["time"]), float(ordered[-1]["value"]))
-    points[0].handle_type = points[1].handle_type = "AUTO"
+    handle = "VECTOR" if source_curve_is_linear(ordered) else "AUTO"
+    points[0].handle_type = points[1].handle_type = handle
     for key in ordered[1:-1]:
         point = points.new(float(key["time"]), float(key["value"]))
-        point.handle_type = "AUTO"
+        point.handle_type = handle
     values = [float(key["value"]) for key in ordered]
     low, high = min(values), max(values)
     padding = max(.1, (high - low) * .2)
@@ -800,6 +873,7 @@ def build_curve_mappings(obj):
             current = curve_mapping_signature(node)
             baseline = str(node.get(CURVE_MAPPING_SIGNATURE, ""))
             if baseline and baseline != current:
+                node.mapping.update()
                 apply_curve_mapping(obj, parameter)
                 fields, keys = source_curve_keys(obj, parameter)
                 wanted = source_curve_signature(keys)
@@ -1054,19 +1128,22 @@ def evaluate_source_curve(keys, time):
     return cubic(y0, y1, y2, y3, (low + high) * .5)
 
 
-def curve_parameter_value(obj, parameter, depth):
-    """Evaluate one native base value and its optional chain-depth multiplier."""
-    base = float(native_number(obj, parameter + ".value"))
+def curve_parameter_multiplier(obj, parameter, depth):
+    """Evaluate the optional root-to-tip multiplier for one native parameter."""
     fields, keys = source_curve_keys(obj, parameter)
     enabled = bool(int(fields["useCurve"].integer))
     node = curve_mapping_node(obj, parameter)
     pending_mapping_edit = (node is not None and str(node.get(CURVE_MAPPING_SIGNATURE, "")) !=
                             curve_mapping_signature(node))
     if enabled and pending_mapping_edit:
-        multiplier = float(node.mapping.evaluate(node.mapping.curves[0], float(depth)))
-    else:
-        multiplier = evaluate_source_curve(keys, float(depth)) if enabled else 1.0
-    return base * multiplier
+        return float(node.mapping.evaluate(node.mapping.curves[0], float(depth)))
+    return evaluate_source_curve(keys, float(depth)) if enabled else 1.0
+
+
+def curve_parameter_value(obj, parameter, depth):
+    """Evaluate one native base value and its optional chain-depth multiplier."""
+    base = float(native_number(obj, parameter + ".value"))
+    return base * curve_parameter_multiplier(obj, parameter, depth)
 
 
 def node_collision_radius(obj, depth):
@@ -1098,7 +1175,7 @@ def component_local_graph(payload, component):
     return by_id, order, children, origins
 
 
-def group_local_selection_graph(obj):
+def group_local_selection_graph(obj, include_mapping=False):
     """Resolve a preview graph by matching serialized points to source Transform origins.
 
     The match is geometric and one-to-one. It does not make SelectionData array
@@ -1153,7 +1230,39 @@ def group_local_selection_graph(obj):
     maximum = max(depths, default=0.0)
     if maximum > 1e-8:
         depths = [min(1.0, max(0.0, value / maximum)) for value in depths]
-    return positions, attributes, parents, depths
+    result = (positions, attributes, parents, depths)
+    return result + (mapping,) if include_mapping else result
+
+
+def cache_native_bone_samples(obj, graph=None):
+    """Build and cache source node roles and normalized chain positions."""
+    positions, attributes, parents, depths, mapping = (
+        graph or group_local_selection_graph(obj, include_mapping=True))
+    payload = snapshot(obj)
+    by_id = {item["identity"]: item for item in payload["transforms"]}
+    samples = {}
+    for identity, index in mapping.items():
+        attribute = attributes[index]
+        role = "FIXED" if attribute & 1 else "MOVE" if attribute & 2 else "IGNORE"
+        samples[by_id[identity]["bone"]] = {
+            "depth": float(depths[index]), "role": role, "index": int(index)}
+    obj[NODE_SAMPLE_CACHE] = json.dumps(samples, separators=(",", ":"))
+    return samples
+
+
+def native_bone_sample(obj, bone):
+    """Return the source node role and curve position for one Rig bone."""
+    source.require(is_native(obj) and obj.eiem_physics.kind == "NATIVE_GROUP",
+                   "所选物体不是游戏源物理组")
+    try:
+        samples = json.loads(str(obj.get(NODE_SAMPLE_CACHE, "{}")))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        samples = {}
+    path = str(bone.get("eiem_path", ""))
+    if path not in samples:
+        samples = cache_native_bone_samples(obj)
+    sample = samples.get(path)
+    return dict(sample, bone=bone, path=path) if sample is not None else None
 
 
 def angle_cone_ring(apex, edge, angle, segments=20):
@@ -1242,7 +1351,9 @@ def rebuild(obj):
             remove_visual(child)
     c = current_record(obj)
     if c["type"] == "BeyondBoneCloth":
-        positions, attributes, parents, depths = group_local_selection_graph(obj)
+        positions, attributes, parents, depths, mapping = group_local_selection_graph(
+            obj, include_mapping=True)
+        cache_native_bone_samples(obj, (positions, attributes, parents, depths, mapping))
         samples = {key: [] for key in ("FIXED", "MOVE")}
         ignored = []
         for index, (position, attribute, depth) in enumerate(zip(positions, attributes, depths)):
@@ -1321,6 +1432,7 @@ def poll_curve_previews():
             previous = str(node.get(CURVE_MAPPING_SIGNATURE, ""))
             if previous and previous != signature:
                 try:
+                    node.mapping.update()
                     if is_parameter_group(obj):
                         apply_curve_mapping(obj, parameter)
                     elif obj.eiem_physics.kind == "GROUP" and AUTHOR is not None:
@@ -1448,6 +1560,11 @@ class EIEM_PG_native_physics(bpy.types.PropertyGroup):
     fields: CollectionProperty(type=EIEM_PG_native_field)
     curve_mapping_tree: PointerProperty(type=bpy.types.NodeTree, options={"HIDDEN"})
     active_curve: EnumProperty(name="变化参数", items=CURVE_PARAMETER_ITEMS, default="0")
+    show_curve_keys: BoolProperty(
+        name="高级关键点", description="显示曲线中间关键点的链位置和倍率", default=False)
+    new_curve_key_position: FloatProperty(
+        name="关键点位置", description="新关键点在骨链根部 0 到末端 1 之间的位置",
+        default=0.5, min=0.0, max=1.0)
     search: StringProperty(name="筛选参数", description="参数名称，例如 gravity、damping、curve")
     show_parameters: BoolProperty(name="源数据检查（只读）", default=False)
     parameter_page: IntProperty(name="页", default=0, min=0)
@@ -1668,6 +1785,57 @@ class EIEM_OT_native_bones(bpy.types.Operator):
             self.report({"ERROR"}, str(error)); return {"CANCELLED"}
 
 
+def commit_curve_mapping(obj, parameter):
+    """Commit the editable Blender projection through the canonical authoring path."""
+    node = curve_mapping_node(obj, parameter)
+    source.require(node is not None, "物理曲线尚未建立")
+    if is_parameter_group(obj):
+        apply_curve_mapping(obj, parameter)
+    else:
+        source.require(obj.eiem_physics.kind == "GROUP" and AUTHOR is not None,
+                       "所选物理组无法编辑这条曲线")
+        AUTHOR.author_curve_mapping_edited(obj, parameter, curve_mapping_keys(node))
+        node[CURVE_MAPPING_SIGNATURE] = curve_mapping_signature(node)
+
+
+class EIEM_OT_native_curve_key(bpy.types.Operator):
+    bl_idname = "eiem.physics_curve_key"
+    bl_label = "编辑物理曲线"
+    bl_options = {"REGISTER", "UNDO"}
+
+    action: StringProperty()
+    parameter: StringProperty()
+    index: IntProperty(default=-1)
+    position: FloatProperty(default=0.5, min=0.0, max=1.0)
+
+    def execute(self, context):
+        try:
+            obj = context.object
+            if not obj or obj.eiem_physics.kind not in ("GROUP", "NATIVE_GROUP"):
+                obj = AUTHOR.group_of(context)
+            source.require(obj and obj.eiem_physics.kind in ("GROUP", "NATIVE_GROUP"),
+                           "请选择物理组")
+            parameter = self.parameter or (active_curve_parameter(obj.eiem_native_physics)
+                                             if is_parameter_group(obj) else NODE_RADIUS_PARAMETER)
+            node = curve_mapping_node(obj, parameter)
+            source.require(node is not None, "物理曲线尚未建立")
+            if self.action in ("LINEAR", "SMOOTH"):
+                set_curve_mapping_interpolation(node, self.action)
+            elif self.action == "ADD":
+                insert_curve_mapping_point(node, self.position)
+            elif self.action == "DELETE":
+                points = curve_mapping_points(node)
+                source.require(0 < self.index < len(points) - 1, "只能删除中间关键点")
+                remove_curve_mapping_point(node, points[self.index])
+            else:
+                source.require(False, "未知的曲线编辑操作")
+            commit_curve_mapping(obj, parameter)
+            return {"FINISHED"}
+        except Exception as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+
+
 def import_source(filename, rig=None):
     source.require(bpy.context.mode == "OBJECT", "请回到物体模式后导入")
     filename = Path(filename).resolve()
@@ -1832,6 +2000,58 @@ class EIEM_OT_native_select(bpy.types.Operator):
         return {"FINISHED"}
 
 
+def draw_curve_distribution(layout, obj, parameter, enabled=True):
+    """Draw the common endpoints and an optional numeric key editor."""
+    node = curve_mapping_node(obj, parameter)
+    if node is None:
+        layout.label(text="曲线数据尚未建立", icon="ERROR")
+        return
+    state = obj.eiem_native_physics
+    points = curve_mapping_points(node)
+    root, tip = curve_mapping_endpoints(node)
+    controls = layout.column()
+    values = controls.column()
+    values.enabled = bool(enabled)
+    values.prop(root, "location", index=1, text="根部倍率")
+    values.prop(tip, "location", index=1, text="末端倍率")
+    style = values.row(align=True)
+    style.label(text="变化方式")
+    linear = curve_mapping_is_linear(node)
+    op = style.operator("eiem.physics_curve_key", text="线性", depress=linear)
+    op.action, op.parameter = "LINEAR", parameter
+    op = style.operator("eiem.physics_curve_key", text="平滑", depress=not linear)
+    op.action, op.parameter = "SMOOTH", parameter
+    if len(points) > 2:
+        controls.label(text="另有 %d 个中间关键点" % (len(points) - 2), icon="KEY_HLT")
+    controls.prop(
+        state, "show_curve_keys",
+        text="高级关键点", toggle=True,
+        icon="TRIA_DOWN" if state.show_curve_keys else "TRIA_RIGHT")
+    if state.show_curve_keys:
+        editor = controls.column()
+        editor.enabled = bool(enabled)
+        keys = editor.box()
+        keys.label(text="链位置 0 为根端，1 为末端")
+        for index, point in enumerate(points):
+            point_box = keys.box()
+            header = point_box.row(align=True)
+            kind = "根端" if index == 0 else "末端" if index == len(points) - 1 else "中间"
+            header.label(text="%s关键点 %d" % (kind, index + 1), icon="KEY_HLT")
+            if 0 < index < len(points) - 1:
+                op = header.operator("eiem.physics_curve_key", text="", icon="X")
+                op.action, op.parameter, op.index = "DELETE", parameter, index
+            values = point_box.row(align=True)
+            if 0 < index < len(points) - 1:
+                values.prop(point, "location", index=0, text="链位置")
+            else:
+                values.label(text="链位置 %.4g" % point.location.x)
+            values.prop(point, "location", index=1, text="倍率")
+        add = editor.row(align=True)
+        add.prop(state, "new_curve_key_position", text="新关键点位置")
+        op = add.operator("eiem.physics_curve_key", text="添加", icon="ADD")
+        op.action, op.parameter, op.position = "ADD", parameter, state.new_curve_key_position
+
+
 def draw_group_parameter_controls(layout, obj):
     """Draw the one supported day-to-day editor in a fixed order."""
     p = obj.eiem_native_physics
@@ -1864,10 +2084,9 @@ def draw_group_parameter_controls(layout, obj):
                     curve_box, field, "value" if field.floating else "integer", extra_label, factor=.42)
     node = curve_mapping_node(obj, parameter)
     if node is not None:
-        column = curve_box.column()
-        column.enabled = bool(p.curve_enabled) if enabled else True
-        column.template_curve_mapping(node, "mapping", type="NONE", use_negative_slope=True)
-        curve_box.label(text="横轴：根部 0 → 末端 1　纵轴：基础值倍率")
+        draw_curve_distribution(
+            curve_box, obj, parameter,
+            bool(p.curve_enabled) if enabled else True)
     else:
         curve_box.label(text="曲线数据尚未建立，请重新选择此物理组", icon="ERROR")
     if parameter == ANGLE_CURVE_PARAMETER and bool(native_number(obj, ANGLE_ENABLED_FIELD)):
@@ -1974,7 +2193,7 @@ def draw(layout, context, obj):
 CLASSES = (EIEM_PG_native_field, EIEM_PG_native_physics, EIEM_OT_native_import,
            EIEM_OT_native_select,
            EIEM_OT_native_parameter_page,
-           EIEM_OT_native_focus, EIEM_OT_native_bones)
+           EIEM_OT_native_focus, EIEM_OT_native_bones, EIEM_OT_native_curve_key)
 
 
 def register(author, api):
