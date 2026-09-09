@@ -457,6 +457,22 @@ created_group = bpy.context.object
 new_bones = set(rig.data.bones.keys()) - before_bones
 assert created_group.eiem_physics.kind == "GROUP" and len(created_group.eiem_physics.nodes) == 2
 assert len(new_bones) == 2 and all(not rig.data.bones[name].get("eiem_skeleton_source", True) for name in new_bones)
+# An authored group already uses Blender armature-local coordinates. Pasting an
+# angle-enabled native preset must place the cone apex on the authored FIXED
+# bone instead of applying the Unity-to-Blender basis a second time.
+angle_template = next(group for group in groups
+                      if bool(native.native_number(group, native.ANGLE_ENABLED_FIELD)))
+bpy.context.view_layer.objects.active = angle_template
+assert bpy.ops.eiem.physics_parameters(action="COPY") == {"FINISHED"}
+bpy.context.view_layer.objects.active = created_group
+assert bpy.ops.eiem.physics_parameters(action="PASTE") == {"FINISHED"}
+angle_visual = next(child for child in created_group.children
+                    if child.get("eiem_physics_preview") == native.ANGLE_PREVIEW_MARKER)
+created_lookup = {str(bone.get("eiem_physics_id")): bone for bone in rig.data.bones
+                  if bone.get("eiem_physics_id")}
+fixed_bone = next(created_lookup[node.bone_id] for node in created_group.eiem_physics.nodes
+                  if node.role == "FIXED")
+assert (angle_visual.data.vertices[0].co - fixed_bone.head_local).length < 1e-6
 # The same clipboard maps every field supported by an author group, including
 # the full node collision-radius curve with Unity tangent/weight metadata.
 bpy.context.view_layer.objects.active = template

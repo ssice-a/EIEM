@@ -2384,3 +2384,23 @@ Blender 5.0.1 验证通过插件发现与三轮注册/卸载、最小作者链�
 `bin/EIEM_Blender-0.26.1-lightweight-physics-curves.zip` 为 110013 字节，SHA256：
 `C8E04F69AE61EF156F73F48F3FBD91E3941FD73F062789E164FE13087ABD1AE4`。本节没有修改或部署 DLL，
 没有写入游戏目录，也没有增加原生碰撞体实例化的游戏内结论。
+
+### 20.46 Blender 0.26.2：修正新增作者组角度锥的重复坐标转换
+
+用户在当前 `maid.002 Skirt Physics` 视图中指出，黄色角度锥集中在角色脚边而不是六条裙摆骨链上。对象确实有
+12 个锥体且未隐藏，但“对象存在”不能证明空间位置正确。复核生成路径后确认：作者组的节点半径球和绿色连接线
+都把 `Bone.head_local` 作为 Blender Rig 局部坐标直接建模；角度锥却复用了原生 v2 源图入口的默认参数，又执行
+一次 Unity→Blender 基变换。重复转换把裙摆局部坐标旋转到了错误位置。
+
+`make_angle_visual` 现在显式接收坐标来源；导入原生 v2 继续保持一次 Unity→Blender 转换，新增作者组则传入
+`native_coordinates=False`，与节点球及连接线共用 Blender Rig 局部空间。热重载 0.26.2 后，当前作者组第一个锥尖
+与第一根 FIXED 骨骼 `maid_skirt_01_a_jnt` 的 `head_local` 均为
+`(0.098348245, -0.003961120, 0.995286882)`，距离误差为 0；12 个 MOVE 骨段的锥体已回到裙摆位置。
+节点碰撞半径曲线和五个独立原生胶囊没有改变。
+
+真实 Typhoea Blender 回归新增“把启用角度限制的原生模板粘贴到新增作者链后，锥尖必须与 FIXED 根骨坐标一致”
+检查，并与最小作者保存重开、插件三轮注册、62 Mesh 正常 package 导入一并通过。七个运行文件已同步到
+`E:\vscode\EIEM_Blender` 和 Blender 5.0 插件目录；当前未保存 `.blend` 没有自动保存。安装包
+`bin/EIEM_Blender-0.26.2-author-angle-preview.zip` 为 110156 字节，SHA256：
+`5674FD8698140C5819AACB744A820CF0F16051290908AD7FBFC18A5C40F429F4`。本节没有修改或部署 DLL，
+也没有写入游戏目录。

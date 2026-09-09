@@ -504,7 +504,7 @@ def rebuild_group(obj):
                     ring = native.angle_cone_ring(parent.head_local, edge, angle)
                     if ring:
                         cones.append((parent.head_local, ring, angle, depth))
-                native.make_angle_visual(obj, cones)
+                native.make_angle_visual(obj, cones, native_coordinates=False)
                 obj["eiem_physics_angle_preview"] = "ok:%d" % len(cones)
             else:
                 obj["eiem_physics_angle_preview"] = "disabled"

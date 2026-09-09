@@ -7,7 +7,7 @@
 目录只需要：
 
 - `__init__.py`：插件发现和注册入口，包含 Blender 要求的 `bl_info`。
-- `eiem_blender_addon.py`：导入、编辑、导出入口，仓库源码版本 0.26.1。
+- `eiem_blender_addon.py`：导入、编辑、导出入口，仓库源码版本 0.26.2。
 - `eiem_physics_authoring.py`、`eiem_physics_document.py`：Physics 面板、辅助体和资源读写，必须一起分发。
 - `eiem_physics_native.py`、`eiem_physics_source.py`：源物理图保留、编辑和独立 v2 导出，必须一起分发。
 - `README.md`：本说明。
@@ -47,7 +47,7 @@ Blender: Start 会重新发现入口。不要同时手动运行单文件版，�
 只有一个隐藏目标时，导出结果可以只有 `mod.ini` 中的一个 Render 块和 `handling=skip`，
 不需要 `.mesh`、`.mat` 或 PNG。对同源拆分物体混合显隐时，隐藏原件并仅装配所选的相机开启部件。
 
-## 物理骨骼作者工具（0.26.1）
+## 物理骨骼作者工具（0.26.2）
 
 AnimeStudio 正常导出的 `.eiem` 目录若含 `physics/components.json`，在包导入窗口勾选
 “导入物理骨骼与碰撞体”即可一起导入。插件会把原生物理实际需要、而渲染 Skeleton 未收录的
@@ -77,7 +77,7 @@ Mesh 容器等无关 Transform 当成骨骼。Typhoea 正常包实测一次导�
 6. 选中目标 Mesh 与新增作者物理组后点击**导出所选 mod**，共享 Rig 自动作为依赖写出，同 Rig 的每个
    Render 都引用同一 Physics。未选物理组时仍只增量导出 Mesh；带独立碰撞体的作者组与原生 v2 使用独立作者导出。
 
-旧 v1 无碰撞体 `Render.physics` 已在主模型、角色 UI 和 NPC 实机验证；0.26.1 新导出继续使用作者 v4。除
+旧 v1 无碰撞体 `Render.physics` 已在主模型、角色 UI 和 NPC 实机验证；0.26.2 新导出继续使用作者 v4。除
 `radius.value/useCurve/AnimationCurve` 外，v4 还保存从原生 `ClothSerializeData` 模板复制的完整数值、开关、枚举、
 `gravityDirection` 与九类常用曲线。DLL 已完成按元数据字段名构造、赋值和回读的宿主测试；v4 参数在游戏中的实际响应仍需单独验证。
 Blender 组合输出仍只开放无独立碰撞体的范围。
@@ -87,7 +87,7 @@ Blender 组合输出仍只开放无独立碰撞体的范围。
 
 旧开发包 `bin/EIEM_Blender-0.11.0-physics-authoring.zip` 仅包含旧 v1，不代表当前源码版本。
 
-## 源物理作者数据（0.26.1，离线）
+## 源物理作者数据（0.26.2，离线）
 
 通过“导入源物理”选择解包的 `components.json`，或者在 Mesh 包导入时勾选默认关闭的物理选项。
 源图、参数曲线、原始字节和共享碰撞引用保存在 `.blend`；使用独立导出保存 `.physics` 及骨架依赖。
@@ -119,6 +119,9 @@ MOVE 骨段的半角为 `limitAngle.value × curve(depth)`。这里的 depth 与
 `limitAngle.useCurve=true`，两者不能混为一个开关。锥体是静止基准姿态的作者预览，运行时当前动画基准仍会受
 `animationPoseRatio` 影响。
 
+新增作者组的角度锥直接使用 Rig 的 Blender 局部坐标，与节点半径球和绿色骨链重合；只有导入的原生 v2
+源图预览才执行 Unity→Blender 基变换。0.26.2 修正了作者锥体被重复转换后落到角色脚边的问题。
+
 每个物理 Group/Collider Empty 的 EIEM RNA 属性是唯一源数据，骨骼只保存身份与静止变换。选中 Empty 后在
 **对象属性 → EIEM 物理参数**中编辑，不需要在侧栏寻找另一份参数。九类常用曲线由下拉框选择，面板一次只显示
 一类参数的基础值、根端倍率、末端倍率和线性/平滑变化；“使用位置曲线”直接对应 `useCurve`。只有源曲线含
@@ -144,9 +147,9 @@ MOVE 骨段的半角为 `limitAngle.value × curve(depth)`。这里的 depth 与
 
 原生 v2 和独立碰撞体尚未由 DLL 实例化，不能进入组合 Mod；它们仍作为游戏原配置的导入、可视化、复制和独立
 作者保存来源。常规 Mesh 与无独立碰撞体的作者物理均按选择增量输出，不以 PFB 限定消费者。
-0.26.1 的七个运行文件已同步到开发目录。已运行的 Blender 会话需要执行
+0.26.2 的七个运行文件已同步到开发目录。已运行的 Blender 会话需要执行
 **Blender: Reload Addons** 才会载入新版。
-当前安装包为 `bin/EIEM_Blender-0.26.1-lightweight-physics-curves.zip`。
+当前安装包为 `bin/EIEM_Blender-0.26.2-author-angle-preview.zip`。
 旧 ZIP 和已经打开的 `.blend` 不会自行改写；旧场景可用上面的整理操作迁移物理集合。
 
 ## UV 接缝与导出顶点（0.8.2）

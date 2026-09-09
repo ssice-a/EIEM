@@ -1281,7 +1281,7 @@ def angle_cone_ring(apex, edge, angle, segments=20):
             for step in range(segments)]
 
 
-def make_angle_visual(owner, cones):
+def make_angle_visual(owner, cones, native_coordinates=True):
     if not cones:
         return None
     label = owner.name + " 角度限制锥"
@@ -1292,7 +1292,9 @@ def make_angle_visual(owner, cones):
             stride = max(1, len(ring_points) // 4)
             paths.extend(([tuple(apex), tuple(ring_points[index])], False)
                          for index in range(0, len(ring_points), stride))
-        visual = make_visual(owner, paths, COLORS["ANGLE"], label, .00065)
+        visual = make_visual(
+            owner, paths, COLORS["ANGLE"], label, .00065,
+            native_coordinates=native_coordinates)
     else:
         vertices, faces = [], []
         for apex, ring_points, angle, depth in cones:
@@ -1302,7 +1304,9 @@ def make_angle_visual(owner, cones):
                 ring_indices.append(len(vertices)); vertices.append(tuple(point))
             for index in range(len(ring_indices)):
                 faces.append((start, ring_indices[index], ring_indices[(index + 1) % len(ring_indices)]))
-        visual = make_mesh_visual(owner, vertices, faces, COLORS["ANGLE"], label, .22)
+        visual = make_mesh_visual(
+            owner, vertices, faces, COLORS["ANGLE"], label, .22,
+            native_coordinates=native_coordinates)
     if visual:
         visual["eiem_physics_preview"] = ANGLE_PREVIEW_MARKER
         visual["eiem_physics_angle_cones"] = len(cones)
