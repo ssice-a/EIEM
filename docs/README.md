@@ -1,6 +1,6 @@
 # EIEM 文档索引与当前状态
 
-核对日期：2026-09-09。范围：仓库工作区和本节明确记录的部署/实机结果；不表示正在运行的 Blender 已同步。
+核对日期：2026-09-11。范围：仓库工作区和本节明确记录的部署/实机结果；Blender 同步状态以本节记录为准。
 
 ## 当前状态
 
@@ -8,15 +8,19 @@
 |---|---|---|
 | Mesh / Material / Texture、条件、Lua UI、持久化 | v59 统一按 Mesh 身份匹配全部消费者；PFB 只保留资源关系；直接构造的 NPC Renderer 在 `RendererInfo._Init` 进入同一执行器 | 63 项检查及完整构建通过；v59 实机记录多个 Typhoea body/cloth 在该入口成功执行，用户确认 NPC 画面已替换 |
 | 共享骨架与新增节点 | Skeleton v1/v2 读取、实例节点创建和 Mesh bones 装配已实现；v70 夹具将 202 个 Typhoea `Finger0` 链权重改绑到一个新节点 | 文件、bindpose 与 C++ 读取通过；用户已在角色 UI 观察到左手拇指动作改变，验证新 Transform 经原生写回驱动替换 Mesh |
-| Blender 作者工具 | 源码版本 0.25.0；侧栏首层只保留当前组、新建、复制参数、粘贴参数、查看；带完整模板的作者组与原生组共用常用参数、角度限制、九条曲线、Empty 自定义属性及高级字段界面，并管理同 Rig 碰撞集合 | 真实 Typhoea 正常包一次导入 62 Mesh、1 共享 Rig、11 组、27 碰撞体；249 项参数及组使用的碰撞集合可复制到新增作者组；v4 保存参数，源碰撞体转为 DLL 配置仍待后续阶段 |
-| Physics 作者 v1/v3/v4 | v1/v3 兼容读取；v4 保存五项常用参数、节点半径曲线及按原生字段路径记录的完整参数模板，选中无独立碰撞体组可随同 Rig Mesh 增量导出 `Render.physics` | v1 创建/运动/退休已有实机验证；v4 的 249 项 Typhoea 参数往返、C++ 读取及元数据名称写入已完成 Blender/宿主验证，游戏内参数响应待验证 |
-| Physics 源作者 v2 | 正常解包输出源图、完整字段/曲线/原始字节、物理 Transform、共享引用、三种原生碰撞体外形、参数复制和 C++ 树读取 | AnimeStudio .NET 9 Release 与 Blender 5 正常整包导入通过；尚未在终末地运行时实例化 v2 或碰撞体 |
-| DLL 配置准备 | v65 为 v1 BoneCloth 写入 `clothType=1`、`connectionMode=0`、构造函数自带的根/IGNORE 列表和五个标量；Data2 使用组件构造实例 | v71 以 F10 完成 `blendWeight=1 → 0 → 1` 双向实机响应；其余参数语义、碰撞转换和 v2 实例化仍未完成 |
-| 原生物理研究 | v65 实机已完成最小 BoneCloth 的配置、`BuildAndRun`、异步 Team 构建和 Animator 接纳；v66 确认 MOVE 节点写回和场景卸载注销；v70 确认新增节点产生可见 Mesh 变形 | team 编号可复用；参数响应、碰撞体和 v2 源图实例化仍未验证 |
+| Blender 作者工具 | 源码版本 0.30.3；物理侧栏保留当前组、新建、复制参数、粘贴参数、查看；作者 v5 保留球体、异径胶囊、中心对齐和共享组引用；带作者物理骨权重的所选 Mesh 自动携带物理组依赖 | 后台 Blender 已验证未选 Group Empty 的带权重 Mesh 仍输出 Physics；当前 03:46 Typhoea 游戏包是在修复前导出，仍需重导 |
+| Physics 作者 v1/v3/v4/v5 | v1/v3/v4 兼容读取；v5 在完整参数模板上增加胶囊末端半径与中心对齐语义，球/胶囊可随 Rig Mesh 增量导出 `Render.physics` | v1 创建/运动/退休已有实机验证；v4 参数响应仅验证过 `blendWeight`；v74 已验证 v5 创建 5 个碰撞组件并装入组列表，实际碰撞响应仍未验证 |
+| Physics 源作者 v2 | 正常解包输出源图、完整字段/曲线/原始字节、物理 Transform、共享引用、三种原生碰撞体外形、参数复制和 C++ 树读取 | AnimeStudio .NET 9 Release 与 Blender 5 正常整包导入通过；源球/胶囊可转换到作者 v5；无限平面与整份 v2 图仍不由 DLL 实例化 |
+| DLL 配置准备 | v80 在既有参数写入、LOD 与蒙皮调度基础上，为纯 partner 列表变化增加差集更新，不再整 Mod 销毁/重建无关 Renderer | MSVC 宿主回归与完整 DLL 构建通过并已部署；按键后贴地是否消失仍待新进程实机验证，F10 仍是完整重建路径 |
+| 原生物理研究 | v65 实机已完成最小 BoneCloth 的配置、`BuildAndRun`、异步 Team 构建和 Animator 接纳；v66 确认 MOVE 节点写回和场景卸载注销；v70 确认新增节点产生可见 Mesh 变形 | team 编号可复用；v71 已验证 `blendWeight` 响应；作者 v5 碰撞体和 v2 源图实例化仍未验证 |
 | Physics 实例所有者调查 | v61 已按 Mesh 命中记录注册模型的 Animator/现有 Cloth，并在 NPC `_BuildBeyondCloth → StartNPC → ReleaseAvatar/OnRelease` 边界关联模型根、Animator 与 Avatar owner | v70 实机确认两个目标 NPC 创建 Physics；v71 F10 与自然卸载均观察到 NPC 最终 `retired` 和 Skeleton 自有节点退休 |
-| Physics 生产适配器 | v67～v69 已按同一 Mesh 规则为角色 UI 和 `BaseModelPart` 建立独立实例；v70 又将相同执行器接到精确 `NPCAvatar.StartNPC` owner | 主模型、角色 UI、NPC 均有四节点原生 Team；UI/NPC 可见生效，v71 `blendWeight` 双向热重载有效。碰撞体和 v2 仍未实证 |
+| Physics 生产适配器 | v67～v71 已按同一 Mesh 规则为主模型、角色 UI 和 NPC 建立独立实例；v72～v79 将作者碰撞体、参数、Skeleton 代际纳入相同实例所有权与退休收集 | 03:46 前日志确认 Team ready、12/12 MOVE 节点变化且 5 个碰撞体进入实例；03:46 后当前包已无 Physics，必须重导后再验收视觉强度 |
 
-当前按用户安排暂停碰撞体 DLL 实验，优先完善解包数据到 Blender 的配置、复制和增量导出流程。
+当前 03:46 生成的 Typhoea 包没有 `.physics`、`[Physics...]` 或 `physics=`；F10 日志已从
+`previous=1 current=0` 退休旧实例。因此当前画面不能用于判断额外物理强弱。修复前的同一进程旧包曾到达
+Team ready，18 个节点全命中且 12/12 MOVE 节点变化，证明链路曾实际运行。Blender 0.30.3 现按网格正权重
+推导作者 Physics 依赖，开发目录已同步；重载插件和重导包后再做视觉 A/B。DLL v80 已部署，普通按键只更新
+partner 差集；连续 F10 的完整重建仍需独立实机验收。
 v53 自动跟踪改动相关 13 项通过，完整构建和部署成功；游戏记录确认自动跟踪、关闭导出、原组件
 `Init → RemoveMonitoringProcess → StartRuntimeBuild` 及中途注销嵌套序列，详见[原生调查第 20 节](native-physics-investigation.md#20-2026-09-07运行时快照与-v53-自动跟踪)。
 v54 将五个 Animator binding InternalCall 纳入相同的自动测试跟踪，但实机因错误使用 CoreModule 查找
@@ -53,7 +57,7 @@ Mesh 命中实例的精确模型 owner/Animator。观察 DLL 已构建并部署�
 | Mod UI | [Lua UI](lua-ui.md) | 脚本 API、窗口和变量事务 |
 | 相机 | [反虚化契约](camera-fade.md) | CameraMono 原评估后清理 |
 | 物理目标 | [三端设计契约](physics-authoring-design.md) | 解包、Blender、DLL 的完整链路要求 |
-| 物理文件 | [Physics 作者 v1/v3/v4](physics-authoring-v1.md)、[源作者 v2](physics-authoring-v2.md) | 新增作者格式与原生源图格式、操作和限制 |
+| 物理文件 | [Physics 作者 v1/v3/v4/v5](physics-authoring-v1.md)、[源作者 v2](physics-authoring-v2.md) | 新增作者格式与原生源图格式、操作和限制 |
 | 物理证据 | [原生调查](native-physics-investigation.md) | 静态/宿主/实机证据与待确认项 |
 | 工具运行 | [资源浏览器](../tools/README.md)、[Blender 开发插件](../tools/Blender/README.md) | 启动、安装与操作 |
 

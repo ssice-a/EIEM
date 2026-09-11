@@ -28,6 +28,30 @@ class RuntimeHookContracts(unittest.TestCase):
         self.assertNotIn("TraceApplyLoadedModelRenderers", self.trace)
         self.assertNotIn("EiemResolveRenderRuleForAsset", self.trace)
 
+    def test_partner_renderers_use_inherited_bounds_and_real_lod_methods(self):
+        self.assertIn(
+            'FindMethodInHierarchy(g_skinnedMeshRendererClass, "get_localBounds", 0)',
+            self.init,
+        )
+        self.assertIn(
+            'FindMethodInHierarchy(g_skinnedMeshRendererClass, "set_localBounds", 1)',
+            self.init,
+        )
+        self.assertIn('FindMethod(g_lodGroupClass, "GetLODs", 1)', self.init)
+        self.assertIn('FindMethod(g_lodGroupClass, "SetLODs", 1)', self.init)
+        self.assertNotIn('FindMethod(g_lodGroupClass, "get_lods"', self.init)
+        self.assertIn("bool getPlatformLODs = false", self.trace)
+        self.assertIn("EiemCopySkinnedRendererState(sourceMeshOwner, partnerMeshOwner)", self.trace)
+        for property_name in (
+            "skinningRoot",
+            "quality",
+            "updateWhenOffscreen",
+            "forceMatrixRecalculationPerRender",
+            "skinnedMotionVectors",
+        ):
+            self.assertIn(f'"get_{property_name}"', self.init)
+            self.assertIn(f'"set_{property_name}"', self.init)
+
     def test_prefab_lifecycle_releases_instance_state(self):
         for method in ("Unload", "Clear", "Dispose"):
             self.assertIn("TracePrefabInstantiate" + method, self.trace)
@@ -307,6 +331,9 @@ class BlenderExportContracts(unittest.TestCase):
         cls.addon = (ROOT / "tools" / "Blender" / "eiem_blender_addon.py").read_text(
             encoding="utf-8"
         )
+        cls.controls = (ROOT / "tools" / "Blender" / "eiem_blender_controls.py").read_text(
+            encoding="utf-8"
+        )
         writer_path = (
             ROOT / "tools" / "AnimeStudio" / "AnimeStudio.GUI" /
             "EiemPackageWriter.cs"
@@ -318,7 +345,7 @@ class BlenderExportContracts(unittest.TestCase):
 
     def test_export_is_rooted_at_selected_eiem_meshes(self):
         self.assertIn("selected_objects", self.addon)
-        self.assertIn("No EIEM mesh objects selected", self.addon)
+        self.assertIn("No EIEM mesh objects selected", self.controls)
 
     def test_export_materials_and_textures_are_dependency_closure(self):
         self.assertIn("referenced_materials", self.addon)

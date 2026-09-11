@@ -25,6 +25,7 @@ $size=0,1
 [RenderMain]
 asset=Body
 shape.Inflate=$size
+shape_speed.Inflate=0.5
 )ini";
 int main() {
   EiemModProgram p; std::string error;
@@ -33,6 +34,9 @@ int main() {
   CHECK(EiemModParseStream(other,"b/mod.ini",p,&error));
   CHECK(p.states[0].uis.size()==1 && p.rules[0].shapeCount==1);
   CHECK(std::string(p.rules[0].shapeNames[0])=="Inflate");
+  CHECK(p.rules[0].shapeSpeedCount==1 &&
+        std::string(p.rules[0].shapeSpeedNames[0])=="Inflate" &&
+        p.rules[0].shapeSpeeds[0]==.5f);
   EiemPublishModState(p); s_eiemModGeneration=7;
   EiemModInputEvent slider{{},7,"a/mod.ini","UISize",{{"$size",.6}}};
   EiemModProgram next; std::vector<std::string> affected; bool shapesOnly=false;
@@ -57,6 +61,8 @@ int main() {
     "[RenderA]\nasset=A\nif false\nshape.X=$missing\nendif\n",
     "[RenderA]\nasset=A\nshape.=0\n",
     "[RenderA]\nasset=A\nshape.X=nan\n",
+    "[RenderA]\nasset=A\nshape.X=1\nshape_speed.X=0\n",
+    "[RenderA]\nasset=A\nshape.X=1\nshape_speed.=1\n",
     "[UIA]\npath=../out.lua\nkey=F8\n",
     "[UIA]\npath=C:/out.lua\nkey=F8\n",
     "[UIA]\npath=/out.lua\nkey=F8\n",
@@ -145,6 +151,20 @@ endif
   CHECK(!EiemApplyShapeWeights(&a,&m2,rule,sa,backend,error));
   a.fail=false;
   CHECK(EiemApplyShapeWeights(&a,&m2,empty,sa,backend,error));
+  EiemModRule animated{};
+  CHECK(EiemSetRenderField(animated,"shape.Inflate","1",error));
+  CHECK(EiemSetRenderField(animated,"shape_speed.Inflate",".5",error));
+  a.weights[0]=0;
+  CHECK(EiemApplyShapeWeights(&a,&m2,animated,sa,backend,error));
+  CHECK(a.weights[0]==0 && EiemShapeStateAnimating(sa));
+  CHECK(EiemApplyShapeWeights(&a,&m2,animated,sa,backend,error,.5f));
+  CHECK(a.weights[0]==25 && EiemShapeStateAnimating(sa));
+  a.fail=true;
+  CHECK(!EiemApplyShapeWeights(&a,&m2,animated,sa,backend,error,1.5f));
+  CHECK(a.weights[0]==25 && EiemShapeStateAnimating(sa));
+  a.fail=false;
+  CHECK(EiemApplyShapeWeights(&a,&m2,animated,sa,backend,error,1.5f));
+  CHECK(a.weights[0]==100 && !EiemShapeStateAnimating(sa));
   return 0;
 }
 '''

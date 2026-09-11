@@ -92,7 +92,7 @@ static bool InvokeChecked(void *m,void *p,void **args,void **out) {
  } else return false;
  return true;
 }
-struct EiemModRule { char modPath[256]="A/mod.ini",skeleton[192]="SkeletonTest"; };
+struct EiemModRule { char modPath[256]="A/mod.ini",skeleton[192]="SkeletonTest"; bool hasPhysics=false; };
 struct EiemModResource { char modPath[256]{},section[192]{}; };
 static std::string disk;
 static uint64_t stamp=1;
@@ -116,7 +116,11 @@ int main(int argc,char **argv) {
  assert(!EiemReadSkeleton(truncated,untouched,error) && untouched.nodes.size()==5); // atomic parse
 
  Node scene{"Scene"},actor{"Actor",&scene},rig{"Rig",&actor},pelvis{"Pelvis",&rig},unused{"Unused",&rig};
- scene.children={&actor}; actor.children={&rig}; rig.children={&pelvis,&unused};
+ Node partnerA{"EIEM Partner Render",&rig},partnerB{"EIEM Partner Render",&rig};
+ scene.children={&actor}; actor.children={&rig};
+ // These generated Partner objects intentionally share a name. They are
+ // outside the Skeleton resource and must not make source resolution fail.
+ rig.children={&pelvis,&unused,&partnerA,&partnerB};
  Array palette; palette.count=1; palette.items[0]=&pelvis; Renderer renderer{&palette},otherPart{&palette};
  EiemModRule rule; char message[256]{}; std::shared_ptr<EiemSkeletonInstance> a,b,c;
  assert(EiemAcquireSkeleton(rule,&renderer,a,message,sizeof(message)) && a->ready && creates==1);
@@ -144,7 +148,13 @@ int main(int argc,char **argv) {
  assert(((Node *)c->nodes[4].Target())->parent==&pelvis2);
  c.reset(); EiemCollectSkeletonInstances(); assert(destroys==2);
 
- ++stamp; assert(!EiemAcquireSkeleton(rule,&renderer,c,message,sizeof(message)) && !c); --stamp;
+ // A changed file starts a private replacement generation immediately. The
+ // previous generation stays alive for its existing Renderer/native users,
+ // but must reject new consumers instead of making the first F10 replay fail.
+ ++stamp;
+ assert(EiemAcquireSkeleton(rule,&renderer,c,message,sizeof(message)) && c &&
+        c!=a && !a->ready && c->ready && c->nodes[4].Target()!=extra);
+ --stamp;
  a.reset(); EiemCollectSkeletonInstances(); assert(extra->alive && destroys==2); // second consumer owns it
  b.reset(); unityThread=false; EiemCollectSkeletonInstances(); assert(extra->alive);
  unityThread=true; failDestroy=true; EiemCollectSkeletonInstances();

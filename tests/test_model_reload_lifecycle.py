@@ -18,7 +18,10 @@ static std::vector<EiemModInputEvent> s_eiemPendingInputs;
 static void EiemProbeCheckpoint(const char *,bool=false) {}
 static void EiemReportCameraFade() {}
 static void EiemReapplyShapeControls(const std::vector<std::string> &) {}
+static void EiemRefreshShapeTransitionTimer() {}
 static void EiemDestroyPartnerObjects(const std::vector<std::string> *) {}
+static void EiemDestroyUndesiredPartnerObjects(
+    const std::vector<std::string> *, const EiemModProgram &) {}
 static void EiemCollectSkeletonInstances() {}
 static void EiemRestoreRenderOverrides(const std::vector<std::string> *) { appliedModels.clear(); }
 '''

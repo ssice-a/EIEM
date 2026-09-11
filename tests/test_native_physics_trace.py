@@ -376,6 +376,7 @@ class NativePhysicsTrace(unittest.TestCase):
         probe = (ROOT / 'src/eiem_native_physics_probe.h').read_text(encoding='utf-8')
         trace = (ROOT / 'src/eiem_native_physics_trace.h').read_text(encoding='utf-8')
         trojan = (ROOT / 'src/trojan.h').read_text(encoding='utf-8')
+        init = (ROOT / 'src/init.h').read_text(encoding='utf-8')
         for text in ('原生物理诊断', '开始原生物理跟踪', '停止并导出跟踪'):
             self.assertNotIn(text, gui)
         for name in ('WM_EIEM_PHYSICS_PROBE', 'WM_EIEM_PHYSICS_TRACE_START',
@@ -389,5 +390,12 @@ class NativePhysicsTrace(unittest.TestCase):
         self.assertIn('plugin\\\\physics_diagnostics', diagnostic)
         self.assertIn('EiemStartPhysicsAutoTraceOnUnityThread();', trojan)
         self.assertIn('EiemFinishPhysicsAutoTraceOnUnityThread();', trojan)
-        self.assertIn('EiemSampleChestMotionAfterLateUpdate();', trojan)
-        self.assertNotIn('CHEST-MOTION', gui + scene)
+        # The former post-FinalIK chest probe hooked every SolverManager
+        # LateUpdate and synchronously traversed Transforms/wrote TSV data on
+        # the game thread.  In-game bisection proved that hook alone caused
+        # visible frame jumps.  Runtime physics diagnostics must not depend on
+        # this unrelated high-frequency animation hook.
+        self.assertNotIn('Hooked_SolverManager_LateUpdate', init + trojan)
+        self.assertNotIn('SolverManager.LateUpdate', init + trojan)
+        self.assertNotIn('EiemSampleChestMotionAfterLateUpdate', trojan)
+        self.assertNotIn('CHEST-MOTION', gui + scene + diagnostic)

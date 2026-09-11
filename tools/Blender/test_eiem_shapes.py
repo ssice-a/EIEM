@@ -92,10 +92,10 @@ assert ("shape.Inflate=" + variable) in ini.split("[RenderSourcePart0]")[1]
 copy = obj.copy()
 copy.name = "Shared"
 bpy.context.scene.collection.objects.link(copy)
-controls, bindings = addon.plan_shape_controls([obj, copy])
+controls, bindings, hotkeys = addon.plan_shape_controls([obj, copy])
 assert len(controls) == 1 and bindings[obj] == bindings[copy]
 copy.data = obj.data.copy()
-controls, bindings = addon.plan_shape_controls([obj, copy])
+controls, bindings, hotkeys = addon.plan_shape_controls([obj, copy])
 assert len(controls) == 2 and bindings[obj] != bindings[copy]
 copy.data.eiem_shape_controls[0].shape = "Missing"
 try:

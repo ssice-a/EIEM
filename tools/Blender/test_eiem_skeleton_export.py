@@ -71,7 +71,7 @@ try:
 except ValueError as ex: assert '同时选择共享骨架' in str(ex),str(ex)
 assert not (output/'missing-rig').exists()
 package=output/'package'; stats=addon.export_package(package,[first,second],[rig])
-assert stats['meshes']==2 and stats['skeletons']==1,stats
+assert stats['meshes']==2 and stats['skeletons']==1 and stats['physics']==0,stats
 ini=configparser.ConfigParser(interpolation=None); ini.read(package/'mod.ini',encoding='utf-8')
 assert ini['RenderFirst']['skeleton']==ini['RenderSecond']['skeleton']=='SkeletonShared'
 skel_file=package/ini['SkeletonShared']['path']; original_skeleton=skel_file.read_bytes()
@@ -84,6 +84,17 @@ assert list(payload['nodes'][:3])==nodes or all(close(matrix(a),matrix(b)) for a
 physics=addon.physics_authoring
 group=physics.create_group(rig,[rig.data.bones['Extra'],rig.data.bones['Tip']],'新增尾链')
 group.eiem_physics.gravity=6.25
+
+# A Mesh that has positive weights on an authored Physics group's bones owns
+# that dependency even when the helper Empty was not manually selected. This
+# prevents a normal Mesh re-export from silently deleting its working Physics.
+inferred=output/'inferred-physics'
+stats=addon.export_package(inferred,[first],[rig])
+assert stats['physics']==1,stats
+inferred_ini=configparser.ConfigParser(interpolation=None)
+inferred_ini.read(inferred/'mod.ini',encoding='utf-8')
+assert 'physics' in inferred_ini['RenderFirst']
+
 bpy.ops.object.select_all(action='DESELECT')
 for selected in (first,second,group): selected.select_set(True)
 bpy.context.view_layer.objects.active=first
@@ -101,16 +112,19 @@ physics_skeleton=(physics_file.parent/document['skeleton']).resolve()
 render_skeleton=(combined/ini[ini['RenderFirst']['skeleton']]['path']).resolve()
 assert physics_skeleton==render_skeleton and physics_skeleton.is_file()
 
-# Authoring colliders remain editable, but cannot leak into the current runtime
-# package before the DLL collider adapter exists.
+# Authoring colliders are emitted into the combined package. The runtime uses
+# one component per author collider and shares that component across group refs.
 collider=physics.create_collider(group,rig.data.bones['Rig'],'CAPSULE','测试碰撞体')
-rejected=output/'rejected-collider'; rejected.mkdir(exist_ok=True)
-(rejected/'mod.ini').write_text('existing author work',encoding='utf-8')
-try:
-    addon.export_package(rejected,[first],[rig],[group])
-    raise AssertionError('runtime collider export succeeded')
-except ValueError as ex: assert '碰撞体' in str(ex),str(ex)
-assert (rejected/'mod.ini').read_text(encoding='utf-8')=='existing author work'
+with_collider=output/'with-collider'
+stats=addon.export_package(with_collider,[first],[rig],[group])
+assert stats['physics']==1,stats
+collider_ini=configparser.ConfigParser(interpolation=None)
+collider_ini.read(with_collider/'mod.ini',encoding='utf-8')
+collider_section=collider_ini['RenderFirst']['physics']
+collider_document=physics.document.read(with_collider/collider_ini[collider_section]['path'])
+assert len(collider_document['colliders'])==1
+assert collider_document['colliders'][0]['shape']=='CAPSULE'
+assert collider_document['groups'][0]['colliders']==[collider_document['colliders'][0]['id']]
 group.eiem_physics.colliders.clear()
 visual=collider.eiem_physics.visual
 if visual: bpy.data.objects.remove(visual,do_unlink=True)
@@ -121,7 +135,10 @@ bpy.ops.wm.save_as_mainfile(filepath=str(output/'author.blend'))
 bpy.ops.wm.open_mainfile(filepath=str(output/'author.blend'))
 rig=bpy.data.objects['SkeletonShared']; first,second=[bpy.data.objects[n] for n in obj_names]
 addon.export_package(package,[first,second],[rig])
-assert skel_file.read_bytes()==original_skeleton
+reloaded_ini=configparser.ConfigParser(interpolation=None)
+reloaded_ini.read(package/'mod.ini',encoding='utf-8')
+reloaded_skeleton=package/reloaded_ini[reloaded_ini['RenderFirst']['skeleton']]['path']
+assert reloaded_skeleton.read_bytes()==original_skeleton
 assert (package/'meshes/MeshFirst.mesh').read_bytes()==new_file.read_bytes()
 
 # Two author rigs may carry a copied section name. Keep files and Render
@@ -151,6 +168,6 @@ try:
     addon.export_package(package,[first],[rig])
     raise AssertionError('source rest edit was silently ignored')
 except ValueError as ex: assert '源骨骼绑定姿态已改变' in str(ex),str(ex)
-assert skel_file.read_bytes()==original_skeleton
+assert reloaded_skeleton.read_bytes()==original_skeleton
 addon.unregister()
 print('EIEM_SKELETON_EXPORT_OK')

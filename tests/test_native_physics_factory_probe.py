@@ -11,6 +11,9 @@ class NativePhysicsRuntimeContracts(unittest.TestCase):
         cls.runtime = (ROOT / "src" / "eiem_native_physics_runtime.h").read_text(
             encoding="utf-8"
         )
+        cls.skeleton_runtime = (
+            ROOT / "src" / "eiem_skeleton_runtime.h"
+        ).read_text(encoding="utf-8")
         cls.trace = (ROOT / "src" / "il2cpp_trace.h").read_text(encoding="utf-8")
         cls.mods = (ROOT / "src" / "eiem_mods.h").read_text(encoding="utf-8")
         cls.diagnostic = (
@@ -68,7 +71,7 @@ class NativePhysicsRuntimeContracts(unittest.TestCase):
         self.assertIn("animator != instance->animator", poll)
         self.assertIn("instance->ready = true", poll)
 
-    def test_retirement_destroys_only_the_owned_host_and_waits_for_native_death(self):
+    def test_retirement_destroys_owned_host_and_collider_objects_then_waits_for_native_death(self):
         self.assertNotIn("DisposeInternal", self.runtime)
         self.assertNotIn("DestroyClothBindings", self.runtime)
         self.assertIn("g_object_destroy", self.runtime)
@@ -80,6 +83,8 @@ class NativePhysicsRuntimeContracts(unittest.TestCase):
         ]
         self.assertIn("hostRef.Status()", dead)
         self.assertIn("componentRef.Status()", dead)
+        self.assertIn("collider.gameObjectRef.Status()", dead)
+        self.assertIn("collider.transformRef.Status()", dead)
         release = self.runtime[
             self.runtime.index("static void EiemReleaseModelPhysics") :
             self.runtime.index("static void EiemPhysicsRuntimePollReady")
@@ -87,6 +92,37 @@ class NativePhysicsRuntimeContracts(unittest.TestCase):
         self.assertIn("s_eiemPhysicsPendingReleases.push_back", release)
         self.assertIn("EiemPhysicsRuntimeDrainReleases", self.runtime)
         self.assertIn("EiemPhysicsRuntimeReleaseOnUnityThread", self.runtime)
+
+    def test_author_colliders_are_shared_by_group_and_bound_before_build(self):
+        build = self.runtime[
+            self.runtime.index("static bool EiemPhysicsRuntimeBuild") :
+            self.runtime.index("static void EiemReconcileModelPhysics")
+        ]
+        for earlier, later in (
+            ("EiemPhysicsRuntimeCreateColliders", "EiemPhysicsRuntimeBindColliders"),
+            ("EiemPhysicsRuntimeBindColliders", "EiemPhysicsRuntimeActivateColliders"),
+            ("EiemPhysicsRuntimeActivateColliders", "buildAndRun"),
+        ):
+            self.assertLess(build.index(earlier), build.rindex(later))
+        self.assertIn("source.span + source.radius + endRadius", self.runtime)
+        self.assertIn("void *parentArgs[] = {binding->second, &keepWorld}", self.runtime)
+        self.assertIn("components.emplace(collider.id, collider.component)", self.runtime)
+        self.assertIn("instance.asset->physics.groups[groupIndex].colliders", self.runtime)
+
+    def test_missing_ui_collider_owner_is_an_explicit_physics_anchor(self):
+        self.assertIn("virtualSkeletonPaths", self.runtime)
+        self.assertIn("&virtualSkeletonPaths", self.runtime)
+        self.assertIn("!node.source || !source[i]", self.skeleton_runtime)
+        self.assertIn("virtualPaths && virtualPaths->count(node.path)", self.skeleton_runtime)
+
+    def test_inactive_model_retires_native_physics(self):
+        reconcile = self.runtime[
+            self.runtime.index("static void EiemReconcileModelPhysics") :
+            self.runtime.index("static void EiemPhysicsRuntimeReleaseOnUnityThread")
+        ]
+        self.assertIn("if (!active)", reconcile)
+        self.assertIn("EiemPhysicsRuntimeBeginRetire(instance, true, stage)", reconcile)
+        self.assertNotIn("(void)active", reconcile)
 
     def test_loader_publishes_physics_mods_for_the_runtime_adapter(self):
         self.assertNotIn("if (requestsPhysics)", self.mods)
@@ -99,6 +135,28 @@ class NativePhysicsRuntimeContracts(unittest.TestCase):
         self.assertIn("paletteHits", self.runtime)
         self.assertIn("palette=%zu selected=%zu paletteHits=%zu boundaryIgnores=%zu", self.runtime)
         self.assertIn("boundaryIgnores += group.boundaryIgnores.size()", self.runtime)
+
+    def test_runtime_observes_visible_palette_and_move_node_writeback(self):
+        self.assertIn("EiemPhysicsRuntimeLogPartnerBinding", self.runtime)
+        self.assertIn("visible-binding generation=", self.runtime)
+        self.assertIn("partner.skeleton == instance.skeleton", self.runtime)
+        self.assertIn("group.authorNodes[index].role != 1", self.runtime)
+        self.assertIn("EiemPhysicsRuntimeObserveMotion", self.runtime)
+        self.assertIn("maxLocalPositionDeltaSq", self.runtime)
+        self.assertIn("instance.motionSamples >= 16", self.runtime)
+
+    def test_deterministic_failure_is_not_rebuilt_every_periodic_poll(self):
+        self.assertIn("struct EiemPhysicsRuntimeFailure", self.runtime)
+        self.assertIn("EiemPhysicsRuntimeFailureMatches", self.runtime)
+        self.assertIn("EiemPhysicsRuntimeRememberFailure", self.runtime)
+        reconcile = self.runtime[
+            self.runtime.index("static void EiemReconcileModelPhysics") :
+            self.runtime.index("static void EiemPhysicsRuntimeReleaseOnUnityThread")
+        ]
+        self.assertIn("if (!failed && !EiemPhysicsRuntimeBuild", reconcile)
+        self.assertIn("&&\n        !retryable", reconcile)
+        self.assertIn("retry-suppressed", reconcile)
+        self.assertIn("failure.asset == intent.asset", reconcile)
 
     def test_shutdown_only_finishes_the_trace(self):
         finish = self.diagnostic[

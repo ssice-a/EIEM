@@ -67,6 +67,10 @@ static bool EiemSetSharedMesh(void *,void *mesh,const char *,void *) {
 static bool EiemBuildMeshResource(const EiemModRule &,void **out,char *,size_t,void *,std::shared_ptr<const EiemSkinIdentity> *) { *out=&tokens[2]; return true; }
 static bool EiemResolveMeshBones(const EiemSkinIdentity &,void *,void **,char *,size_t) { return true; }
 static bool EiemPreserveSourceSkinning(void *,void *,char *,size_t) { return true; }
+struct EiemBounds { float value[6]{}; };
+static void *g_smr_get_localBounds=nullptr;
+static bool EiemReadBounds(void *,void *,EiemBounds *) { return false; }
+static void EiemSetReplacementDrawBounds(void *,const char *,void *,const EiemBounds *) {}
 static bool EiemPrepareRendererShapeBinding(void *,void *,const char *,char *,size_t) {return true;}
 static bool EiemInitializeRendererShapeBinding(void *,const char *,char *,size_t) {return true;}
 static void EiemRetireShapeBinding(const std::shared_ptr<EiemShapeRuntimeBinding> &) {}

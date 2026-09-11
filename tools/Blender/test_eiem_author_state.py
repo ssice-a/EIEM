@@ -28,7 +28,7 @@ added = obj.shape_key_add(name="Inflate")
 added.data[0].co.z = .1
 added.value = .3
 mesh["eiem_blend_shapes_json"] = json.dumps([{"name":"Blink","hash":1,"frames":[{"key":"Blink","source_name":"Blink","weight":100}]}])
-declarations, bindings = addon.plan_shape_controls([obj])
+declarations, bindings, hotkeys = addon.plan_shape_controls([obj])
 assert len(declarations)==1 and "shape.Inflate=" in bindings[obj][0]
 assert not any("Blink" in x for x in bindings[obj])
 variable = declarations[0][0]
@@ -42,7 +42,7 @@ extra = obj.shape_key_add(name="Sleeve")
 assert addon.plan_shape_controls([obj])[0][0][0] == variable
 copy = obj.copy();copy.data = mesh.copy();copy.name="Independent"
 bpy.context.scene.collection.objects.link(copy)
-decl, bind = addon.plan_shape_controls([copy, obj])
+decl, bind, hotkeys = addon.plan_shape_controls([copy, obj])
 assert bind[obj][0] == "shape.Inflate="+variable and bind[copy][0] != bind[obj][0]
 saved = output/"author.blend"
 bpy.ops.wm.save_as_mainfile(filepath=str(saved))

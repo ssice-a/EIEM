@@ -23,7 +23,7 @@ class PhysicsOwnerProbeContracts(unittest.TestCase):
         self.assertIn('#include "eiem_npc_model_owner.h"', self.trace)
         self.assertNotIn("ImGui::", self.probe)
         self.assertNotIn("GetAsyncKeyState", self.probe)
-        self.assertIn("resource-runtime-v70-physics-npc-owner", self.init)
+        self.assertIn("resource-runtime-v80-selective-partner-controls", self.init)
 
     def test_probe_hooks_exact_npc_owner_boundaries(self):
         for method in ("StartNPC", "_BuildBeyondCloth", "ReleaseAvatar", "OnRelease"):

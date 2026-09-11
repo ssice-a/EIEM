@@ -86,7 +86,7 @@ int main(int argc, char **argv) {
   if (scenario == "empty_rules_observed") {
     CHECK(s_eiemModelInstances.empty());
     CHECK(!EiemRegisterAndApplyModelInstance(EiemModelOwnerKind::BaseModelPart, (void *)1, (void *)2, nullptr, 0, "empty-rules"));
-    CHECK(observedModels == 1 && s_eiemModelInstances.size() == 1);
+    CHECK(observedModels == 0 && s_eiemModelInstances.size() == 1);
   } else if (scenario == "global") {
     EiemGlobalConfig config;
     std::istringstream valid("\xEF\xBB\xBF[Hotkeys]\r\nreload=Ctrl+F8\r\ngui=INSERT\r\n");
@@ -131,6 +131,24 @@ int main(int argc, char **argv) {
     CHECK(next.states[0].variables.at("$a") == 0 && !next.rules[0].handling[0]);
     EiemPublishModState(program); // F10 replacement resets to parsed defaults
     CHECK(s_eiemModProgram.states[0].variables.at("$a") == 0);
+  } else if (scenario == "partner_links_only") {
+    EiemModProgram program;
+    std::istringstream input(
+      "[Constants]\n$a=0\n"
+      "[KeyA]\nkey=F6\ntype=cycle\n$a=0,1\n"
+      "[MeshNew]\npath=meshes/new.mesh\n"
+      "[RenderMain]\nasset=Body\nif $a == 1\npartner.0=RenderPart\nendif\n"
+      "[RenderPart]\nmesh=MeshNew\n");
+    CHECK(EiemModParseStream(input, "a/mod.ini", program, &error));
+    EiemPublishModState(program); s_eiemModGeneration = 9;
+    EiemModProgram next; std::vector<std::string> affected;
+    bool shapesOnly = false, partnerLinksOnly = false;
+    CHECK(EiemPrepareInputUpdate({{{VK_F6,0},9}}, &next, &affected,
+                                 &shapesOnly, &partnerLinksOnly));
+    CHECK(!shapesOnly);
+    CHECK(partnerLinksOnly);
+    CHECK(next.rules.size() == program.rules.size());
+    CHECK(next.rules[0].partnerCount == 1);
   } else if (scenario == "default_off_instances") {
     EiemModProgram program;
     std::istringstream input("[RenderMain]\nasset=Body\n");
@@ -183,8 +201,9 @@ class ModControlsTests(unittest.TestCase):
     def test_global_config_default_edit_and_invalid_transaction(self): self.run_case("global")
     def test_only_owned_slots_restore_and_only_owned_tail_removed(self): self.run_case("slots")
     def test_press_order_stale_generation_and_publish_after_restore(self): self.run_case("events")
+    def test_partner_visibility_is_a_lightweight_link_update(self): self.run_case("partner_links_only")
     def test_actual_runtime_registers_default_off_multi_instances(self): self.run_case("default_off_instances")
-    def test_empty_program_still_registers_observed_instances(self): self.run_case("empty_rules_observed")
+    def test_empty_program_still_registers_instances_without_diagnostic_probe(self): self.run_case("empty_rules_observed")
 
 
 if __name__ == "__main__": unittest.main()

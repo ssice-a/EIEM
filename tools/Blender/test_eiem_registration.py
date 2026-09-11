@@ -38,6 +38,7 @@ for cycle in range(3):
     assert module is not None, "Add-on registration failed"
     assert module is not previous_module, "Reload kept a stale package module"
     assert Path(module.eiem_blender_addon.__file__).resolve() == directory / "eiem_blender_addon.py"
+    assert Path(module.eiem_blender_addon.controls.__file__).resolve() == directory / "eiem_blender_controls.py"
     assert metadata.bl_info == module.bl_info == module.eiem_blender_addon.bl_info
     assert bpy.ops.eiem.import_package.get_rna_type() is not None
     assert bpy.ops.eiem.export_package.get_rna_type() is not None
@@ -48,6 +49,9 @@ for cycle in range(3):
     assert bpy.ops.eiem.physics_parameters.get_rna_type() is not None
     assert bpy.ops.eiem.physics_curve_key.get_rna_type() is not None
     assert bpy.ops.eiem.switch_key_record.get_rna_type() is not None
+    assert bpy.ops.eiem.switch_state_drag.get_rna_type() is not None
+    assert bpy.ops.eiem.shape_key_record.get_rna_type() is not None
+    assert hasattr(bpy.types, "EIEM_UL_switch_states")
     assert hasattr(bpy.types, "OBJECT_PT_eiem_physics")
     assert hasattr(bpy.types, "EIEM_MT_physics_create")
     assert not hasattr(bpy.types, "EIEM_MT_physics_copy")
@@ -74,6 +78,7 @@ for cycle in range(3):
     assert bpy.context.scene.eiem_physics_group == probe
     bpy.data.objects.remove(probe, do_unlink=True)
     assert hasattr(bpy.types.Scene, "eiem_switch_active")
+    assert hasattr(bpy.types.Collection, "eiem_switch_state_index")
     assert len(callbacks(bpy.types.TOPBAR_MT_file_import)) == 1
     assert len(callbacks(bpy.types.TOPBAR_MT_file_export)) == 1
     assert tuple(bpy.data.objects) == scene_objects
@@ -82,6 +87,7 @@ for cycle in range(3):
     assert not callbacks(bpy.types.TOPBAR_MT_file_import)
     assert not callbacks(bpy.types.TOPBAR_MT_file_export)
     assert not hasattr(bpy.types.Scene, "eiem_switch_active")
+    assert not hasattr(bpy.types.Collection, "eiem_switch_state_index")
     assert not hasattr(bpy.types.Object, "eiem_physics")
     assert not hasattr(bpy.types.Scene, "eiem_physics_group")
     assert not hasattr(bpy.types.Scene, "eiem_physics_visibility")

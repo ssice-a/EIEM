@@ -62,6 +62,24 @@ def corner_indices(payload):
     return result
 
 
+# Blender may re-encode an imported split normal by a tiny amount after an
+# update/save. That is still the same author normal and must not trigger a full
+# current-normal export. A visible direction edit must trigger it.
+normal_probe = make_object('NormalEncodingProbe')
+source_normals = [(0, 0, 1)] * len(normal_probe.data.vertices)
+addon.set_point_attribute(normal_probe.data, 'EIEM_SourceNormal', 'FLOAT_VECTOR',
+                          source_normals, 'vector')
+assert addon.normal_state_matches_source(normal_probe.data, source_normals)
+for polygon in normal_probe.data.polygons:
+    polygon.use_smooth = True
+normal_probe.data.normals_split_custom_set([(0, .01, .99995)] * len(normal_probe.data.loops))
+normal_probe.data.update()
+assert addon.normal_state_matches_source(normal_probe.data, source_normals)
+normal_probe.data.normals_split_custom_set([(0, .1, .994987)] * len(normal_probe.data.loops))
+normal_probe.data.update()
+assert not addon.normal_state_matches_source(normal_probe.data, source_normals)
+
+
 # Missing tangents must produce actual UV0-derived data, not an empty array.
 obj = make_object('NewGeometry')
 result = export(obj, 'new')
@@ -116,6 +134,18 @@ for corner, index in enumerate(corner_indices(mixed_result)):
     else:
         new_index = indices[corner]
         assert bits(actual) == bits(result['tangents'][new_index*4:new_index*4+4])
+
+# A non-zero imported tangent can still be unusable after a join or a custom
+# normal edit. It must be regenerated against the normal that is serialized.
+parallel = make_object('ParallelTangent')
+addon.set_point_attribute(parallel.data, 'EIEM_Tangent', 'FLOAT_VECTOR',
+                          [(0,0,1)] * 6, 'vector')
+addon.set_point_attribute(parallel.data, 'EIEM_TangentSign', 'FLOAT', [1] * 6, 'value')
+parallel_result = export(parallel, 'parallel')
+for index in corner_indices(parallel_result):
+    normal = Vector(parallel_result['normals'][index*3:index*3+3])
+    tangent = Vector(parallel_result['tangents'][index*4:index*4+3])
+    assert abs(normal.dot(tangent)) < 1e-5 and abs(tangent.length-1) < 1e-5
 
 # Generated data uses the final native Blender custom normals, not a backup.
 custom = make_object('CustomNormals')

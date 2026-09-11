@@ -16,6 +16,10 @@ EXTRA = r'''
 static uintptr_t s_eiemActivePrefabInstance=0;
 static bool programEnabled=true,unityThread=true;
 static bool EiemOnUnityThread() { return unityThread; }
+static bool EiemIsSkinnedRenderer(void *) { return true; }
+static bool EiemApplyStandaloneRenderRulesToRenderer(
+    void *,void *,void *,const char *,void *,const char *) { return false; }
+static void EiemPhysicsOwnerProbeObserveRenderer(void *,const char *) {}
 static EiemModRule activeRule{};
 static bool EiemFindRenderRuleBySection(const char *,const char *,EiemModRule *out) {
   if(!programEnabled) return false; *out=activeRule; return true;

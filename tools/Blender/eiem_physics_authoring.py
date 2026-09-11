@@ -1168,9 +1168,16 @@ def rebuild_collider(self, context):
         geometry = {"shape": "SPHERE", "center": (0, 0, 0), "radius": radius}
     else:
         span = self.span
+        end_radius = self.end_radius if self.separate_radii else radius
+        length = span + radius + end_radius
+        if self.aligned_on_center:
+            start_distance = max(length / 2 - radius, 0)
+            end_distance = max(length / 2 - end_radius, 0)
+        else:
+            start_distance, end_distance = 0, span
         geometry = {"shape": "CAPSULE", "center": (0, 0, 0),
-                    "start": (0, span / 2, 0), "end": (0, -span / 2, 0),
-                    "startRadius": radius, "endRadius": radius}
+                    "start": (0, start_distance, 0), "end": (0, -end_distance, 0),
+                    "startRadius": radius, "endRadius": end_radius}
     self.visual = native.make_collider_visual(obj, geometry, obj.name + " " +
         ("球体" if self.shape == "SPHERE" else "胶囊"))
 
@@ -1206,8 +1213,8 @@ def author_document(groups, skeleton_path):
             c = ref.object
             document.require(c and c.eiem_physics.rig == rig,
                              "缺失碰撞体或引用了其他 Rig；请移除失效引用")
-            document.require(c.eiem_physics.kind == "COLLIDER",
-                             "当前组引用了游戏源碰撞体；关联已保存在 .blend，DLL 转换完成前不能导出作者 Physics")
+            document.require(c.eiem_physics.kind in ("COLLIDER", "NATIVE_COLLIDER"),
+                             "当前组引用了不支持的碰撞体对象")
             cid = c.eiem_physics.identity
             document.require(cid not in collider_objects or collider_objects[cid] == c,
                              "复制碰撞体后身份冲突，请通过添加碰撞体创建")
@@ -1242,12 +1249,42 @@ def author_document(groups, skeleton_path):
                              for channel in ("location", "rotation", "scale") for axis in "xyz") and
                          max(abs(constraint.inverse_matrix[r][c]-inverse[r][c]) for r in range(4) for c in range(4)) < 1e-5,
                          "碰撞体约束或骨架姿态已变化，请刷新骨骼绑定")
-        basis = API["unity_transform_matrix_to_blender_basis"]()
-        matrix = basis.inverted() @ obj.matrix_basis @ basis
-        position, rotation, scale = matrix.decompose()
+        if p.kind == "NATIVE_COLLIDER":
+            document.require(max(abs(obj.matrix_basis[r][c] - (1 if r == c else 0))
+                                 for r in range(4) for c in range(4)) < 1e-5,
+                             "游戏源碰撞体对象变换已改变；请编辑其碰撞参数")
+            source_record = native.current_record(obj)
+            geometry = native.source.collider_geometry(source_record)
+            document.require(geometry["shape"] != "PLANE",
+                             "作者 Physics v5 暂不支持无限平面碰撞体")
+            if geometry["shape"] == "SPHERE":
+                position = Vector(geometry["center"])
+                rotation = Quaternion()
+                radius = end_radius = float(geometry["radius"])
+                span, aligned = 0.0, True
+            else:
+                direction = Vector(geometry["start"]) - Vector(geometry["end"])
+                span = float(geometry["segmentLength"])
+                rotation = direction.normalized().to_track_quat("Y", "Z") if span > 1e-12 else Quaternion()
+                position = Vector(geometry["center"])
+                radius = float(geometry["startRadius"])
+                end_radius = float(geometry["endRadius"])
+                aligned = bool(geometry["alignedOnCenter"])
+            shape = geometry["shape"]
+        else:
+            basis = API["unity_transform_matrix_to_blender_basis"]()
+            matrix = basis.inverted() @ obj.matrix_basis @ basis
+            position, rotation, scale = matrix.decompose()
+            shape = p.shape
+            radius = p.radius
+            end_radius = p.end_radius if p.separate_radii and shape == "CAPSULE" else radius
+            span = p.span if shape == "CAPSULE" else 0.0
+            aligned = bool(p.aligned_on_center)
         colliders.append({"id": cid, "name": p.label, "bone": bone_path(p.bone_id),
-            "shape": p.shape, "position": list(position), "rotation": [rotation.x, rotation.y, rotation.z, rotation.w],
-            "radius": p.radius, "span": p.span if p.shape == "CAPSULE" else 0.0})
+            "shape": shape, "position": list(position),
+            "rotation": [rotation.x, rotation.y, rotation.z, rotation.w],
+            "radius": radius, "endRadius": end_radius, "span": span,
+            "alignedOnCenter": aligned})
     identity = rig.get("eiem_physics_resource_id")
     if not identity:
         identity = rig["eiem_physics_resource_id"] = uuid.uuid4().hex
@@ -1348,7 +1385,10 @@ def import_physics(filename, rig=None):
         for c in payload["colliders"]:
             obj = create_collider(made_groups[0], by_path[c["bone"]], c["shape"], c["name"])
             p = obj.eiem_physics
-            p.identity, p.radius, p.span = c["id"], c["radius"], c["span"]
+            p.identity, p.radius, p.end_radius, p.span = (
+                c["id"], c["radius"], c.get("endRadius", c["radius"]), c["span"])
+            p.separate_radii = abs(p.radius - p.end_radius) > 1e-7
+            p.aligned_on_center = bool(c.get("alignedOnCenter", True))
             q = c["rotation"]
             native_matrix = Matrix.LocRotScale(Vector(c["position"]), Quaternion((q[3],q[0],q[1],q[2])), Vector((1,1,1)))
             obj.matrix_basis = API["unity_transform_matrix_to_blender"](native_matrix)
@@ -1417,6 +1457,9 @@ class EIEM_PG_physics(bpy.types.PropertyGroup):
     visual: PointerProperty(type=bpy.types.Object)
     shape: EnumProperty(name="类型", items=[("SPHERE", "球体", ""), ("CAPSULE", "胶囊", "")], default="CAPSULE", update=rebuild_collider)
     radius: FloatProperty(name="半径", default=0.03, min=0.000001, update=rebuild_collider)
+    separate_radii: bpy.props.BoolProperty(name="区分两端半径", default=False, update=rebuild_collider)
+    end_radius: FloatProperty(name="末端半径", default=0.03, min=0.000001, update=rebuild_collider)
+    aligned_on_center: bpy.props.BoolProperty(name="以中心对齐", default=True, update=rebuild_collider)
     span: FloatProperty(name="两端球心间距", default=0.1, min=0, update=rebuild_collider)
     gravity: FloatProperty(name="重力", default=9.8, min=0, update=author_shared_parameter_updated)
     stablizationTimeAfterReset: FloatProperty(
@@ -1809,7 +1852,7 @@ class EIEM_PT_physics_object(bpy.types.Panel):
             native.draw(layout, context, obj)
             return
         layout.prop(data, "label", text="名称")
-        layout.label(text=("作者 v4 物理组" if data.kind == "GROUP" else "作者碰撞体") +
+        layout.label(text=("作者 v5 物理组" if data.kind == "GROUP" else "作者碰撞体") +
                      " · 数据保存在此 Empty", icon="OUTLINER_OB_EMPTY")
         if data.kind == "GROUP":
             if native.is_parameter_group(obj):
@@ -1845,7 +1888,7 @@ class EIEM_PT_physics_object(bpy.types.Panel):
             candidate.prop(data, "collider_candidate", text="")
             candidate.operator("eiem.physics_edit", text="加入", icon="ADD").action = "LINK_CANDIDATE"
             if any(ref.object and ref.object.eiem_physics.kind == "NATIVE_COLLIDER" for ref in data.colliders):
-                collider_box.label(text="源碰撞体关联已保存在 .blend；DLL 转换留待碰撞阶段", icon="INFO")
+                collider_box.label(text="源碰撞体将在导出时转换为可移植碰撞体", icon="INFO")
             layout.prop(data, "show_structure", icon="TRIA_DOWN" if data.show_structure else "TRIA_RIGHT",
                         emboss=False)
             if data.show_structure:
@@ -1861,6 +1904,10 @@ class EIEM_PT_physics_object(bpy.types.Panel):
             layout.prop(data, "shape", text="形状")
             layout.prop(data, "radius")
             if data.shape == "CAPSULE":
+                layout.prop(data, "separate_radii")
+                if data.separate_radii:
+                    layout.prop(data, "end_radius")
+                layout.prop(data, "aligned_on_center")
                 layout.prop(data, "span")
             layout.prop(obj, "location", text="骨骼局部位移")
             layout.prop(obj, "rotation_quaternion", text="局部旋转")

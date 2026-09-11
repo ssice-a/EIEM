@@ -522,16 +522,15 @@ native.poll_curve_previews()
 author_damping_key = next(field for field in created_group.eiem_native_physics.fields
                           if field.label == "serializeData.damping.curve.m_Curve.0.value")
 assert abs(author_damping_key.value - damping_point.location.y) < 1e-6
-# Source collider associations are now preserved for editing, selection and
-# visibility. Conversion to author collider records remains a separate DLL task.
-try:
-    addon.physics_authoring.author_document([created_group], "test.skeleton")
-    raise AssertionError("source collider reference exported as author collider")
-except ValueError as error:
-    assert "游戏源碰撞体" in str(error)
+# Source collider associations convert to portable author collider records.
+source_collider_payload = addon.physics_authoring.author_document([created_group], "test.skeleton")
+assert len(source_collider_payload["colliders"]) == len(copied_colliders) == 1
+assert source_collider_payload["colliders"][0]["shape"] == "CAPSULE"
+assert source_collider_payload["colliders"][0]["endRadius"] > 0
+assert source_collider_payload["groups"][0]["colliders"] == [source_collider_payload["colliders"][0]["id"]]
 created_group.eiem_physics.colliders.clear()
 author_payload = addon.physics_authoring.author_document([created_group], "test.skeleton")
-assert author_payload["version"] == addon.physics_authoring.document.VERSION == 4
+assert author_payload["version"] == addon.physics_authoring.document.VERSION == 5
 assert len(author_payload["groups"][0]["nativeParameters"]) == 249
 assert next(item["value"] for item in author_payload["groups"][0]["nativeParameters"]
             if item["path"] == author_damping_path) == edited_damping

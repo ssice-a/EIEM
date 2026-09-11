@@ -2404,3 +2404,570 @@ Blender 5.0.1 验证通过插件发现与三轮注册/卸载、最小作者链�
 `bin/EIEM_Blender-0.26.2-author-angle-preview.zip` 为 110156 字节，SHA256：
 `5674FD8698140C5819AACB744A820CF0F16051290908AD7FBFC18A5C40F429F4`。本节没有修改或部署 DLL，
 也没有写入游戏目录。
+
+### 20.47 Blender 0.30.0 / 作者 v5 / DLL v72：球体与胶囊进入运行时配置
+
+本轮把此前只保存在 Blender 场景中的作者碰撞集合接到组合导出和 DLL 运行时。作者格式升级为 v5，在原有
+`radius` 与两端球心距离 `span` 之外增加 `endRadius` 和 `alignedOnCenter`；v1/v3/v4 的原字节布局
+继续兼容读取。球体要求两端半径相等且 `span=0`。胶囊调用原生
+`SetSize(startRadius, endRadius, span + startRadius + endRadius)`；关闭中心对齐时首端球心位于碰撞物体
+原点，开启时沿原生居中公式分配两端距离。无法由该公式无损表达的极端异径居中胶囊在导出时拒绝。
+
+从 `components.json` 导入的 `BeyondBoneSphereCollider` 和 `BeyondBoneCapsuleCollider` 可在作者组
+碰撞集合中直接引用。导出器读取 Empty 当前字段，将原生 `center`、方向轴、反向标志、两端半径、外部长和
+中心对齐方式转换成骨骼局部 v5 记录。当前 Typhoea 场景的 `maid.002 Skirt Physics` 引用左右大腿、骨盆及
+左右前臂共五个胶囊；它们均可表达为 v5。原生无限平面仍无作者记录，引用它时组合导出明确失败。
+
+DLL v72 通过元数据名称解析 `ColliderComponent`、`BeyondBoneSphereCollider`、
+`BeyondBoneCapsuleCollider`、两种 `SetSize`、胶囊方向/反向/异径/中心对齐字段，以及
+`ClothSerializeData.colliderCollisionConstraint.colliderList`。每个作者碰撞体只创建一个绑定到声明骨骼
+的子 GameObject 和原生 Collider 组件；同一组件引用按作者 UUID 加入所有使用它的组列表。碰撞体在
+`BuildAndRun` 前激活，并与物理 host 一同进入实例退休和 Unity 原生对象死亡收集。字段、列表数量和成员引用
+在启动前回读核对。
+
+针对性验证共 45 个测试方法通过：作者 v1/v3/v4/v5 Python/C++ 往返 9 项、DLL 配置 13 项、运行时源码契约
+10 项、Blender 作者/组合 Skeleton/真实 Typhoea 源图 3 项、原生源图/胶囊几何 9 项、插件三轮注册重载
+1 项。完整 `build.bat` 已生成本地 `bin/eiem.dll` 和两个代理 DLL。本轮尚未把 v72 写入游戏目录，也没有
+游戏日志证明组件实际创建、胶囊位置/方向、碰撞响应或卸载结果；这些是导出实际裙摆包后的下一轮验收项。
+
+BlenderMCP 已把当前 `G:\zmd\typhoeus\18324_autosave.blend` 热重载到 0.30.0。导出前发现 body Mesh
+仍留有 v70 可见骨骼夹具的 `EIEM_PhysicsTip` 顶点组，而对应测试骨骼已被删除；恰好 202 个原
+`Bip001_L_Finger02` 权重仍在该孤立组。现已逐项把相同权重恢复到 `Bip001_L_Finger02` 并删除孤立组，
+未修改裙摆权重。随后用当前选择的 12 个 Mesh、共享 Rig 和 `maid.002 Skirt Physics` 成功写出暂存包
+`E:\EIEM_Workspace\export-validation\typhoea-collider-v72-preflight`：45 个文件、124988405 字节，
+12 个 Render 引用同一 v5 Physics；该文档含 1 组、18 节点、5 个胶囊和 5 个组引用。生产 C++ Mod/Physics
+读取器以 `validate` 模式接受整份 `mod.ini`。当前 `.blend` 保持未保存状态。
+
+用户退出游戏后，已于 2026-09-10 17:24 将本地 v72 写入
+`D:\Hypergryph Launcher\games\Endfield Game\plugin\eiem.dll`；安装文件大小 6322176 字节，SHA256 为
+`37E401A7BBB0C15EAA32D581454736F6F9C09C76069B5B629D930BF0848BCB36`，内含
+`[PHYSICS-RUNTIME-v72]`。旧 v70 备份位于
+`E:\EIEM_Workspace\plugin-releases\before-v72-colliders-20260910-172406\eiem.dll`。此时尚未重新启动游戏，
+部署事实不构成碰撞体创建或响应验收。
+
+### 20.48 v72 首轮作者 v5 失败、身体切线定位与 v73 收敛诊断
+
+用户启动 v72 与实际裙摆包后观察到转动视角时画面像幻灯片跳变、人物光照异常，并且裙摆物理和碰撞都没有
+效果。`eiem_log.txt` 给出了同一个原因链：同一模型和同一
+`PhysicsSkeletonchr_0034_typhoea_postmodel_0` 共进行 400 次配置尝试，每次都在
+`Native Physics gravityDirection readback mismatch` 处拒绝。日志没有该实例的 `binding`、
+`build-started` 或 `ready`，因此这次没有执行 `BuildAndRun`，也没有建立可产生响应的碰撞组。生产适配器每
+250ms 重新协调一次，而失败实例未进入活动实例表，遂反复分配 Skeleton/config 草稿；这与视角转动时的周期性
+卡顿有直接时序证据，不能解释成物理已经运行但参数太弱。
+
+v73 对同一模型、同一 `EiemPhysicsAsset` 和同一运行时 key 的确定性失败只记录一次；模型死亡、资源对象因 F10
+重载更换或意图消失后记录会清除。Renderer/Animator 尚未就绪仍标记为 pending 并允许重试。重力方向检查同时
+拆成字段缺失/歧义、声明类型变化、写入失败、读取失败和带 expected/actual 三分量的数值不匹配；数值比较不再
+把等值浮点的位模式差异当成失败。该改动消除已观察到的 400 次无意义重建，但是否越过当前重力方向失败并启动
+模拟，仍必须由下一次游戏日志确认。
+
+身体光照另行按二进制 Mesh 数据检查。当前安装包的
+`MeshS_actor_typhoea_body_01_lod0_0.mesh` 为 14724 顶点，旧身体为 14664 顶点；新增 60 个是导出时为面角
+UV/切线差异生成的接缝副本。按坐标对齐后，当前文件的每条法线都能在旧身体中找到完全一致的源法线；大腿附近
+同位置不同法线的 19 组硬接缝在旧文件中已经存在，未发现导出器重算法线的证据。异常出现在切线：50 个顶点的
+`abs(dot(normal,tangent)) > 0.1`，最大为 0.9934247，且主要集中在高度约 0.815～0.817 的大腿内侧区域，切线
+统一退化为 `(-1,0,0)`。这会破坏法线贴图使用的切线空间。
+
+Blender 0.30.1 因此把“切线非零”扩展为“切线有限、符号有效且与最终序列化法线正交”。连接网格、接缝拆分或
+自定义法线变化后仍非零但不匹配的旧切线，只对受影响角点从 UV0 重建，并针对最终导出法线正交化；原法线和其余
+有效源切线不变。新增平行切线回归在 Blender 5.0.1 通过，原有缺失/混合/镜像 UV/自定义法线/无 UV 回归也通过。
+
+当前 Blender 场景中的身体网格还有一个与此相关的误判：记录的法线 CRC 为 `462b7e5c`，当前 CRC 为
+`283209df`，但逐角点方向比较的最小点积为 `0.9999996349`，最大夹角仅约 `0.049` 度，未发现点积低于
+`0.99999` 的角点。这是 Blender 对自定义分裂法线的微小重新编码，不是可见的法线修改。0.30.1 现在以 CRC
+作为快速路径，并以真实方向一致性作为回退；这种微小编码变化会继续序列化精确源法线，明显编辑或连接后新增的零
+占位法线仍会导出当前法线。热重载后的当前身体临时导出为 14724 顶点，所有顶点均满足
+`abs(dot(normal,tangent)) <= 0.02`，因此大腿内侧的 50 个退化切线已在离线导出中消失。该场景尚未保存，正式
+Mod 也尚未用 0.30.1 重新导出，游戏内光照仍需以重新导出的包验证。
+
+### 20.49 Blender 0.30.2 贴图名称与原生依赖收敛
+
+实际 Typhoea 场景暴露出贴图段名被误用为文件名的问题。外部 `body.png` 先被内部资源段统一加前缀为
+`TextureBody`，再次导入后又可能形成 `TextureTextureBody`；旧导出器随后生成
+`textures/TextureTextureBody.png`。0.30.2 将 INI 资源段身份与磁盘文件名分开：资源段只在缺少 `Texture`
+前缀时补一次，写入 `textures/` 的文件始终保留用户所选文件的原始 stem，例如 `body.png` 仍导出为
+`body.png`。两个不同内容的已修改贴图若使用同一文件名会明确报错，不再静默改名。
+
+多 package 导入还会为同一原生贴图生成仅用于 Blender 内部去重的尾号。例如当前场景的原生
+`T_actor_common_cloth_04_RS_4523718382697154697.png` 有两个不同磁盘路径和两个段名，其中第二个为
+`TextureT_actor_common_cloth_04_RS_45237183826971546972`；两份文件大小均为 8225 字节且 SHA-256 同为
+`B085075B3685826BF83FBD6343C152767F86F195540C160F4850594DC5260BB2`。0.30.2 先按原文件名归一段名，
+必要时再比较未编辑图片的实际字节；与材质导入基线内容一致的贴图继续由 `source` 游戏材质继承，不生成
+Texture 段或文件。脏图片和内容不同的替换图片仍作为显式覆盖导出。
+
+Blender 5.0.1 增量导出回归使用真实 Typhoea 包验证：`body.png` 输出文件名保持不变，材质覆盖引用
+`TextureBody`，人为从第二个 package 复制的未修改原生贴图没有进入输出；统计为 1 Mesh、1 Material、
+1 Texture。0.30.2 热重载后对当前场景进行只读规划：身体只输出 `body.png/body_NM.png`；两套女仆材质分别
+只输出各自的 diffuse/normal/P 与共用 `white.png`；`RS`、`RD`、原生 emission 和 vertex-noise 均继承源材质。
+插件注册与资源管线另外 37 项测试通过。
+
+DLL 的配置与运行时相关测试 24 项通过，完整 `build.bat` 成功。游戏退出后已部署 v73 到
+`D:\Hypergryph Launcher\games\Endfield Game\plugin\eiem.dll`，大小 6328832 字节，SHA256 为
+`2A016E7065FCE10F063A87A420B22FF602FB67E4067F3EF5EEF7E2FC5BD9D8BB`，包含
+`[PHYSICS-RUNTIME-v73]`；旧 DLL 备份目录为
+`E:\EIEM_Workspace\plugin-releases\before-v73-gravity-tangent-20260910`。源文件与安装文件哈希一致。
+
+### 20.50 Blender 0.30.3 重导出与 DLL v74 实机前修正
+
+v73 首次新进程日志把 `gravityDirection` 的真实声明类型报告为
+`Unity.Mathematics.float3`，因此作者 v5 仍在配置阶段被拒绝，没有出现该实例的 `build-started` 或 `ready`。
+v74 接受 `UnityEngine.Vector3` 与实际 `Unity.Mathematics.float3` 两种三浮点字段名，但在写入前仍通过元数据
+检查值类型大小必须为 12 字节、对齐为 4 字节，写入后再逐分量回读。测试另用 16 字节假布局确认不会越界猜写。
+这一修改只消除已经由日志证明的类型名不兼容；实际创建、裙摆运动和碰撞响应仍由下一次游戏运行确认。
+
+转动视角时人物突变另有独立的裁剪条件。当前替换身体为 14724 顶点并覆盖完整角色高度，而命中的原身体分片
+范围明显更小；旧运行时给替换后的 `SkinnedMeshRenderer` 保留原 `localBounds`。v74 在替换前读取原
+`localBounds`，在 Mesh 构建完成后读取新 Mesh 的 `bounds`，将二者联合后写回；伙伴 Renderer 使用相同规则。
+这避免新增几何落在原包围盒外，但是否完全消除用户观察到的画面跳变仍需实机转动视角验收。此前用于定位资源
+路径和残留引用的临时 residue 探针已从生产 `il2cpp_trace.h` 调用链移除，普通资源跟踪预算关闭，避免继续输出
+每帧级诊断日志。
+
+Blender 0.30.3 修正三项成品链路问题。第一，INI 导入器忽略 `if/elif/else/endif` 控制行，只读取 Mesh、
+Material、Texture、Skeleton 和 Physics 资源，因此带按键切换的导出包可以重新导入而不恢复切换作者状态。
+第二，同一游戏 Texture 在多个 package 中的短序号或资源哈希后缀会归入同一原生贴图家族；未改的 `RD/RS`、
+原生 emission、noise 等继续由源材质继承，不再被错误复制。第三，实际覆盖的 `_BumpMap` 输出
+`linear=true`，避免自定义法线 PNG 以 sRGB 采样。含两个 Skeleton 的成品包会按每个 Render 的
+`physics=` 与 `skeleton=` 关系为 Physics 选择 Rig，不再因包内骨架数量大于一而拒绝导入。
+
+当前 Blender 场景已热重载到 0.30.3，导入和导出菜单各保留一个回调。当前选择按显式
+`maid.002 Skirt Physics` 组重新导出到
+`D:\Hypergryph Launcher\games\Endfield Game\plugin\mods\typhoeus`，统计为 12 Mesh、2 Skeleton、
+1 Physics、4 Material、10 Texture。Texture 目录只包含 `body/body_NM`、两套 maid 的 diffuse/normal/P、
+`siwa` 和共用 `white`；没有原生 `T_actor_*` 或 `T_pipe_*` 文件，三张自定义法线均为 `linear=true`。
+后台 Blender 以 `include_physics=True` 反向导入成品，得到 12 Mesh 和 1 个绑定
+`Skeletonchr_0034_typhoea_postmodel_0` 的 `maid.002 Skirt Physics` 组。正式身体 Mesh 的法线/切线最大
+`abs(dot)` 为 `2.00855806e-07`，14724 个顶点中没有超过 0.02 的值。
+
+97 项 MSVC 针对性测试通过，完整 `build.bat` 成功。v74 已写入
+`D:\Hypergryph Launcher\games\Endfield Game\plugin\eiem.dll`，本地与安装文件 SHA256 均为
+`A511F2ECB9171C13530D47608C7525376D3687040E9DA73405E7DD66134B20B5`；旧 v73 备份位于
+`E:\EIEM_Workspace\plugin-releases\before-v74-float3-bounds-20260910\eiem.dll`。本节尚未启动游戏，
+不能据此认定 v74 已创建物理组件、完成 `BuildAndRun`、产生碰撞响应或解决画面跳变。
+
+### 20.51 v74 实机结果与 DLL v75 包围盒、LOD、可见写回诊断
+
+用户运行 v74 后确认转动视角时人物仍会突然切换，裙摆物理也没有可见效果。新进程日志确认
+`resource-runtime-v74-float3-bounds` 已加载；`Unity.Mathematics.float3` 修正生效，作者物理通过配置，创建
+5 个碰撞组件并执行 `BuildAndRun`，随后进入 `running` 的 team 37。该实例直到游戏退出时才进入 retire。
+因此 v74 已验证组件创建、碰撞列表装配、Team 启动和 Animator 身份接纳，但没有验证 MOVE 节点运动、
+可见裙子蒙皮响应或实际碰撞响应。
+
+同一日志也证明 v74 的包围盒修正根本没有执行：`SkinnedMeshRenderer` 初始化行中的
+`localBounds=0/0`。`get_localBounds/set_localBounds` 声明在父类 `UnityEngine.Renderer`，旧代码却只查
+`SkinnedMeshRenderer` 自身。伙伴 LOD 接口也为 `0/0`；Unity 暴露的是方法 `GetLODs/SetLODs`，旧代码查找
+了不存在的属性访问器 `get_lods/set_lods`。这两处都是后来新增伙伴 Renderer 路径的确定错误，会使替换
+包围盒保持错误，并使伙伴脱离源 Renderer 的 LOD 层级；不再把画面突变归因于高模面数。
+
+v75 将 `localBounds` 改为沿类继承层查找，并使用真实的 `LODGroup.GetLODs/SetLODs`。物理侧新增一次性、
+低频自动观测：Team ready 后统计所有共享同一 Skeleton 实例的伙伴 Renderer 骨骼数组对 18 个物理节点的
+命中数，并每 500 ms 采样 12 个 MOVE 节点的局部位置与旋转，最多 16 次，只在第 4 次和第 16 次写汇总。
+这会把“原生模拟没有写 MOVE Transform”与“Transform 已动但可见 Mesh 没绑定”分开。该观测不接入 Dump
+页面，不创建第二套组件，也不参与资源配置。
+
+静态契约 60 项通过；完整 MSVC 环境运行 234 项测试，222 项通过、12 项按环境跳过、0 失败；完整
+`build.bat` 成功。游戏退出后已部署 v75 到
+`D:\Hypergryph Launcher\games\Endfield Game\plugin\eiem.dll`，本地与安装文件 SHA256 均为
+`97A68C4B442FBE6AB885926A0E79844E8E60DD56B7BCAB65E2D757D7CAEEDA92`。旧 v74 备份位于
+`E:\EIEM_Workspace\plugin-releases\before-v75-bounds-lod-motion-20260911\eiem.dll`。部署本身不证明
+画面突变已经消失，也不证明裙摆或碰撞已有可见响应；需要下一次游戏进程检查 v75 的非空 bounds/LOD
+接口、伙伴 LOD 加入记录、`visible-binding` 和 `motion` 汇总。
+
+### 20.52 v75 实机写回结果与 DLL v76 伙伴蒙皮、LOD 修正
+
+用户运行 v75 后确认两个现象均未消失：转动视角时人物仍会像幻灯片一样突变，裙摆物理仍无可见效果。
+该问题不再按高模渲染负载分析。新进程日志显示 `localBounds` 读写接口已经非空，说明 v75 的继承层查找修正生效；
+但 `LODGroup GetLODs/SetLODs` 仍为 `0/非零`，所以伙伴 LOD 维护没有执行。
+
+同一日志把物理问题进一步收敛。目标实例进入 running Team；8 个共享同一 Skeleton 的伙伴 Renderer 共含 998 个
+骨骼表项，对作者声明的 18 个物理节点达到 18 个唯一命中。连续 16 次采样中，12 个 MOVE 节点均发生局部位移和旋转；
+最大局部位置差平方约 `0.00115446211`，最大旋转差平方约 `0.225109577`。因此原生模拟已经驱动 Transform，
+且可见伙伴引用这些 Transform；“没有可见裙摆响应”位于后续伙伴蒙皮矩阵提交或游戏渲染注册链路，不能再解释为物理没有运行。
+
+离线读取当前启用的 `MeshS_actor_typhoea_cloth_01_lod0_2_5.mesh` 还确认：7295 个顶点全部至少有一个新增
+裙摆物理骨骼的正权重，18 根 `maid_skirt_01..06_{a,b,c}_jnt` 均被实际使用；当前 `state.ini` 中裙子开关为 0，
+对应 Part4 处于启用分支。这排除了“活动裙片没有权重”这一解释。
+
+随后直接读取本游戏 IL2CPP v29 元数据，确认 `UnityEngine.LODGroup.GetLODs` 实际声明为
+`GetLODs(bool getPlatformLODs)`，而 `SetLODs` 为一参数。v75 按 Unity 常见的零参数公开 API 查找，因此得到空指针；
+这不是接口整体被裁剪。v76 改为按一参数解析并传入 `false` 读取作者 LOD 数组。伙伴 SkinnedMeshRenderer 另从源
+Renderer 复制 `skinningRoot`、`quality`、`updateWhenOffscreen`、`forceMatrixRecalculationPerRender` 和
+`skinnedMotionVectors`，并输出一次源/伙伴成对值，核对新增组件是否取得相同的蒙皮空间与更新调度。
+
+针对性静态契约 60 项通过；完整 MSVC 环境运行 234 项测试，222 项通过、12 项按环境跳过、0 失败；完整
+`build.bat` 成功。当前包只有 LOD0 资源和规则，所以即使伙伴正确进入 LOD0，切换到游戏原生 LOD1/2 时仍可能出现
+模型形态切换；这属于 LOD 覆盖范围问题，与模型面数导致的帧率下降无关。v76 的首次实机需要分别核对
+`LODGroup get/set lods`、`Added partner Renderer`、`MOD-PARTNER-SKIN-v76`，再观察近距离转动视角和裙摆运动。
+
+确认游戏目录下没有运行中的进程后，已将 v76 写入
+`D:\Hypergryph Launcher\games\Endfield Game\plugin\eiem.dll`。本地与安装文件大小均为 6288896 字节，
+SHA256 均为 `C811ED6E2E6E5DEDD19ECFC453D38B8644C3D260D79B38BA2DD1C3AE416C4DC2`；v75 备份位于
+`E:\EIEM_Workspace\plugin-releases\before-v76-partner-skin-lod-20260911-005225\eiem.dll`。部署只为下一轮观测提供构建，
+尚未证明画面突变或裙摆可见写回已经修复。
+
+### 20.53 v76 实机结果、提交版差异与原 Renderer A/B
+
+用户运行 v76 后再次确认：Mesh 能显示且基础蒙皮正常，但转动视角时仍有幻灯片式突变，裙摆物理没有可见效果。
+本轮日志中 `LODGroup.GetLODs/SetLODs` 均已解析，仍没有任何 `Added partner Renderer` 记录；这说明目标角色没有沿
+标准 Unity `LODGroup` 管理该源 Renderer，v76 的标准 LOD 插入没有改变伙伴归属。8 个伙伴的
+`quality/updateWhenOffscreen/forceMatrixRecalculationPerRender/skinnedMotionVectors/skinningRoot` 均与源 Renderer
+一致。物理 Team 同时保持 running，12 个 MOVE 节点全部变化，最大局部位置差平方为 `0.00895480532`、最大旋转差
+平方为 `0.183481708`。因此本轮仍把问题定位在伙伴 Renderer 的游戏专用注册/蒙皮提交，而不是高模负载、静态蒙皮
+绑定或原生求解器没有运行。
+
+当前工作树与最后提交 `4558509`（DLL v70）的 Renderer 代码差异主要是 replacement bounds 合并、伙伴
+SkinnedMeshRenderer 状态复制和标准 LOD API 修正；其中后两项的实机读回已经证明没有解决症状。更关键的数据差异是：
+v70 的可见实测把单个 Mesh 原位写回游戏已有 SkinnedMeshRenderer，而当前 Mod 对 cloth 01/02 使用
+`handling=skip`，再创建多个 partner Renderer。旧 v70 备份中的 cloth 规则没有 partner；幻灯片式突变第一次记录在
+采用拆分衣物包的 v72 实测。因而“原位替换”和“新增伙伴”是当前最有区分度的变量。
+
+游戏进程退出后，已备份当前 `mod.ini/state.ini` 到
+`E:\EIEM_Workspace\plugin-releases\before-v77-inplace-render-ab-20260911-011336`，并只改写安装 Mod 的两个 cloth
+入口：cloth 01 直接把当前裙片 `MeshS_actor_typhoea_cloth_01_lod0_2_5` 写入原 Renderer，cloth 02 直接写入
+`MeshS_actor_typhoea_cloth_02_lod0_3`；不再从这两个入口创建 partner。DLL、Mesh、Skeleton、Physics 和材质文件均未
+改动。该版本会暂时只显示这两个衣物片段，切换键也不控制其余衣片；用途是一次性核对原 Renderer 路径能否同时消除
+视角突变并显示新增裙摆骨的物理写回。在实机结果出来前，这仍是 A/B 诊断，不能记作已确认根因或正式修复。
+
+用户完成上述原 Renderer A/B 后，画面突变仍存在；裙摆因穿模无法可靠判断是否产生物理响应。对应日志确认没有创建
+partner，cloth 01 已在游戏原 SkinnedMeshRenderer 上绑定 138 槽骨骼表，原位 Mesh 写入成功。原生 Team 仍为
+running，12 个 MOVE 节点全部变化，最大局部位置差平方为 `0.00915865973`，最大旋转差平方为 `0.195221469`。
+因此“partner 是突变的唯一原因”已被否定。该轮 `visible-binding` 为零只因诊断函数仅统计 partner，不能据此断言原位
+cloth 没有引用物理节点；后续诊断必须同时覆盖受控原 Renderer。
+
+下一轮保持同一三张 Mesh、Skeleton、材质和原位 Renderer 配置，只移除所有 Render 的 `physics=`，以隔离 Physics
+运行时是否影响画面。修改前的原位配置已备份到
+`E:\EIEM_Workspace\plugin-releases\before-v77-physics-off-ab-20260911-011953`。安装 `mod.ini` 的 SHA256 为
+`72228E21BDE778CD1E52BD7FC8D4709136C5642E9B57B29C03F2EFD0A96669F6`。该 A/B 尚未运行，不能提前写成
+Physics 已排除或已经确认是根因。
+
+用户完成 Physics-off A/B 后，转动视角时仍然发生相同突变。日志确认该进程没有出现任何
+`PHYSICS-RUNTIME` 或 `PHYSICS-PLAN`，也没有创建 partner Renderer；body、cloth 01 和 cloth 02 仍通过游戏原
+SkinnedMeshRenderer 原位替换。因此 Physics 运行时和 partner Renderer 均已被排除为画面突变的必要条件。这一轮
+刻意关闭了 Physics，不能用于判断裙摆运动或碰撞是否可见。
+
+下一轮继续保持上述 `mod.ini`、Mesh、Skeleton、材质和原位 Renderer 不变，只将安装 DLL 从 v76 切换到旧的
+`resource-runtime-v70-physics-npc-owner`，用于直接对比最后提交版与当前 Renderer 实现。当前 v76 已备份到
+`E:\EIEM_Workspace\plugin-releases\before-v70-render-ab-20260911-012715\eiem-v76.dll`；安装的 v70 来自
+`E:\EIEM_Workspace\plugin-releases\before-v72-colliders-20260910-172406\eiem.dll`，大小 6266880 字节，SHA256 为
+`4F1679649F535C51329DF4469645347622A544BC83CCDB148B3A3E9A4AB199DC`。`mod.ini` SHA256 仍为
+`72228E21BDE778CD1E52BD7FC8D4709136C5642E9B57B29C03F2EFD0A96669F6`，活动 `physics=` 数量为 0。若 v70 仍
+突变，范围将收敛到当前导出的 Mesh／Skeleton 或游戏自定义 LOD；若 v70 恢复平滑，再逐项检查 v70 到 v76 的
+Renderer 变更。本节只记录已部署的诊断变量，尚无该轮实机结论。
+
+v70 首次运行没有形成预期的“旧 Renderer + 当前 Mod”对照。启动日志在解析
+`plugin\mods\typhoeus\mod.ini:16` 时报告 `Invalid/duplicate key chord (file skipped)`：v70 尚不支持当前导出器使用的
+`NUMPAD6` 等小键盘名称，当前 `shape_speed.*` 也属于 v70 之后的语法。Typhoeus 整份文件因此被跳过，日志只加载了
+其他配置中的 1 条 Render 规则。用户注释与恢复 Typhoeus 配置后看到的都仍是游戏原模型，F10 也无法重新应用一份
+解析失败的 Mod；这不是当前 Mesh 已由 v70 成功加载后的结果。
+
+值得单独记录的是：在 Typhoeus 配置被完整跳过、屏幕显示游戏原模型时，用户仍观察到相同的画面突变。此时当前
+Mesh、Skeleton、Physics 与伙伴 Renderer 均未参与，但 v70 DLL 的全局 Hook 和 `disable_camera_fade=1` 仍在运行。
+为区分 EIEM 全局运行时与游戏自身表现，游戏退出后已把
+`D:\Hypergryph Launcher\games\Endfield Game\plugin\eiem.dll` 改名为
+`eiem.dll.disabled-v70-ab-20260911-013327`；文件 SHA256 仍为
+`4F1679649F535C51329DF4469645347622A544BC83CCDB148B3A3E9A4AB199DC`，当前目录不存在可加载的 `eiem.dll`。下一轮
+只核对完全不加载 EIEM 时转动视角是否仍突变。若恢复平滑，根因在 EIEM 的全局 Hook／配置；若仍突变，当前 Mod
+链路即可排除，应转查游戏原生自定义 LOD、动画或显示设置。本段尚未记录无 DLL 实机结果。
+
+无 EIEM DLL 对照中，用户确认游戏原模型转动视角正常，没有突变。因而症状来自 EIEM DLL 的全局运行路径；当前
+导出 Mesh、Skeleton、Physics、材质和 Mod Render 规则都不是该症状出现的必要条件。下一项单变量为全局
+`plugin\eiem.ini` 的 `disable_camera_fade`。v70 日志此前显示它为 1；对应 Hook 会在每次
+`CameraMono._ProcessDitherByPitch` 返回后调用 `ForceClearDither`，即使全部 Mod 均解析失败也仍持续运行。
+
+游戏退出后已恢复同一个 v70 DLL，同时只把 `disable_camera_fade=true` 改为 `false`。Typhoeus INI 保持原样，仍会因
+v70 不支持小键盘名称而被整份跳过，所以这一轮屏幕仍应显示游戏原模型。部署 DLL SHA256 为
+`4F1679649F535C51329DF4469645347622A544BC83CCDB148B3A3E9A4AB199DC`；修改前的全局配置与 v70 DLL 备份位于
+`E:\EIEM_Workspace\plugin-releases\before-camera-fade-off-ab-20260911-013651`。若本轮恢复平滑，即可把突变归因于
+相机反虚化功能；若仍突变，再继续关闭其他全局 Hook。本段尚未记录该轮实机结果。
+
+关闭相机反虚化后用户仍观察到突变，因此该 Hook 也不是唯一根因。此时无 Mod 规则仍会安装两类全局入口：第一类是
+Mod 所需的资源、Renderer、Prefab/UI/NPC 生命周期入口；第二类是早期 MMD／动作实验留下的 HumanPose
+`GetInternalAvatarPose`、四个全局 Transform 写入 Hook、`MovementComponent.Tick`、三个 FinalIK 入口、
+`PlayerController.SetMainCharacter`、三个 SkeletalMorph／Morph Job 入口和动画工作线程。尤其
+`Hooked_MorphToBoneJob` 在第一次确认对象时会直接把 EyeLookAtIK 写为 false，说明第二类并非纯观察代码，不能继续把
+空 Mod 等同于 DLL 对游戏状态无影响。
+
+后续按二分法验证，而非逐 Hook 重启。第一轮从提交 `4558509` 建立独立 v70 诊断工作树
+`E:\EIEM_Workspace\diagnostics\hook-bisect-v70-20260911-014332`：保留全部资源／Renderer 入口，整组禁止上述旧
+HumanPose、Transform、Movement、FinalIK、PlayerController、SkeletalMorph 入口和动画线程。该差异只由编译宏
+`EIEM_BISECT_DISABLE_LEGACY_ANIMATION_HOOKS=1` 启用，构建标识为
+`resource-runtime-v70-bisect-resource-renderer-only`；完整 DLL 构建成功。Typhoeus 仍保持 v70 解析失败的零规则状态，
+`disable_camera_fade=false`。
+
+诊断 DLL 已部署到游戏目录，大小 6248448 字节，SHA256 为
+`817D77C57CB6EFCD3CEA32D16DD96AA7E124887AF29FFF59DFD02C1AB00EBE8E`；部署前的完整 v70 DLL、全局 INI 与 Mod INI
+备份在 `E:\EIEM_Workspace\plugin-releases\before-v70-resource-renderer-bisect-20260911-014605`。若本轮画面平滑，
+根因在旧动作组，下一轮将该组对半；若仍突变，根因在资源／Renderer 组，下一轮对该组二分。本段尚未记录实机结果。
+第一轮二分的实机结果为画面平滑、没有突变。日志确认加载的是
+`resource-runtime-v70-bisect-resource-renderer-only`，Typhoeus 为 0 条规则，相机反虚化关闭，旧动作组安装点均被
+跳过。因此资源／Renderer、Prefab/UI/NPC 生命周期 Hook 在该条件下可以排除，根因位于旧动作组。
+
+第二轮把旧动作组分成两半：A 组为 HumanPose、`PlayerController.SetMainCharacter`、SkeletalMorph／Morph Job 和
+动画线程；B 组为四个全局 Transform 写入、`MovementComponent.Tick` 和三个 FinalIK 入口。当前部署只启用 A 组，
+继续关闭 B 组，构建标识为 `resource-runtime-v70-bisect-pose-morph-only`。DLL 大小 6291968 字节，SHA256 为
+`6CB917CF9F9DBCBE8415468CBE98EDF0EC5E19771DB5F7B2D903328B502861A0`；上一轮平滑版本及配置备份位于
+`E:\EIEM_Workspace\plugin-releases\before-v70-pose-morph-bisect-20260911-015038`。若本轮突变，后续只二分 A 组；
+若仍平滑，后续只二分 B 组。本段尚未记录第二轮实机结果。
+
+第二轮实机同样平滑，因此 A 组可以排除，根因位于 B 组。第三轮把 B 组再分为：B1 为四个全局 Transform 写入
+Hook 与 `MovementComponent.Tick`；B2 为 `SolverManager.LateUpdate`、`BipedIK.UpdateSolver` 和
+`IKSolverTrigonometric.OnUpdate` 三个 FinalIK 入口。当前诊断 DLL 只启用 B1，Pose／Morph 与 B2 均关闭，构建标识
+为 `resource-runtime-v70-bisect-transform-movement-only`。DLL 大小 6248960 字节，SHA256 为
+`C6FCDC81BBB1C08FE716E394C4EC894EA83FAAD99177D650FACC70A983D72D96`；上一轮 A 组版本和配置备份位于
+`E:\EIEM_Workspace\plugin-releases\before-v70-transform-movement-bisect-20260911-015601`。Typhoeus 仍为零规则，
+相机反虚化仍关闭。本段只记录已部署的第三轮变量，尚无实机结果。
+
+第三轮实机仍然平滑，因此 B1 也可排除；按二分范围，剩余 B2 为三个 FinalIK 入口。为验证该结论并排除只有组合时
+才发生的交互，第四轮只启用 `SolverManager.LateUpdate`、`BipedIK.UpdateSolver` 和
+`IKSolverTrigonometric.OnUpdate`，关闭 Pose／Morph、Transform／Movement，资源／Renderer 组继续保留。构建标识为
+`resource-runtime-v70-bisect-finalik-only`，DLL 大小 6256640 字节，SHA256 为
+`1EECF0040D3DC1F17BED73FF7B5364772C9305907DC4BA3F959E8291ADD5B0E3`；第三轮版本与配置备份位于
+`E:\EIEM_Workspace\plugin-releases\before-v70-finalik-bisect-20260911-020023`。Typhoeus 仍为零规则，相机反虚化关闭；
+本段尚无第四轮实机结果。
+
+第四轮 FinalIK-only 实机复现画面突变，确认症状来自这三个入口中的至少一个。日志证明三者均通过 IL2CPP 元数据动态
+安装，没有走硬编码 RVA 回退；`SolverManager.LateUpdate` 同时启动了自动胸骨运动采样并在 161 帧后写出 TSV。
+第五轮继续二分：C1 仅保留 `SolverManager.LateUpdate`，C2 的 `BipedIK.UpdateSolver` 与
+`IKSolverTrigonometric.OnUpdate` 一并关闭；其他旧动作组仍关闭。构建标识为
+`resource-runtime-v70-bisect-solver-manager-only`，DLL 大小 6255616 字节，SHA256 为
+`DE6799EC73617B44E77D804C1FDEB3BDCB038D53C1EF9436B6ED6C37822A0DED`；FinalIK-only 版本与配置备份位于
+`E:\EIEM_Workspace\plugin-releases\before-v70-solver-manager-bisect-20260911-020511`。Typhoeus 仍为零规则，相机
+反虚化关闭；本段尚无第五轮实机结果。
+
+第五轮实机只启用 `SolverManager.LateUpdate` 时再次复现画面突变，因而将问题收敛到该入口；此前的
+`BipedIK.UpdateSolver` 与 `IKSolverTrigonometric.OnUpdate` 在同组测试中尚未被单独证明有问题。生产源码中的
+`SolverManager.LateUpdate` Hook 原本只是为了在每帧结束后调用胸骨运动采样，并不是物理运行时的必要入口。该采样
+会递归查找 Transform、读取姿态并同步写 TSV，不能作为游戏功能保留；它会改变 FinalIK 的每帧调用路径，且已被实机二分
+证明与画面突变同时出现。
+
+已从生产 `src/init.h`、`src/trojan.h` 和 `src/eiem_native_physics_diagnostic.h` 删除该 Hook、胸骨采样函数及其
+自动启动/结束入口。正常 Physics 资源解析、创建和生命周期代码保留；诊断不再挂在 `SolverManager.LateUpdate` 或
+Dump UI 上。回归测试同时要求生产源码不存在 `Hooked_SolverManager_LateUpdate`、`SolverManager.LateUpdate`、
+`EiemSampleChestMotionAfterLateUpdate` 和 `CHEST-MOTION`。
+
+修复后的正式构建标识为 `resource-runtime-v77-remove-lateupdate-probe`。MSVC 完整 `build.bat` 构建成功；DLL
+大小为 6278656 字节，SHA256 为
+`339EB1823763A82132C4DE5CE5248800DB2A89A11ADB4EDA8787BEE03F0D1462`。部署前的诊断 DLL、临时 Physics-off Mod、
+全局配置和运行状态备份位于 `E:\EIEM_Workspace\plugin-releases\before-v77-final-deploy-20260911-025856`。
+游戏目录已恢复完整 Mod 配置（12 条 `physics=`，SHA256 为
+`B13CBBECD109653902CCEFB8F8B551901454296B93E46554D97C7C5637B10A86`），并恢复
+`plugin\eiem.ini` 的 `disable_camera_fade=true`；`state.ini` 原样保留。部署后的游戏实机结果仍需下一次启动后由用户
+确认，当前证据只证明问题入口已删除、正式 DLL 已构建并完成文件校验。
+
+### 20.54 v77 实机结论、当前裙子导出核验与 v78 延迟激活修复
+
+用户启动 v77 后确认画面不再突变，因此 `SolverManager.LateUpdate` 诊断 Hook 与该症状的因果关系已完成实机闭环；
+这项结论只覆盖画面突变，不等同于新增裙子物理与碰撞已经通过实机验收。v77 最后一次运行日志中的旧包已经到达
+Physics `ready`，12 个 MOVE 节点全部产生局部位置或旋转变化；但当前 Mod 在 03:15 重新导出，晚于该次游戏运行，
+所以旧日志不能用来宣称新包已经在游戏中执行。
+
+对 03:15 当前包按文件内容重新扫描，而不是依赖 Blender 对象顺序或固定 Part 编号。唯一包含新增裙骨的资源是
+`MeshS_actor_typhoea_cloth_01_lod0_2_4.mesh`：7295 个导出顶点均具有有效蒙皮，138 槽骨骼表中新增的
+18 个 `maid_skirt_01..06_{a,b,c}_jnt` 全部被实际权重引用；没有零权重顶点或越界骨索引。物理文件为作者 v5，
+包含一个 `maid.002 Skirt Physics` 组、18 个节点、6 个 FIXED 根和 12 个 MOVE 节点，保留 249 项原生参数并引用
+左右大腿、骨盆和左右前臂共 5 个胶囊。各 Render Part 均声明同一 Skeleton 与 Physics。当前
+`state.ini` 中裙子变量 `$switch_3247ace4b0c74d49=1`，而该 `_2_4.mesh` 仅在值为 0 时加入；对应切换键为
+`NUMPAD5`。因此若不先把该组切回 0，画面中没有可用于判断新增裙骨运动的网格。
+
+`MeshS_actor_typhoea_cloth_02_lod0_clothes` 的上一轮“躺地”作为独立问题处理。其导出文件
+`MeshS_actor_typhoea_cloth_02_lod0_3_3.mesh` 有 3775/3775 条蒙皮记录、126 槽骨骼表、无零权重和越界索引；
+其原始顶点沿 Z 轴位于 0.841..1.203，而 Y 轴仅为 -0.108..0.177。该姿态与游戏里观察到的贴地现象一致于
+“新增 SkinnedMeshRenderer 没有进入蒙皮更新”，而不是文件缺少权重。旧创建流程会在活动 GameObject 上先
+AddComponent，使 Renderer 在 Mesh、bones、bindposes、rootBone 与 skinningRoot 尚未赋值时进入启用路径。
+
+v78 将所有 partner Renderer 的创建改为通用的延迟激活流程：读取源 GameObject 状态，先让新对象保持 inactive，
+完成 Mesh、骨骼表、rootBone、skinningRoot、Renderer 状态、边界、材质与 LOD 归属后，最后恢复源激活状态。
+实现不判断角色、Mesh 名、LOD 编号或骨骼名；`cloth_02` 只是暴露通用初始化顺序问题的样本。新增顺序契约测试后，
+相关 MSVC/宿主测试 111 项全部通过，`git diff --check` 无补丁错误，完整 `build.bat` 构建成功。部署版本标识为
+`resource-runtime-v78-deferred-partner-activation`，本地与游戏目录 DLL 的 SHA256 均为
+`2AA52AA0FB340B27FF91DD04935255ED29BF4FF1389D023DEF0F351895F2089D`；v77 备份位于
+`C:\Users\25487\AppData\Local\Temp\EIEM-deploy-backups\eiem-v77-before-v78-20260911-031730.dll`。
+部署只替换 `plugin\eiem.dll`，校验确认当前 `typhoeus\mod.ini` 未变化。v78 尚未启动游戏；`cloth_02` 站立、
+当前 `_2_4.mesh` 的物理运动及五个胶囊的可见碰撞效果仍需下一次实机分别确认。
+
+### 20.55 v78 物理参数证据与 v79 F10 代际滚动
+
+用户在 v78 实机中已经观察到物理碰撞。对应运行日志确认当前作者物理以 `groups=1 colliders=5` 进入构建，
+原生 Team 到达 `ready`，12 个 MOVE 节点在 16 次采样中全部发生变化，最大局部位置差平方为
+`0.00720635988`、最大局部旋转差平方为 `0.512426734`。配置路径并非只读取文件：构建前会把组级
+`blendWeight/gravity/gravityFalloff/animationPoseRatio/stablizationTimeAfterReset`、半径曲线和 249 项
+`nativeParameters` 写入新建的 `ClothSerializeData`，每项均立即从原生对象回读并精确核对；任一写入、曲线键、
+类型或回读不一致都会拒绝该次构建。本轮日志没有这些拒绝。因此可以确认当前包的参数已进入原生求解器，而不是
+仅被 Blender 或 DLL 解析后丢弃；但尚未用单参数 A/B 定量确认每一个参数对画面的独立影响，不能据此声称所有字段的
+视觉语义均已逐项验证。
+
+同一次运行暴露了独立的 F10 热重载故障。每次全局重载先恢复并销毁旧 partner Renderer，随后变更后的 Skeleton
+文件需要重建；旧 Physics Team 此时仍持有旧 Skeleton，旧实现返回 `Skeleton changed while in use`。全部新 partner
+因此创建失败，而源 Renderer 又因 `handling=skip` 保持隐藏，表现为模型和材质在第一次 F10 后消失。按切换键会再次
+触发 Reconcile；此时旧 Physics 已退休、旧 Skeleton 节点已释放，所以模型才重新出现。日志顺序明确记录了 partner
+失败发生在 `PHYSICS-RUNTIME retire` 之前，排除了贴图缺失和切换状态未保存作为这次首轮消失的根因。
+
+v79 把 Skeleton 缓存改为通用的代际滚动：文件时间戳变化时，旧代际停止接收新消费者，但继续由既有 Renderer 或
+原生 Physics 持有；新消费者立即从变化后的文件创建独立新代际。旧 Team 退休后，其旧私有节点才按既有引用计数回收。
+该实现不判断角色名、Mesh 名、骨骼名、LOD 或固定节点数量。为处理重复 F10 后逐渐增多的贴地对象，partner 退休顺序
+同时改为先停用整个 GameObject，再隐藏 Renderer、移出 LOD、解绑 Transform 并请求 Unity 销毁，避免延迟销毁窗口中
+已解绑对象被控制器重新显示在场景根部。
+
+新增的宿主回归分别验证“旧骨架仍被消费时可以创建新代际”和“partner 必须先停用再解绑销毁”；连同热重载、蒙皮、
+材质恢复、物理配置/生命周期及按键状态共 126 项测试全部通过，完整 `build.bat` 构建成功。部署版本标识为
+`resource-runtime-v79-hot-reload-skeleton-rollover`，本地与游戏目录 DLL 的 SHA256 均为
+`BC26F69BC0D1D3B15658D340DCBF7A1F09F2A19BA632297DD03241A1835D0B6F`。v78 备份位于
+`C:\Users\25487\AppData\Local\Temp\EIEM-deploy-backups\eiem-v78-before-v79-20260911-0341.dll`。
+部署仅替换 `plugin\eiem.dll`，没有修改 Mod INI、状态、Mesh、材质、贴图、Skeleton 或 Physics 文件。v79 的
+“一次 F10 即恢复全部模型”以及“连续 F10 不再累积贴地对象”仍需下一轮实机验证，当前不得记录为已经验收。
+
+### 20.56 v79 实机复核、03:46 Physics 丢失根因与 v80 增量切换
+
+v79 运行日志证明 03:46 覆盖导出之前的作者 Physics 确实进入游戏原生求解：generation 1 的可见绑定在
+7 个 partner、876 个骨骼槽中选中 18 个唯一物理节点，Team 到达 `ready`；16 次采样中 12/12 个 MOVE 节点
+全部变化，最大局部位置差平方 `0.00917975325`、最大局部旋转差平方 `0.196268007`。重复 F10 建立的
+generation 4 同样到达 `ready`，包含 5 个碰撞体；因此“参数和碰撞从未进入原生实例”与日志不符。
+这些证据证明该旧包的原生实例运行，不等同于每个参数的视觉语义都已逐项 A/B。
+
+03:46 的当前导出晚于上述记录。该包目录中已没有 `.physics` 文件，`mod.ini` 也没有 `[Physics...]` 或
+`physics=`。随后 F10 的第 2201 行明确记录 `[PHYSICS-PLAN] previous=1 current=0`，并退休 generation 4、
+5 个碰撞体和 18 个 Skeleton 自有节点。因此当前画面的轻微摆动不是这份新增 Physics 的效果，也不能先归咎于
+权重。导出器此前只收集显式选中的物理组 Empty，又会清理旧生成目录；只选 Mesh 覆盖导出便把有效物理依赖删除。
+
+对 03:46 当前 Mesh 内容重新按骨骼路径扫描，物理裙片现在是
+`MeshS_actor_typhoea_cloth_01_lod0_2_5.mesh`（位置不能写成运行时硬编码）。7295 个顶点全部具有有效蒙皮，
+无零权重、越界索引或跨 Mesh bind pose 冲突。每顶点新增裙骨总权重最小约 0.018、中位数约 0.173、
+90 分位约 0.418、最大约 0.755、平均约 0.210；新增裙骨权重中约 90.9% 落在 12 个 MOVE 节点，未错误集中于
+6 个 FIXED 根。这符合此前“均匀且轻”的作者要求，说明权重合法但视觉响应被主动压低；只有恢复 Physics 后仍偏弱，
+才应以单变量方式提高 b/c MOVE 骨权重，而不是在 Physics 缺席时盲目重刷。
+
+Blender 0.30.3 现从所选可见 Mesh 的实际正权重反推同 Rig 作者物理组：Mesh 使用该组任一节点骨骼时，
+即便未手动选择 Group Empty，也把 Physics 与共享 Skeleton 纳入导出闭包；完全不使用作者物理骨骼的 Mesh
+仍保持纯 Mesh 导出。后台 Blender 回归先在旧实现得到 `physics=0`，修复后得到 `physics=1` 并生成 Render 绑定。
+源码已同步到 `E:\vscode\EIEM_Blender`，但当前游戏包不会被代码修改自动补回，仍需插件重载后重新导出。
+
+按键贴地的运行时日志还显示：任一普通 `mod control` 都会销毁同 Mod 的 5～9 个 partner、恢复全部源 Renderer，
+再重建当前全部可见项；一个显隐键因此会让未变化的衣服反复经过蒙皮注册。v80 为纯 partner 列表变化增加差集路径：
+每个 partner 记录来源 Render，仍被新规则引用的实例保持原对象、骨骼表与 Skeleton lease，只退休已移除项并创建
+新增项。该实现按 Mod/Render 关系工作，不包含角色、Mesh、LOD、骨骼或按键硬编码。对应的分类与引用关系宿主测试、
+模型重载测试、partner 生命周期测试及后台 Skeleton/Physics 依赖测试通过；完整 `build.bat` 构建成功。
+
+部署构建标识为 `resource-runtime-v80-selective-partner-controls`，本地与游戏目录 DLL SHA256 均为
+`FD6A048FE15C96E964AE807E99C6A17E966F462C3426D40B1B037770DF23D6D0`；v79 备份位于
+`C:\Users\25487\AppData\Local\Temp\EIEM-deploy-backups\eiem-v79-before-v80-20260911.dll`。部署只替换 DLL，
+没有修改当前 Mod、状态或资源。v80 尚未启动游戏；普通按键后是否仍贴地、重新导出后 Physics 的视觉强度以及
+连续 F10 的完整重建均未实机验收。全量测试中的材质贴图数量与角点切线各有一项失败；本轮没有修改这两条代码路径，
+但也未用本轮开始前的基线运行证明其为既存失败。本轮相关目标测试和完整 DLL 编译通过，不把全量测试记录成全绿。
+
+### 20.57 UI、NPC 与大世界的 Physics 创建边界（调查结论）
+
+三类场景应共享同一个 Physics 运行时适配器，但不应共享一个全局 Physics 实例。正确的创建边界是
+“模型实例已经完成、匹配 Renderer 已收集、且存在唯一最近 Animator”这一模型层；`RendererInfo._Init`
+只负责 Mesh/材质命中与收集 Physics intent，不能直接创建 Physics。大世界由 `PrefabInstantiateProxy`
+或 `BaseModelViewPart` 完成边界提供模型，NPC 由 `NPCAvatar.StartNPC` 提供，角色 UI 由
+`CharUIModelMono.OnAwake/SetVisible` 提供；它们各自持有 owner，释放边界分别进入同一个安全退休流程。
+
+当前实现已经有共享入口：`EiemStoreModelPhysicsIntents` 将 Renderer 命中的 intent 交给
+`EiemReconcileModelPhysics`。但 `src/eiem_native_physics_runtime.h` 的该函数目前显式忽略 `active`，
+因此 UI 隐藏、NPC 暂停与大世界可见状态还没有形成统一的激活语义，这应在 DLL 的模型编排层修复。
+
+本次 v80 日志中，Typhoea 的一个 UI 模型记录了 `applied=1`，说明 UI Hook 和 Mesh 规则确实命中；其它
+`applied=0` 的 UI 模型对应其它角色。Typhoea 的服装 partner 则因导出 Skeleton 引用了当前 live rig
+中不存在或重复的碰撞体路径而创建失败。更关键的是当前游戏目录 `typhoeus` 没有 `.physics` 文件、
+`mod.ini` 没有 `[Physics]` 或 `physics=`，日志也没有 `PHYSICS-RUNTIME`，所以本次运行不能证明任何
+UI/NPC Physics 已建立或运行。
+
+下一步应先在共享模型编排层补齐 owner active/ready 状态，再修正 Skeleton 对 live rig 的绑定，恢复带
+Physics 的导出包后分别验证大世界、NPC、UI 三个 owner；不能把 UI 的 Mesh 命中当作 Physics 已生效。
+
+### 20.58 13:49 重新导出后的 Physics 包核对
+
+20.57 中关于“当前游戏目录没有 Physics”的结论只对应 03:46 的旧 Mesh-only 导出包，不能用于判断后续导出。
+用户在 13:49 重新导出后，当前 `typhoeus/mod.ini` 已包含
+`[Skeletonchr_0034_typhoea_postmodel_0]`、
+`[PhysicsSkeletonchr_0034_typhoea_postmodel_0]`，并在多个 `Render` action 中写入
+`physics=PhysicsSkeletonchr_0034_typhoea_postmodel_0`。对应的
+`physics/PhysicsSkeletonchr_0034_typhoea_postmodel_0/PhysicsSkeletonchr_0034_typhoea_postmodel_0.physics`
+文件也存在，文件头为 `EIEPHYS` v5，并包含原生胶囊碰撞体记录。
+
+因此当前证据支持“Blender 导出器已经把本次物理资源写入游戏包”，不支持“游戏内 Physics 已经建立并正确模拟”。
+后者仍需以本次包启动后的 `PHYSICS-RUNTIME` 日志、owner 命中、Team ready 和节点运动采样核实。若再次只导出
+Mesh，旧生成目录会被清理，`mod.ini` 可能再次回到没有 `physics=` 的状态；检查时必须同时记录包的导出时间、
+`mod.ini` 和 `.physics` 文件，避免把不同导出批次混为一次结果。
+
+### 20.59 UI、NPC 碰撞体来源与当前未完成项
+
+“Physics 碰撞骨骼不可用”指运行时绑定阶段的失败，不是 `.physics` 文件没有导出碰撞体。当前适配器先把导出
+Skeleton 的节点路径解析到某个模型实例的 live Transform，再用同一份路径表查找每个 collider 的 `source.bone`；
+源码在 `EiemPhysicsRuntimeCreateColliders` 中明确执行这一步。只要 UI 或 NPC 的实际层级缺少该相对路径，或路径出现
+重复歧义，该模型实例的 Physics 构建就会被拒绝。导出文件本身可以完整存在，仍然会出现这个运行时错误。
+
+大世界 PFB 是物理作者数据的来源，但不是 UI、NPC 的运行时对象身份。UI 使用角色展示 prefab，NPC 由
+`NPCAvatar` 组装模型；它们可能复用同一角色骨架命名，也可能使用裁剪、变体或不同根节点的层级。若相对骨骼路径
+和 Transform 拓扑完全一致，同一份 Physics 资源可以复用，碰撞体的形状、半径、参数不需要按场景复制三份；运行时
+只应把它们分别挂到各自实例的对应骨骼上。若拓扑不一致，就必须为该实例导出匹配的 Skeleton/Physics 来源，不能把
+大世界 PFB 的 Transform 指针或绝对路径硬套到 UI/NPC。
+
+因此当前状态分成三层：Mesh 命中和 UI/NPC owner 入口已有实机证据；当前 13:49 包的 Physics 资源已经写入；
+但 UI/NPC 对当前五个胶囊及全部导出骨骼的逐实例绑定尚未重新验收。`EiemReconcileModelPhysics` 仍显式忽略
+`active`，而碰撞骨骼缺失时会拒绝整次构建。下一步应在不硬编码角色名、PFB 或场景的前提下，为每个模型实例记录
+“实际 Skeleton 根、成功解析的骨骼数、碰撞体绑定数”，分别验证大世界、NPC、UI；不能仅凭 Physics 文件来自大世界
+PFB 就宣称三类实例都已生效。
+
+### 20.60 v80 包运行结果：大世界成功，角色 UI 暴露两类独立绑定问题
+
+用户退出后的最新 `eiem_log.txt`（PID 17328）给出了本次包的实际分叉。大世界实例
+`model=0000000FD6BE2A20` 在 `PrefabInstantiateProxy.OnCompleted` 建立 1 个 Physics group、5 个
+collider，随后记录 `ready teams=17`；16 次采样中 12/12 个 MOVE 节点变化。这证明当前 13:49 导出的 Physics
+资源在至少一个大世界模型实例上完成了创建、碰撞列表注册和原生运动。
+
+该运行日志使用的运行时标签仍是 `[PHYSICS-RUNTIME-v76]`；它是源码中的诊断标签，不能单独用来推断部署构建
+编号，当前安装 DLL 的 SHA256 仍需以文件哈希为准。
+
+角色 UI 实例 `model=0000001097CA0E60` 的 Physics 计划确实进入了 `CharUIModelMono.OnAwake`，但第一次构建因
+`Ambiguous live Skeleton path` 指向 `EIEM Partner Render...` 失败。后续重试又报告
+`Source bone is missing (not a new bone): .../Magica Capsule Collider (Bip001_L_Forearm_Large)`，随后同一缺失路径
+使多个 UI partner 创建失败。这里的“缺失”不是 UI 没有 `Bip001_L_Forearm` 主骨骼，而是 UI 层级没有大世界 PFB
+中作为源节点导入的 `Magica Capsule Collider (...)` 子 Transform。当前导出的 Physics Skeleton 共 415 个节点，
+其中 397 个标为源节点、18 个为新增节点；碰撞体 owner 节点属于前者。
+
+本次还没有 `NpcAvatar` 的 Physics owner/ready 记录，只有 `PrefabProxy`、`BaseModelPart` 和角色 UI 记录，因而
+不能把 NPC 写成成功或失败。下一步的实现应拆成两个明确修复：Skeleton 解析只从 Renderer 骨骼 palette 及其祖先
+建立源路径表，不能遍历包含 EIEM Partner 的整棵模型树；Physics 实例遇到缺失的碰撞体 owner 时，应在其最近
+存在的父骨骼下创建 EIEM 自有的锚点 Transform，并使用导出 Skeleton 中该节点的局部 TRS，再挂载 Collider，
+而不是把大世界 PFB 的 Transform 指针带到 UI/NPC。这个策略仍按资源路径和实际拓扑工作，不按角色名或场景硬编码。
+
+### 20.61 v81 UI/NPC 绑定修复（代码与离线验证）
+
+针对 20.60 日志中的两个明确失败点，v81 做了三项收敛：
+
+1. `EiemSkeletonSourceNodes` 不再遍历锚点下的完整 Transform 子树。它只按 Skeleton 资源声明的相对路径逐段查找，因此 EIEM 自己生成的 `Partner` 层级不会制造伪造的重复路径；真实同名源节点仍会明确报 ambiguous。
+2. 明确绑定 Physics 的 Render/Skeleton 资源会把其 Skeleton 文档中的源节点路径收集为显式 `virtualSkeletonPaths`。当 UI/NPC 缺少大世界 PFB 导出的碰撞体或物理链节点时，Skeleton 适配器允许该路径缺失，并在已解析的父骨骼下创建带有导出局部 TRS 的 EIEM 私有锚点；普通 Mesh-only Skeleton 资源仍保持“缺失源骨骼即失败”。Collider 仍通过这个 Transform 绑定，不复制大世界 PFB 的对象指针。
+3. `EiemReconcileModelPhysics` 不再忽略 `active`。模型 owner 不可见时，所有属于该模型的 host 和碰撞体进入既有的 `BeginRetire`/native-death 等待流程；重新可见后才允许新一轮构建。没有使用 `DisposeInternal`、计数器或 trace 作为完成栅栏。
+
+回归覆盖了重复 Partner 名称、缺失源节点的原有拒绝语义、Physics 虚拟 owner 契约和 inactive retire 契约。MSVC 下全套 `unittest` 为 240 项通过、12 项因环境缺少 Blender/外部工具跳过；`build.bat` 完整构建通过。v81 DLL 已部署到 `D:\Hypergryph Launcher\games\Endfield Game\plugin\eiem.dll`，SHA256 为 `EB404FC412842D2661CB180E43BF040AD971A208BC34A2C9D5F7CE0992DFCF10`，旧文件备份在 `C:\Users\25487\AppData\Local\Temp\EIEM-deploy-backups\`。这仍不等于 UI/NPC 实机成功；下一次游戏运行要检查 `PHYSICS-RUNTIME-v81` 的 UI、NPC 与大世界实例日志，以及 collider 数量和 `ready`/`motion` 记录。
+
+### 20.62 v81 实机结果与 v82 修复
+
+重启后的 v81 日志确认大世界实例仍建立 1 个 Physics group、5 个 collider 并进入 `ready`，12 个 MOVE 节点持续变化；但角色 UI 在 Mesh Partner 创建和 Physics 构建前都因同一条 `Magica Capsule Collider (Bip001_L_Forearm_Large)` 源节点缺失而失败。解析当前 `.physics/.skeleton` 后发现 Skeleton 有 415 个节点，实际 Physics collider 依赖为 5 个，PFB 中其余碰撞节点仍以 source 节点保存在 Skeleton 中，因此仅允许 5 个 `collider.bone` 不足以让 UI 复用该 Skeleton。
+
+v82 已将虚拟化范围改为“带 `physics=` 的 Render 所声明 Skeleton 文档中的全部 source 节点”，缺失节点按导出 TRS 在最近已解析父节点下创建；没有 Physics 的 Mesh-only Skeleton 仍保持严格缺失检查。v82 的骨架/契约测试和完整 MSVC 构建已通过，并已部署到游戏目录；本次部署 DLL SHA256 为 `D9A2E030C659CD115F0CD71679E47F5D408F3CA162D4449E2E40C14B4762A802`，旧文件备份在 `C:\Users\25487\AppData\Local\Temp\EIEM-deploy-backups\`。重新启动后仍需检查 UI、NPC 和大世界三类 owner 的 Physics 日志。
+
+### 20.63 v83 rootBone late-binding and switch investigation
+
+The ground-position symptom changes after restart and after outfit-key changes. The current package does not contain `siwa` or `neiku` resources; those labels map to switch-controlled Render partners in `mod.ini`. The switch path therefore remains resource-driven and is not a valid reason to add a mesh-name exception.
+
+The relevant lifecycle gap was in Partner creation: `EiemCreatePartnerRenderer` copied the source SkinnedMeshRenderer `rootBone` only once. The game can call `SetSMRRootBone` after the source Renderer has already been observed and after one or more Partners have been created. The source then has a valid root bone while an early Partner retains null or stale rootBone, which can place only the parts created in that timing window at the scene origin. Recreating a different switch branch changes which part falls into the window, matching the reported restart-dependent symptom.
+
+v83 synchronizes rootBone by the source Renderer relationship, without hardcoded mesh, character, LOD, or switch names. It runs after `AssignSkinPost`, after `SetSMRRootBone`, and at the end of every Partner replay. Synchronization only writes a live source rootBone to a live Partner and verifies the setter readback; it does not use counters, disposal returns, or dump output as completion fences. Creation logs now include `rootBone=source/partner`, and late repairs are logged as `[MOD-PARTNER-ROOT]`.
+
+Offline Partner, skeleton, and resource-contract tests pass; `build.bat` passes. v83 was deployed to the game directory with the previous DLL backed up on `E:` at `E:\EIEM_Workspace\plugin-releases\before-v83-rootbone-sync-20260911-164206`. Gameplay confirmation is still pending: after launching, switch the affected groups and check whether the log records root synchronization for the newly created Partners and whether the affected parts remain attached to the live rig.
+### 20.64 v83 实机日志：大世界/UI 已运行，NPC 与碰撞姿态仍需单独验收
+
+本次 v83 运行日志确认了两个独立模型实例进入同一份 Physics 资源：
+
+- 大世界 `PrefabInstantiateProxy.OnCompleted`：`groups=1`、`colliders=5`，随后 `ready`；16 次采样中 `12/12` 个 MOVE 节点持续变化。
+- 角色 UI `CharUIModelMono.OnAwake`：同样建立 `groups=1`、`colliders=5`，随后 `ready`；16 次采样中 `12/12` 个 MOVE 节点持续变化。
+
+因此当前证据可以确认 Physics 组、物理链和五个碰撞体已经进入原生运行时；“裙子被挤压”也不是静态蒙皮造成的。日志仍只记录碰撞体数量，没有逐个记录 `source.bone` 对应的实际 Transform、局部位置/旋转和胶囊半径读回，所以不能仅凭 `colliders=5` 证明 UI 的碰撞体空间位置正确。挤压方向或强度异常仍可能来自碰撞体绑定层级、局部姿态、半径/长度，或裙子权重。
+
+本次运行没有出现 `NPCAvatar.StartNPC` 的 Physics owner/ready 记录，只有 PrefabProxy、BaseModelPart 和 CharUIModel 记录；因此 NPC Physics 仍未被这次运行验收，不能把 UI 的成功结果推广到 NPC。下一步应在普通 NPC 实例出现后再检查其独立的 `binding/build-started/ready/motion` 记录，并补充每个 collider 的实际绑定 Transform 与几何读回日志，再判断 UI 挤压是否需要调整碰撞体或权重。
+### 20.65 v84 碰撞体逐项运行追踪
+
+v84 只增加普通运行日志，不改变 Physics 创建、按键切换或碰撞参数。每个实例创建碰撞体后会记录 `source.bone`、实际绑定 Transform、父节点是否匹配、局部位置/旋转、形状、半径、末端半径、长度以及几何读回值。该日志用于区分“碰撞体已注册但姿态错误”和“裙子权重/物理链响应不正确”。
+
+本次部署同时修正了 DLL 目标文件名：游戏目录存在一个普通 `eiem.dll` 和一个带不可见字符的同名变体，v84 已部署到普通文件，变体未删除。旧普通 DLL 备份在 `E:\EIEM_Workspace\plugin-releases\before-v84-collider-trace-20260911-170329`。下一次运行仍需分别取得大世界、UI 和 NPC 的逐项记录。

@@ -572,7 +572,7 @@ static DWORD WINAPI InitThread(LPVOID) {
       CreateFileA("plugin\\eiem_log.txt", GENERIC_WRITE, FILE_SHARE_READ, NULL,
                   CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
   Log("=== EIEM Phase 1: Skeleton Discovery ===");
-  Log("[BUILD] resource-runtime-v70-physics-npc-owner dll=%s %s", __DATE__,
+  Log("[BUILD] resource-runtime-v80-selective-partner-controls dll=%s %s", __DATE__,
       __TIME__);
 
   if (!Resolve()) {
@@ -978,14 +978,44 @@ static DWORD WINAPI InitThread(LPVOID) {
     g_smr_set_bones = FindMethod(g_skinnedMeshRendererClass, "set_bones", 1);
     g_smr_get_rootBone = FindMethod(g_skinnedMeshRendererClass, "get_rootBone", 0);
     g_smr_set_rootBone = FindMethod(g_skinnedMeshRendererClass, "set_rootBone", 1);
-    g_smr_get_localBounds = FindMethod(g_skinnedMeshRendererClass, "get_localBounds", 0);
-    g_smr_set_localBounds = FindMethod(g_skinnedMeshRendererClass, "set_localBounds", 1);
+    g_smr_get_skinningRoot =
+        FindMethod(g_skinnedMeshRendererClass, "get_skinningRoot", 0);
+    g_smr_set_skinningRoot =
+        FindMethod(g_skinnedMeshRendererClass, "set_skinningRoot", 1);
+    g_smr_get_quality = FindMethod(g_skinnedMeshRendererClass, "get_quality", 0);
+    g_smr_set_quality = FindMethod(g_skinnedMeshRendererClass, "set_quality", 1);
+    g_smr_get_updateWhenOffscreen =
+        FindMethod(g_skinnedMeshRendererClass, "get_updateWhenOffscreen", 0);
+    g_smr_set_updateWhenOffscreen =
+        FindMethod(g_skinnedMeshRendererClass, "set_updateWhenOffscreen", 1);
+    g_smr_get_forceMatrixRecalculationPerRender = FindMethod(
+        g_skinnedMeshRendererClass, "get_forceMatrixRecalculationPerRender", 0);
+    g_smr_set_forceMatrixRecalculationPerRender = FindMethod(
+        g_skinnedMeshRendererClass, "set_forceMatrixRecalculationPerRender", 1);
+    g_smr_get_skinnedMotionVectors =
+        FindMethod(g_skinnedMeshRendererClass, "get_skinnedMotionVectors", 0);
+    g_smr_set_skinnedMotionVectors =
+        FindMethod(g_skinnedMeshRendererClass, "set_skinnedMotionVectors", 1);
+    // localBounds is declared by Renderer, not SkinnedMeshRenderer. A direct
+    // class lookup returned null in v74 and silently disabled replacement
+    // bounds updates.
+    g_smr_get_localBounds =
+        FindMethodInHierarchy(g_skinnedMeshRendererClass, "get_localBounds", 0);
+    g_smr_set_localBounds =
+        FindMethodInHierarchy(g_skinnedMeshRendererClass, "set_localBounds", 1);
     Log("[OK] SkinnedMeshRenderer: get/set sharedMesh=%p/%p, GetWeight=%p, SetWeight=%p, "
-        "get/set bones=%p/%p rootBone=%p/%p localBounds=%p/%p",
+        "get/set bones=%p/%p rootBone=%p/%p skinningRoot=%p/%p "
+        "quality=%p/%p offscreen=%p/%p forceMatrix=%p/%p motion=%p/%p "
+        "localBounds=%p/%p",
         g_smr_get_sharedMesh, g_smr_set_sharedMesh, g_smr_GetBlendShapeWeight,
         g_smr_SetBlendShapeWeight, g_smr_get_bones, g_smr_set_bones,
-        g_smr_get_rootBone, g_smr_set_rootBone, g_smr_get_localBounds,
-        g_smr_set_localBounds);
+        g_smr_get_rootBone, g_smr_set_rootBone, g_smr_get_skinningRoot,
+        g_smr_set_skinningRoot, g_smr_get_quality, g_smr_set_quality,
+        g_smr_get_updateWhenOffscreen, g_smr_set_updateWhenOffscreen,
+        g_smr_get_forceMatrixRecalculationPerRender,
+        g_smr_set_forceMatrixRecalculationPerRender,
+        g_smr_get_skinnedMotionVectors, g_smr_set_skinnedMotionVectors,
+        g_smr_get_localBounds, g_smr_set_localBounds);
   } else {
     Log("[WARN] SkinnedMeshRenderer class NOT found");
   }
@@ -1024,8 +1054,11 @@ static DWORD WINAPI InitThread(LPVOID) {
   // not expose LODGroup. Partner Renderers still work without this block.
   g_lodGroupClass = FindClass("UnityEngine", "LODGroup", asms, ac);
   if (g_lodGroupClass) {
-    g_lodGroup_get_lods = FindMethod(g_lodGroupClass, "get_lods", 0);
-    g_lodGroup_set_lods = FindMethod(g_lodGroupClass, "set_lods", 1);
+    // This Endfield build exposes GetLODs(bool getPlatformLODs), rather than
+    // Unity's usual public zero-argument wrapper. The v75 zero-argument lookup
+    // therefore left every partner outside the source Renderer LOD levels.
+    g_lodGroup_get_lods = FindMethod(g_lodGroupClass, "GetLODs", 1);
+    g_lodGroup_set_lods = FindMethod(g_lodGroupClass, "SetLODs", 1);
     Log("[MOD] LODGroup get/set lods: %p / %p", g_lodGroup_get_lods,
         g_lodGroup_set_lods);
   } else {
@@ -1203,24 +1236,6 @@ static DWORD WINAPI InitThread(LPVOID) {
       }
     } else {
       Log("[GF2] WARN: MovementComponent class not found");
-    }
-
-    void *solverMgrClass = FindClass("RootMotion", "SolverManager", asms, ac);
-    if (!solverMgrClass)
-      solverMgrClass = FindClass("RootMotion.FinalIK", "SolverManager", asms, ac);
-    void *lateUpdateMethod = solverMgrClass ? FindMethod(solverMgrClass, "LateUpdate", 0) : nullptr;
-    if (lateUpdateMethod && Hook(lateUpdateMethod, "SolverManager.LateUpdate",
-                                 (void *)Hooked_SolverManager_LateUpdate, &s_origLateUpdate)) {
-      Log("[IK] SolverManager.LateUpdate hooked dynamically via IL2CPP");
-    } else {
-      void *lateUpdateAddr = (void *)(gaBase2 + 0x035BD200);
-      if (MH_CreateHook(lateUpdateAddr, (void *)Hooked_SolverManager_LateUpdate,
-                        &s_origLateUpdate) == MH_OK) {
-        MH_EnableHook(lateUpdateAddr);
-        Log("[IK] SolverManager.LateUpdate hooked via fallback RVA %p", lateUpdateAddr);
-      } else {
-        Log("[IK] WARN: Failed to hook SolverManager.LateUpdate");
-      }
     }
 
     void *bipedIKClass = FindClass("RootMotion.FinalIK", "BipedIK", asms, ac);

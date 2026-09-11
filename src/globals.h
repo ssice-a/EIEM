@@ -392,6 +392,16 @@ static void *g_smr_get_bones =
 static void *g_smr_set_bones = nullptr;
 static void *g_smr_get_rootBone = nullptr;
 static void *g_smr_set_rootBone = nullptr;
+static void *g_smr_get_skinningRoot = nullptr;
+static void *g_smr_set_skinningRoot = nullptr;
+static void *g_smr_get_quality = nullptr;
+static void *g_smr_set_quality = nullptr;
+static void *g_smr_get_updateWhenOffscreen = nullptr;
+static void *g_smr_set_updateWhenOffscreen = nullptr;
+static void *g_smr_get_forceMatrixRecalculationPerRender = nullptr;
+static void *g_smr_set_forceMatrixRecalculationPerRender = nullptr;
+static void *g_smr_get_skinnedMotionVectors = nullptr;
+static void *g_smr_set_skinnedMotionVectors = nullptr;
 static void *g_smr_get_localBounds = nullptr;
 static void *g_smr_set_localBounds = nullptr;
 

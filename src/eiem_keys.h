@@ -36,7 +36,15 @@ static UINT EiemKeyCode(std::string name) {
     {"LEFT", VK_LEFT}, {"RIGHT", VK_RIGHT}, {"UP", VK_UP}, {"DOWN", VK_DOWN},
     {"SPACE", VK_SPACE}, {"ENTER", VK_RETURN}, {"ESC", VK_ESCAPE},
     {"TAB", VK_TAB}, {"BACKSPACE", VK_BACK}, {"CAPSLOCK", VK_CAPITAL},
-    {"TILDE", VK_OEM_3}
+    {"TILDE", VK_OEM_3},
+    {"NUMPAD0", VK_NUMPAD0}, {"NUMPAD1", VK_NUMPAD1},
+    {"NUMPAD2", VK_NUMPAD2}, {"NUMPAD3", VK_NUMPAD3},
+    {"NUMPAD4", VK_NUMPAD4}, {"NUMPAD5", VK_NUMPAD5},
+    {"NUMPAD6", VK_NUMPAD6}, {"NUMPAD7", VK_NUMPAD7},
+    {"NUMPAD8", VK_NUMPAD8}, {"NUMPAD9", VK_NUMPAD9},
+    {"NUMPADPLUS", VK_ADD}, {"NUMPADMINUS", VK_SUBTRACT},
+    {"NUMPADMULTIPLY", VK_MULTIPLY}, {"NUMPADDIVIDE", VK_DIVIDE},
+    {"NUMPADDECIMAL", VK_DECIMAL}
   };
   for (const auto &entry : entries) if (name == entry.name) return entry.vk;
   return 0;

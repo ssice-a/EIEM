@@ -840,17 +840,8 @@ static void __fastcall Hooked_MovementComponent_Tick(void *self, float deltaTime
     ((fn)s_origMoveTick)(self, deltaTime, methodInfo);
 }
 
-static void *s_origLateUpdate = nullptr;
 static void *s_origUpdateSolver = nullptr;
 static void __fastcall Hooked_IK_UpdateSolver(void *self, void *methodInfo);
-
-static void __fastcall Hooked_SolverManager_LateUpdate(void *self, void *methodInfo) {
-  typedef void (__fastcall *fn)(void *, void *);
-  if (s_origLateUpdate) {
-    ((fn)s_origLateUpdate)(self, methodInfo);
-  }
-  EiemSampleChestMotionAfterLateUpdate();
-}
 
 static void *s_origOnUpdate = nullptr;
 
@@ -2328,6 +2319,8 @@ static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     g_shutdownRequested = true;
     g_guiRunning = false;
     g_trojanActive = false;
+    KillTimer(hwnd, kEiemShapeTransitionTimer);
+    s_eiemShapeTransitionTick = 0;
 
     // Wake the GUI message loop. It will observe g_guiRunning=false and tear
     // down its own D3D resources on its owning thread.
@@ -2389,6 +2382,10 @@ static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
   }
   if (msg == WM_EIEM_MOD_RECONCILE) {
     EiemRunModReconcile();
+    return 0;
+  }
+  if (msg == WM_TIMER && wParam == kEiemShapeTransitionTimer) {
+    EiemRunShapeTransitions();
     return 0;
   }
   if (msg == WM_EIEM_MOD_KEY) {

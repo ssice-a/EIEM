@@ -150,9 +150,8 @@ class ResidueProbeTests(unittest.TestCase):
                           'il2cpp_object_new(', 'Destroy(', 'DontDestroyOnLoad('):
             self.assertNotIn(forbidden, source)
         trace = (ROOT / 'src/il2cpp_trace.h').read_text(encoding='utf-8')
-        start = trace.rindex('static bool EiemRegisterAndApplyModelInstance(')
-        body = trace[start:trace.index('\n}', start)]
-        self.assertLess(body.index('EiemProbeObserveModel'), body.index('EiemHasStandaloneRenderRules'))
+        self.assertNotIn('#include "eiem_residue_probe.h"', trace)
+        self.assertNotIn('EiemProbeObserveModel', trace)
 
 if __name__ == '__main__':
     unittest.main()

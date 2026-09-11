@@ -314,6 +314,7 @@ static void *s_eiemMeshCtor = nullptr;
 static void *s_eiemMeshSetIndexFormat = nullptr;
 static void *s_eiemMeshSetVertices = nullptr;
 static void *s_eiemMeshGetVertices = nullptr;
+static void *s_eiemMeshGetBounds = nullptr;
 static void *s_eiemMeshSetNormals = nullptr;
 static void *s_eiemMeshSetTangents = nullptr;
 static void *s_eiemMeshSetColors = nullptr;
@@ -570,6 +571,7 @@ static void EiemResolveResourceBackend(void **assemblies, size_t assemblyCount) 
     s_eiemMeshSetIndexFormat = FindMethod(s_eiemMeshClass, "set_indexFormat", 1);
     s_eiemMeshSetVertices = FindMethod(s_eiemMeshClass, "set_vertices", 1);
     s_eiemMeshGetVertices = FindMethod(s_eiemMeshClass, "get_vertices", 0);
+    s_eiemMeshGetBounds = FindMethod(s_eiemMeshClass, "get_bounds", 0);
     s_eiemMeshSetNormals = FindMethod(s_eiemMeshClass, "set_normals", 1);
     s_eiemMeshSetTangents = FindMethod(s_eiemMeshClass, "set_tangents", 1);
     s_eiemMeshSetColors = FindMethod(s_eiemMeshClass, "set_colors", 1);
@@ -677,7 +679,7 @@ static void EiemResolveResourceBackend(void **assemblies, size_t assemblyCount) 
         s_eiemImageConversionClass, "LoadImage", loadImageTypes,
         _countof(loadImageTypes));
   }
-  Log("[MOD] Mesh backend: setName=%p ctor=%p vertices=%p/%p normals=%p tangents=%p uv=%p triangles=%p bones=%p/%p bindposes=%p/%p upload=%p blendShapes=%p bounds=%p",
+  Log("[MOD] Mesh backend: setName=%p ctor=%p vertices=%p/%p normals=%p tangents=%p uv=%p triangles=%p bones=%p/%p bindposes=%p/%p upload=%p blendShapes=%p bounds=%p/%p",
       s_eiemObjectSetName, s_eiemMeshCtor, s_eiemMeshSetVertices,
       s_eiemMeshGetVertices, s_eiemMeshSetNormals, s_eiemMeshSetTangents,
       s_eiemMeshSetUVs2, s_eiemMeshSetTriangles,
@@ -685,7 +687,7 @@ static void EiemResolveResourceBackend(void **assemblies, size_t assemblyCount) 
       s_eiemMeshSetBindPoses, s_eiemMeshGetBindPoses,
       s_eiemMeshUploadMeshData,
       s_eiemMeshAddBlendShapeFrame,
-      g_mesh_recalculateBounds);
+      g_mesh_recalculateBounds, s_eiemMeshGetBounds);
   Log("[MOD] Material backend: load=%p immediate=%p get=%p clone=%p setMaterials=%p scale=%p offset=%p",
       s_eiemResourceManagerLoad, s_eiemProxyLoadImmediate, s_eiemProxyGet,
       s_eiemMaterialCtorCopy, s_eiemRendererSetSharedMaterials,

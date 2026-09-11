@@ -166,6 +166,14 @@ int main(int argc, char **argv) {
     EiemKeyChord chord;
     CHECK(EiemParseKeyChord("Ctrl+Shift+F12", &chord));
     CHECK(chord.vk == VK_F12 && chord.modifiers == (MOD_CONTROL | MOD_SHIFT));
+    CHECK(EiemParseKeyChord("Ctrl+Alt+Numpad7", &chord));
+    CHECK(chord.vk == VK_NUMPAD7 && chord.modifiers == (MOD_CONTROL | MOD_ALT));
+    CHECK(EiemParseKeyChord("Shift+NumpadPlus", &chord));
+    CHECK(chord.vk == VK_ADD && chord.modifiers == MOD_SHIFT);
+    CHECK(EiemParseKeyChord("NumpadMinus", &chord) && chord.vk == VK_SUBTRACT);
+    CHECK(EiemParseKeyChord("NumpadMultiply", &chord) && chord.vk == VK_MULTIPLY);
+    CHECK(EiemParseKeyChord("NumpadDivide", &chord) && chord.vk == VK_DIVIDE);
+    CHECK(EiemParseKeyChord("NumpadDecimal", &chord) && chord.vk == VK_DECIMAL);
     for (const auto &s : {"F25", "F10garbage", "Ctrl", "Ctrl+Ctrl+F6", "F6+F7", "F6+", "bogus"})
       CHECK(!EiemParseKeyChord(s, &chord));
   } else return 2;

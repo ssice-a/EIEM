@@ -48,6 +48,9 @@ struct EiemModRule {
   char shapeNames[64][192] = {};
   float shapeWeights[64] = {}; // authoring units: 1 == Unity 100
   uint32_t shapeCount = 0;
+  char shapeSpeedNames[64][192] = {};
+  float shapeSpeeds[64] = {}; // authoring units per second
+  uint32_t shapeSpeedCount = 0;
 };
 
 // A Prefab declaration groups the Render actions for one logical model. Each
@@ -228,6 +231,30 @@ static bool EiemSetRenderField(EiemModRule &rule, const std::string &key,
     if (slot == rule.shapeCount) ++rule.shapeCount;
     return true;
   }
+  if (key.compare(0, 12, "shape_speed.") == 0) {
+    const std::string name = key.substr(12);
+    if (name.empty() || name.size() >= sizeof(rule.shapeSpeedNames[0])) return fail();
+    uint32_t slot = 0;
+    while (slot < rule.shapeSpeedCount && name != rule.shapeSpeedNames[slot]) ++slot;
+    if (value.empty()) {
+      if (slot < rule.shapeSpeedCount) {
+        for (uint32_t i = slot + 1; i < rule.shapeSpeedCount; ++i) {
+          memcpy(rule.shapeSpeedNames[i - 1], rule.shapeSpeedNames[i],
+                 sizeof(rule.shapeSpeedNames[i]));
+          rule.shapeSpeeds[i - 1] = rule.shapeSpeeds[i];
+        }
+        --rule.shapeSpeedCount;
+      }
+      return true;
+    }
+    double speed = 0;
+    if (slot >= _countof(rule.shapeSpeedNames) || !EiemNumber(value, &speed) ||
+        !std::isfinite((float)speed) || speed <= 0) return fail();
+    EiemModCopy(rule.shapeSpeedNames[slot], sizeof(rule.shapeSpeedNames[slot]), name);
+    rule.shapeSpeeds[slot] = (float)speed;
+    if (slot == rule.shapeSpeedCount) ++rule.shapeSpeedCount;
+    return true;
+  }
   int32_t index = 0;
   if (key.compare(0, 9, "material.") == 0) {
     if (!EiemModInteger(key.substr(9), &index, 0, _countof(rule.materialSlots) - 1)) return fail();
@@ -388,7 +415,7 @@ static bool EiemValidateModDocument(EiemModProgram &doc, std::string &error) {
   std::vector<std::vector<size_t>> edges(doc.definitions.size());
   for (size_t i = 0; i < doc.definitions.size(); ++i) {
     bool valid = true;
-    std::unordered_set<std::string> shapes;
+    std::unordered_set<std::string> shapes, shapeSpeeds;
     EiemVisitStatements(doc.definitions[i].statements, [&](const EiemModStatement &s) {
       if (!valid) return;
       std::string detail;
@@ -399,6 +426,10 @@ static bool EiemValidateModDocument(EiemModProgram &doc, std::string &error) {
       }
       if (s.key.compare(0, 6, "shape.") == 0 && shapes.insert(s.key).second && shapes.size() > 64) {
         valid = false; detail = "Render exceeds 64 shape channels";
+      }
+      if (s.key.compare(0, 12, "shape_speed.") == 0 &&
+          shapeSpeeds.insert(s.key).second && shapeSpeeds.size() > 64) {
+        valid = false; detail = "Render exceeds 64 shape transition channels";
       }
       if (!s.condition && !s.value.empty()) {
         std::string kind;
@@ -614,7 +645,10 @@ static bool EiemModParseStream(std::istream &input, const char *path,
     }
     const std::string authoredKey = key;
     std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return (char)std::tolower(c); });
-    if (section == Render && key.compare(0, 6, "shape.") == 0) key = "shape." + authoredKey.substr(6);
+    if (section == Render && key.compare(0, 6, "shape.") == 0)
+      key = "shape." + authoredKey.substr(6);
+    if (section == Render && key.compare(0, 12, "shape_speed.") == 0)
+      key = "shape_speed." + authoredKey.substr(12);
     if (section == UI) {
       if (!uiFields.insert(key).second) return fail("Duplicate UI field: " + key);
       auto &ui = state.uis.back();

@@ -1,13 +1,14 @@
 bl_info = {
     "name": "EIEM Resource Package",
     "author": "EIEM",
-    "version": (0, 26, 2),
+    "version": (0, 30, 3),
     "blender": (3, 0, 0),
     "location": "File > Import/Export > EIEM package",
     "category": "Import-Export",
 }
 
 import configparser
+import hashlib
 import json
 import os
 import re
@@ -27,11 +28,49 @@ from mathutils import Matrix, Quaternion, Vector
 
 if __package__:
     from . import eiem_physics_authoring as physics_authoring
+    from . import eiem_blender_controls as controls
 else:
     _physics_spec = importlib.util.spec_from_file_location(
         "eiem_physics_authoring", Path(__file__).with_name("eiem_physics_authoring.py"))
     physics_authoring = importlib.util.module_from_spec(_physics_spec)
     _physics_spec.loader.exec_module(physics_authoring)
+    _controls_spec = importlib.util.spec_from_file_location(
+        "eiem_blender_controls", Path(__file__).with_name("eiem_blender_controls.py"))
+    controls = importlib.util.module_from_spec(_controls_spec)
+    _controls_spec.loader.exec_module(controls)
+
+
+# Preserve the standalone add-on's public Python surface for authoring scripts
+# while keeping control behavior in one focused module.
+parse_json_property = controls.parse_json_property
+author_identity = controls.author_identity
+add_shape_control = controls.add_shape_control
+sync_new_shape_controls = controls.sync_new_shape_controls
+shape_channel_name = controls.shape_channel_name
+switch_groups = controls.switch_groups
+switch_states = controls.switch_states
+switch_state_values = controls.switch_state_values
+switch_meshes = controls.switch_meshes
+switch_members = controls.switch_members
+capture_switch_state = controls.capture_switch_state
+validate_switch_key = controls.validate_switch_key
+switch_key_from_event = controls.switch_key_from_event
+set_switch_group_key = controls.set_switch_group_key
+set_shape_control_hotkey = controls.set_shape_control_hotkey
+add_switch_state = controls.add_switch_state
+set_switch_state_order = controls.set_switch_state_order
+reorder_switch_state = controls.reorder_switch_state
+set_switch_default = controls.set_switch_default
+restore_switch_preview = controls.restore_switch_preview
+preview_switch = controls.preview_switch
+assign_switch_meshes = controls.assign_switch_meshes
+create_switch_group = controls.create_switch_group
+delete_switch_group = controls.delete_switch_group
+mesh_source_identity = controls.mesh_source_identity
+plan_switch_export = controls.plan_switch_export
+plan_shape_controls = controls.plan_shape_controls
+lua_string = controls.lua_string
+generate_mod_ui = controls.generate_mod_ui
 
 
 MAGIC_MESH = b"EIEMESH\0"
@@ -155,10 +194,24 @@ class Writer:
 
 
 def parse_ini(root):
+    # Runtime Render sections may contain EIEM's conditional program syntax.
+    # ConfigParser accepts the indented assignments inside those blocks, but
+    # bare ``if``/``endif`` statements are not INI options and make an
+    # exported package impossible to import back into Blender.  The importer
+    # needs the declared resources and bindings, not execution of the switch
+    # program, so remove only control-flow statements before parsing.
+    lines = []
+    control_words = {"if", "elif", "else", "endif"}
+    with open(Path(root) / "mod.ini", "r", encoding="utf-8-sig") as stream:
+        for line in stream:
+            stripped = line.strip()
+            word = stripped.split(None, 1)[0].lower() if stripped else ""
+            if word in control_words and "=" not in stripped:
+                continue
+            lines.append(line)
     parser = configparser.ConfigParser(interpolation=None, strict=False)
     parser.optionxform = str
-    with open(Path(root) / "mod.ini", "r", encoding="utf-8-sig") as stream:
-        parser.read_file(stream)
+    parser.read_string("".join(lines), source=str(Path(root) / "mod.ini"))
     return parser
 
 
@@ -479,6 +532,27 @@ def normal_state_crc(mesh):
         checksum = zlib.crc32(
             struct.pack("<I3f", loop.vertex_index, *corner.vector), checksum)
     return "%08x" % (checksum & 0xFFFFFFFF)
+
+
+def normal_state_matches_source(mesh, source_normals, minimum_alignment=0.9998):
+    """Ignore Blender's harmless split-normal re-encoding after save/update.
+
+    A real normal edit still changes direction beyond the same tolerance used
+    by the import round-trip check. Zero-filled attributes on joined geometry
+    remain a mismatch and therefore cannot resurrect stale source normals.
+    """
+    if source_normals is None or len(source_normals) != len(mesh.vertices):
+        return False
+    for loop, corner in zip(mesh.loops, mesh.corner_normals):
+        source = Vector(source_normals[loop.vertex_index])
+        current = Vector(corner.vector)
+        if source.length_squared == 0.0 or current.length_squared == 0.0:
+            if source.length_squared != current.length_squared:
+                return False
+            continue
+        if source.normalized().dot(current.normalized()) < minimum_alignment:
+            return False
+    return True
 
 
 def unique_shape_key_name(obj, requested):
@@ -1014,28 +1088,45 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
     for armature in armatures_by_hierarchy.values():
         armature.data["eiem_source_bindings_json"] = json.dumps(shared_skin_bindings(armature), separators=(",", ":"))
     if include_physics:
-        files = [Path(physics_file)] if physics_file else [safe_path(root, values["path"]) for section, values in resources.items()
-                 if section.lower().startswith("physics") and values.get("path")]
-        if not files:
+        physics_resources = [
+            (section, safe_path(root, values["path"]))
+            for section, values in resources.items()
+            if section.lower().startswith("physics") and values.get("path")
+        ]
+        if physics_file:
+            physics_resources = [("", Path(physics_file))]
+        if not physics_resources:
             candidate = Path(root) / "physics" / "components.json"
-            if candidate.is_file(): files = [candidate]
-        if not files:
+            if candidate.is_file():
+                physics_resources = [("", candidate)]
+        if not physics_resources:
             raise ValueError("资源包未包含物理文件，请指定解包的 components.json 或 .physics")
+        physics_rigs = {}
+        for section, values in resources.items():
+            if not section.lower().startswith("render"):
+                continue
+            physics_section = values.get("physics", "")
+            skeleton = skeletons.get(values.get("skeleton", ""))
+            if not physics_section or skeleton is None:
+                continue
+            previous = physics_rigs.get(physics_section)
+            if previous is not None and previous is not skeleton:
+                raise ValueError("Physics %s 被多个不同 Skeleton 引用" % physics_section)
+            physics_rigs[physics_section] = skeleton
         rigs = list(armatures_by_hierarchy.values())
-        if len(rigs) != 1:
-            raise ValueError("物理导入需要明确的共享 Rig；请选中目标 Rig 后使用导入源物理")
-        for file in files:
-            if file.suffix.lower() == ".physics": physics_authoring.import_physics(file, rigs[0])
-            else: physics_authoring.native.import_source(file, rigs[0])
+        for section, file in physics_resources:
+            rig = physics_rigs.get(section)
+            if rig is None:
+                if len(rigs) != 1:
+                    raise ValueError(
+                        "无法从 Render.physics 确定 %s 使用的 Skeleton" %
+                        (section or Path(file).name))
+                rig = rigs[0]
+            if file.suffix.lower() == ".physics":
+                physics_authoring.import_physics(file, rig)
+            else:
+                physics_authoring.native.import_source(file, rig)
     return len(meshes)
-
-
-def parse_json_property(owner, name, default):
-    try:
-        value = json.loads(owner.get(name, json.dumps(default)))
-        return value
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return default
 
 
 def export_corner_map(mesh, channels):
@@ -1106,7 +1197,7 @@ def mesh_export_colors(mesh):
     return attribute.domain, values
 
 
-def mesh_export_tangents(mesh):
+def mesh_export_tangents(mesh, source_normals, normal_corners, preserve_normals):
     """Retain usable authored frames; generate only missing frames from UV0.
 
     Authored point signs are stored in the source coordinate convention by
@@ -1133,8 +1224,28 @@ def mesh_export_tangents(mesh):
         return (all(math.isfinite(x) for x in value)
                 and any(x != 0 for x in value[:3]) and value[3] in (-1, 1))
 
-    valid = [usable(value) for value in points] if points else [False] * len(mesh.vertices)
-    missing = [loop.index for loop in mesh.loops if not valid[loop.vertex_index]]
+    def export_normal(loop):
+        value = (source_normals[loop.vertex_index] if preserve_normals
+                 else normal_corners[loop.index])
+        return Vector(value)
+
+    def matches_normal(value, loop):
+        if not usable(value):
+            return False
+        normal = export_normal(loop)
+        tangent = Vector(value[:3])
+        if normal.length_squared == 0.0 or tangent.length_squared == 0.0:
+            return False
+        # A tangent frame is meaningful only relative to the normal that will
+        # actually be serialized. Joined meshes can retain a non-zero source
+        # tangent while their final custom normal has changed.
+        cosine = abs(normal.dot(tangent)) / (normal.length * tangent.length)
+        return cosine <= 2.0e-3
+
+    point_valid = [usable(value) for value in points] if points else [False] * len(mesh.vertices)
+    missing = [loop.index for loop in mesh.loops
+               if not point_valid[loop.vertex_index]
+               or not matches_normal(points[loop.vertex_index], loop)]
     if not missing:
         return points, []
     if mesh.uv_layers.get("UV0") is None:
@@ -1154,17 +1265,31 @@ def mesh_export_tangents(mesh):
         generated = [(*loop.tangent, loop.bitangent_sign * handedness) for loop in work.loops]
     finally:
         bpy.data.meshes.remove(work)
-    for loop in missing:
-        if not usable(generated[loop]):
+    for loop_index in missing:
+        loop = mesh.loops[loop_index]
+        value = generated[loop_index]
+        if not usable(value):
             raise ValueError("%s corner %d cannot generate a usable tangent; check UV0 and normals" %
-                             (mesh.name, loop))
+                             (mesh.name, loop_index))
+        normal = export_normal(loop)
+        tangent = Vector(value[:3])
+        # calc_tangents uses Blender's evaluated normals. Orthogonalize against
+        # the exact normal selected for export in case a lossless source-normal
+        # backup differs slightly from Blender's encoded custom-normal result.
+        tangent -= normal * (tangent.dot(normal) / normal.length_squared)
+        if tangent.length_squared == 0.0:
+            raise ValueError("%s corner %d tangent is parallel to its exported normal" %
+                             (mesh.name, loop_index))
+        tangent.normalize()
+        generated[loop_index] = (*tangent, value[3])
     # Unreferenced loose vertices have no face/UV derivative. Keep valid source
     # data there, or a zero sentinel rather than inventing a direction.
-    points = [points[i] if valid[i] else (0., 0., 0., 0.) for i in range(len(mesh.vertices))]
-    corners = [points[loop.vertex_index] if valid[loop.vertex_index] else generated[loop.index]
+    points = [points[i] if point_valid[i] else (0., 0., 0., 0.) for i in range(len(mesh.vertices))]
+    missing_set = set(missing)
+    corners = [generated[loop.index] if loop.index in missing_set else points[loop.vertex_index]
                for loop in mesh.loops]
-    print("[EIEM] %s: tangents retained on %d vertices; generated %d corners from UV0" %
-          (mesh.name, sum(valid), len(missing)))
+    print("[EIEM] %s: tangents retained on %d corners; generated %d corners from UV0" %
+          (mesh.name, len(mesh.loops) - len(missing), len(missing)))
     return points, corners
 
 
@@ -1386,12 +1511,14 @@ def write_mesh(path, obj):
     # evaluated state instead of silently falling back to that backup.
     source_normals = get_point_attribute(mesh, "EIEM_SourceNormal", "vector")
     baseline_crc = str(mesh.get("eiem_normal_baseline_crc", ""))
-    preserve_normals = (source_normals is not None
-                        and baseline_crc and normal_state_crc(mesh) == baseline_crc)
+    preserve_normals = (source_normals is not None and baseline_crc and
+                        (normal_state_crc(mesh) == baseline_crc or
+                         normal_state_matches_source(mesh, source_normals)))
     normal_corners = [] if preserve_normals else [tuple(c.vector) for c in mesh.corner_normals]
     uv_channels = mesh_export_uv_channels(mesh)
     color_domain, color_values = mesh_export_colors(mesh)
-    tangent_points, tangent_corners = mesh_export_tangents(mesh)
+    tangent_points, tangent_corners = mesh_export_tangents(
+        mesh, source_normals, normal_corners, preserve_normals)
     corner_channels = [channel[1] for channel in uv_channels if channel is not None]
     if not preserve_normals:
         corner_channels.append(normal_corners)
@@ -1621,10 +1748,15 @@ def image_absolute_path(image):
     return str(Path(bpy.path.abspath(image.filepath, library=image.library)).resolve())
 
 
-def unique_texture_section(path, images_by_section):
+def texture_section_base(path):
+    """Return a stable INI section name without doubling a Texture prefix."""
     fragment = re.sub(r"[^A-Za-z0-9_]", "_", Path(path).stem).strip("_") or "External"
     fragment = fragment[:1].upper() + fragment[1:]
-    base = "Texture" + fragment
+    return fragment if fragment.lower().startswith("texture") else "Texture" + fragment
+
+
+def unique_texture_section(path, images_by_section):
+    base = texture_section_base(path)
     used = {str(section).lower() for section in images_by_section}
     candidate = base
     serial = 2
@@ -1634,13 +1766,84 @@ def unique_texture_section(path, images_by_section):
     return candidate
 
 
+def file_content_digest(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.digest()
+
+
+def texture_images_equal(first, second):
+    """Compare two unedited image resources by their actual source bytes."""
+    if first is None or second is None:
+        return False
+    if first is second:
+        return not first.is_dirty
+    if first.is_dirty or second.is_dirty:
+        return False
+    first_path = image_absolute_path(first)
+    second_path = image_absolute_path(second)
+    if first_path and second_path:
+        first_file, second_file = Path(first_path), Path(second_path)
+        if first_file.is_file() and second_file.is_file():
+            if os.path.normcase(str(first_file)) == os.path.normcase(str(second_file)):
+                return True
+            if first_file.stat().st_size != second_file.stat().st_size:
+                return False
+            return file_content_digest(first_file) == file_content_digest(second_file)
+    first_source = str(first.get("eiem_source", "") or first.get("eiem_target_path", "")).strip()
+    second_source = str(second.get("eiem_source", "") or second.get("eiem_target_path", "")).strip()
+    return bool(first_source and first_source.lower() == second_source.lower())
+
+
+def canonical_texture_section(image, images_by_section):
+    """Collapse import-only section suffixes while retaining distinct images."""
+    path = image_absolute_path(image)
+    identity = path or str(image.get("eiem_name", image.name))
+    preferred = texture_section_base(identity)
+    owner = images_by_section.get(preferred)
+    if owner is None or owner is image:
+        images_by_section[preferred] = image
+        return preferred
+    if texture_images_equal(owner, image):
+        return preferred
+    current = str(image.get("eiem_section", "")).strip()
+    return current or unique_texture_section(identity, images_by_section)
+
+
+def texture_output_filename(image):
+    """Keep the user's source stem; Texture section prefixes are not filenames."""
+    path = image_absolute_path(image)
+    source_name = Path(path).name if path else str(image.get("eiem_name", image.name))
+    stem = Path(source_name).stem
+    if not stem:
+        raise ValueError("Texture image has no usable filename: " + image.name)
+    return stem + ".png"
+
+
+def texture_property_uses_linear_data(property_name):
+    """Return whether a shader property stores vector data rather than colour."""
+    name = str(property_name).lower()
+    return "bump" in name or "normal" in name
+
+
+def native_texture_family(section):
+    """Ignore package-local numeric IDs on an extracted game Texture section."""
+    text = str(section).strip().lower()
+    if not text.startswith("texturet_"):
+        return ""
+    return re.sub(r"_+\d+$", "", text)
+
+
 def resolve_material_texture(material, property_name, value, images_by_section,
                              original_bindings):
     """Resolve a Blender-facing image path to an exported Texture section."""
     value = str(value).strip()
     if value in images_by_section:
-        original_bindings[property_name] = value
-        return value
+        section = canonical_texture_section(images_by_section[value], images_by_section)
+        original_bindings[property_name] = section
+        return section
 
     requested = Path(bpy.path.abspath(os.path.expandvars(value))).resolve()
     if not requested.is_file():
@@ -1649,22 +1852,25 @@ def resolve_material_texture(material, property_name, value, images_by_section,
             (material.name, property_name, requested))
 
     requested_key = os.path.normcase(str(requested))
-    for section, image in images_by_section.items():
+    for section, image in list(images_by_section.items()):
         existing = image_absolute_path(image)
         if existing and os.path.normcase(existing) == requested_key:
+            section = canonical_texture_section(image, images_by_section)
             original_bindings[property_name] = section
             return section
 
     image = bpy.data.images.load(str(requested), check_existing=True)
     existing_section = image.get("eiem_section", "")
     if existing_section and existing_section in images_by_section:
-        original_bindings[property_name] = existing_section
-        return existing_section
+        section = canonical_texture_section(image, images_by_section)
+        original_bindings[property_name] = section
+        return section
 
     section = unique_texture_section(requested, images_by_section)
     template = images_by_section.get(original_bindings.get(property_name, ""))
     defaults = {
-        "eiem_linear": "false", "eiem_mipmaps": "true",
+        "eiem_linear": "true" if texture_property_uses_linear_data(property_name) else "false",
+        "eiem_mipmaps": "true",
         "eiem_filter": "1", "eiem_wrap": "0", "eiem_aniso": "1",
         "eiem_mip_bias": "0",
     }
@@ -1675,7 +1881,11 @@ def resolve_material_texture(material, property_name, value, images_by_section,
     image["eiem_target_path"] = ""
     image["eiem_target_asset"] = ""
     for key, default in defaults.items():
-        image[key] = template.get(key, default) if template else default
+        # Imported legacy packages did not record Texture2D.linear.  In
+        # particular they report a native bump map as false by default, which
+        # must not make a newly assigned normal map use sRGB sampling.
+        image[key] = (default if key == "eiem_linear" else
+                      template.get(key, default) if template else default)
     images_by_section[section] = image
     original_bindings[property_name] = section
     return section
@@ -1731,6 +1941,10 @@ def material_override_payload(material, images_by_section, force=False):
 
     has_baseline = "eiem_baseline_json" in material
     baseline = parse_json_property(material, "eiem_baseline_json", {})
+    source_snapshot = any(
+        key.startswith(("float.", "value4.", "color.", "int.", "keyword."))
+        for key in baseline
+    )
     texture_bindings = parse_json_property(
         material, "eiem_texture_sections_json", {})
     reserved = {
@@ -1749,13 +1963,41 @@ def material_override_payload(material, images_by_section, force=False):
         if property_name.startswith("texture."):
             if value == str(baseline.get(property_name, "")) and value.replace("\\", "/").lower().startswith("assets/"):
                 continue  # unchanged game logical texture: inherited from the cloned source
+            original = str(baseline.get(property_name, "") if has_baseline else
+                           texture_bindings.get(property_name, ""))
+            # Capture the baseline owner before canonicalization adds an alias
+            # for a legacy section such as TextureTextureBody -> TextureBody.
+            # A missing owner means the local file is an authored override,
+            # even when its preferred section spelling equals the old string.
+            original_image = images_by_section.get(original)
             value = resolve_material_texture(
                 material, property_name, value, images_by_section,
                 texture_bindings)
-            original = str(baseline.get(property_name, "") if has_baseline else
-                           texture_bindings.get(property_name, ""))
-            changed = value != original
+            current_image = images_by_section.get(value)
+            import_alias = (
+                source_snapshot and original.lower().startswith(value.lower()) and
+                original[len(value):].isdigit()
+            )
+            original_family = native_texture_family(original)
+            if (source_snapshot and original_family and
+                    original_family == native_texture_family(value)):
+                import_alias = True
+            changed = bool(current_image is not None and current_image.is_dirty)
+            if not changed:
+                if not source_snapshot:
+                    # Short/legacy material files are authored deltas even if
+                    # they predate overrides=true. Their explicit textures
+                    # must survive another export.
+                    changed = True
+                elif original_image is not None:
+                    changed = value != original and not texture_images_equal(
+                        current_image, original_image)
+                else:
+                    changed = value != original and not import_alias
             if changed:
+                if (current_image is not None and
+                        texture_property_uses_linear_data(property_name)):
+                    current_image["eiem_linear"] = "true"
                 referenced_images.add(value)
         else:
             # Version 0.3.x scenes do not carry a baseline. Preserve their
@@ -1786,253 +2028,6 @@ def material_override_payload(material, images_by_section, force=False):
     return values, referenced_images
 
 
-def switch_groups(scene=None):
-    scene = scene or bpy.context.scene
-    return sorted((c for c in scene.collection.children_recursive
-                   if c.get("eiem_switch_group")), key=lambda c: c.name)
-
-
-def author_identity(owner, peers):
-    """Stable .blend identity; data copies become independent without user IDs."""
-    identity = str(owner.get("eiem_control_id", ""))
-    if not re.fullmatch(r"[0-9a-f]{16}", identity):
-        identity = uuid.uuid4().hex[:16]
-        owner["eiem_control_id"] = identity
-        owner["eiem_control_owner"] = owner.name
-    duplicates = [p for p in peers if p.get("eiem_control_id") == identity]
-    if len(duplicates) > 1:
-        original = next((p for p in duplicates if p.name == p.get("eiem_control_owner")),
-                        sorted(duplicates, key=lambda p: p.name)[0])
-        for peer in duplicates:
-            if peer != original:
-                peer["eiem_control_id"] = uuid.uuid4().hex[:16]
-            peer["eiem_control_owner"] = peer.name
-    owner["eiem_control_owner"] = owner.name
-    return owner["eiem_control_id"]
-
-
-def switch_state_values(group):
-    states = switch_states(group)
-    counter = max(int(group.get("eiem_next_state", 0)),
-                  max((int(s.get("eiem_state_value", -1)) + 1 for s in states), default=0))
-    used = set()
-    for state in states:
-        value = int(state.get("eiem_state_value", -1))
-        if value < 0 or value in used:
-            value = counter
-            counter += 1
-            state["eiem_state_value"] = value
-        used.add(value)
-    group["eiem_next_state"] = counter
-    return [int(s["eiem_state_value"]) for s in states]
-
-
-def switch_states(group):
-    return [c for c in group.children if c.get("eiem_switch_state")]
-
-
-def switch_meshes(state):
-    return [obj for obj in state.all_objects if obj.type == "MESH"]
-
-
-def validate_switch_key(value):
-    """Same finite key vocabulary as eiem_keys.h; not Blender key events."""
-    parts = [part.strip().upper() for part in str(value).split("+")]
-    modifiers = parts[:-1]
-    if (not parts or any(p not in {"CTRL", "SHIFT", "ALT"} for p in modifiers)
-            or len(set(modifiers)) != len(modifiers)):
-        raise ValueError("快捷键无效：" + str(value))
-    key = parts[-1]
-    names = {"INSERT", "DELETE", "HOME", "END", "PAGEUP", "PAGEDOWN",
-             "LEFT", "RIGHT", "UP", "DOWN", "SPACE", "ENTER", "ESC",
-             "TAB", "BACKSPACE", "CAPSLOCK", "TILDE"}
-    if not (re.fullmatch(r"[A-Z0-9]", key) or key in names or
-            re.fullmatch(r"F(?:[1-9]|1[0-9]|2[0-4])", key)):
-        raise ValueError("快捷键无效：" + str(value))
-    return "+".join([m for m in ("CTRL", "SHIFT", "ALT") if m in modifiers] + [key])
-
-
-def switch_key_from_event(event):
-    """Translate one Blender keyboard press into the runtime INI vocabulary."""
-    if getattr(event, "value", "") != "PRESS":
-        raise ValueError("请按下一个键")
-    event_type = str(getattr(event, "type", "")).upper()
-    aliases = {
-        "ZERO": "0", "ONE": "1", "TWO": "2", "THREE": "3", "FOUR": "4",
-        "FIVE": "5", "SIX": "6", "SEVEN": "7", "EIGHT": "8", "NINE": "9",
-        "DEL": "DELETE", "RET": "ENTER", "NUMPAD_ENTER": "ENTER",
-        "LEFT_ARROW": "LEFT", "RIGHT_ARROW": "RIGHT",
-        "UP_ARROW": "UP", "DOWN_ARROW": "DOWN",
-        "PAGE_UP": "PAGEUP", "PAGE_DOWN": "PAGEDOWN",
-        "BACK_SPACE": "BACKSPACE", "CAPS_LOCK": "CAPSLOCK",
-        "ACCENT_GRAVE": "TILDE",
-    }
-    key = aliases.get(event_type, event_type)
-    modifiers = []
-    if bool(getattr(event, "ctrl", False)): modifiers.append("CTRL")
-    if bool(getattr(event, "shift", False)): modifiers.append("SHIFT")
-    if bool(getattr(event, "alt", False)): modifiers.append("ALT")
-    return validate_switch_key("+".join(modifiers + [key]))
-
-
-def set_switch_group_key(group, key, scene=None):
-    scene = scene or bpy.context.scene
-    key = validate_switch_key(key)
-    if any(candidate != group and validate_switch_key(candidate.get("eiem_key", "")) == key
-           for candidate in switch_groups(scene)):
-        raise ValueError("已有切换组使用快捷键 " + key)
-    group["eiem_key"] = key
-    return key
-
-
-def add_switch_state(group, name):
-    state = bpy.data.collections.new(name)
-    group.children.link(state)
-    state["eiem_switch_state"] = True
-    state["eiem_default"] = len(switch_states(group)) == 1
-    return state
-
-
-def set_switch_default(group, state):
-    for candidate in switch_states(group):
-        candidate["eiem_default"] = candidate == state
-
-
-def restore_switch_preview(objects=None, context=None):
-    context = context or bpy.context
-    for obj in objects if objects is not None else context.scene.objects:
-        saved = parse_json_property(obj, "eiem_preview_json", {})
-        previous = saved.pop(context.view_layer.name, None)
-        if previous is not None:
-            obj.hide_set(previous, view_layer=context.view_layer)
-            if saved:
-                obj["eiem_preview_json"] = json.dumps(saved)
-            else:
-                del obj["eiem_preview_json"]
-
-
-def preview_switch(group, state, context=None):
-    context = context or bpy.context
-    for candidate in switch_states(group):
-        for obj in switch_meshes(candidate):
-            if obj.name not in context.view_layer.objects:
-                continue
-            saved = parse_json_property(obj, "eiem_preview_json", {})
-            saved.setdefault(context.view_layer.name, obj.hide_get(view_layer=context.view_layer))
-            obj["eiem_preview_json"] = json.dumps(saved)
-            obj.hide_set(candidate != state, view_layer=context.view_layer)
-
-
-def assign_switch_meshes(state, objects, scene=None):
-    scene = scene or bpy.context.scene
-    objects = list(objects)
-    if not objects or any(obj.type != "MESH" or not obj.data.get("eiem_section") for obj in objects):
-        raise ValueError("请在物体模式选择已绑定 EIEM 源资源的网格")
-    restore_switch_preview(objects)
-    for obj in objects:
-        for group in switch_groups(scene):
-            for previous in switch_states(group):
-                if obj.name in previous.objects:
-                    previous.objects.unlink(obj)
-        if state is not None and obj.name not in state.objects:
-            state.objects.link(obj)
-        if not obj.users_collection:
-            scene.collection.objects.link(obj)
-
-
-def create_switch_group(name, key, objects, scene=None):
-    scene = scene or bpy.context.scene
-    objects = list(objects)
-    key = validate_switch_key(key)
-    if not objects or any(obj.type != "MESH" or not obj.data.get("eiem_section") for obj in objects):
-        raise ValueError("请先选择 EIEM 网格部件")
-    if any(validate_switch_key(g.get("eiem_key", "")) == key for g in switch_groups(scene)):
-        raise ValueError("已有切换组使用快捷键 " + key)
-    root = next((c for c in scene.collection.children if c.get("eiem_switch_root")), None)
-    if root is None:
-        root = bpy.data.collections.new("EIEM 切换")
-        root["eiem_switch_root"] = True
-        scene.collection.children.link(root)
-    group = bpy.data.collections.new(name or "切换组")
-    group["eiem_switch_group"] = True
-    group["eiem_key"] = key
-    root.children.link(group)
-    shown = add_switch_state(group, "显示")
-    add_switch_state(group, "隐藏")
-    assign_switch_meshes(shown, objects, scene)
-    scene.eiem_switch_active = group
-    return group
-
-
-def mesh_source_identity(obj):
-    asset = str(obj.get("eiem_render_asset", "") or obj.data.get(
-        "eiem_target_asset", obj.data.get("eiem_asset", ""))).strip()
-    source = str(obj.data.get("eiem_target_path", "") or obj.data.get("eiem_source", ""))
-    package = str(obj.get("eiem_author_package", ""))
-    return package.replace("\\", "/").lower(), source.replace("\\", "/").lower(), asset.lower()
-
-
-def plan_switch_export(mesh_objects, scene=None):
-    """Plan exactly the selected objects; visibility is an explicit action."""
-    scene = scene or bpy.context.scene
-    selected = set(mesh_objects)
-    if not selected:
-        raise ValueError("No EIEM mesh objects selected")
-    if any(o.type != "MESH" or not o.data.get("eiem_section") for o in selected):
-        raise ValueError("所选包含未绑定 EIEM 的网格")
-    sources = {o: mesh_source_identity(o) for o in selected}
-    hidden = {o for o in selected if o.hide_render}
-    for obj in selected:
-        if not sources[obj][2]:
-            raise ValueError("网格 %s 缺少原 Mesh 命中名称" % obj.name)
-    groups = switch_groups(scene)
-    members = {}
-    for group in groups:
-        for state in switch_states(group):
-            for obj in switch_meshes(state):
-                if obj in selected and obj not in hidden:
-                    members.setdefault(obj, []).append((group, state))
-    used_groups = {g for bindings in members.values() for g, state in bindings}
-    group_defs, bindings, keys = [], {}, set()
-    for group in groups:
-        if group not in used_groups:
-            continue
-        states = switch_states(group)
-        if len(states) < 2:
-            raise ValueError("切换组 %s 至少需要两个状态（允许空状态）" % group.name)
-        defaults = [i for i, state in enumerate(states) if state.get("eiem_default")]
-        if len(defaults) != 1:
-            raise ValueError("请为切换组 %s 指定一个初始状态" % group.name)
-        key = validate_switch_key(group.get("eiem_key", ""))
-        if key in keys:
-            raise ValueError("导出的多个切换组使用同一快捷键：" + key)
-        keys.add(key)
-        variable = "$switch_" + author_identity(group, bpy.data.collections)
-        state_values = switch_state_values(group)
-        group_defs.append((group, states, state_values[defaults[0]], key, variable))
-        for index, state in enumerate(states):
-            for obj in switch_meshes(state):
-                if obj not in members:
-                    continue
-                if len(members[obj]) != 1:
-                    raise ValueError("网格 %s 同时属于多个切换状态" % obj.name)
-                bindings[obj] = (variable, state_values[index])
-    grouped = {}
-    selectors = {}
-    for obj in sorted(selected, key=lambda o: (sources[o], o.name)):
-        identity = sources[obj]
-        if identity[2] in selectors and selectors[identity[2]] != identity:
-            raise ValueError("同名 Mesh 来自不同源资源/作者包，不能安全合并：" + identity[2])
-        selectors[identity[2]] = identity
-        grouped.setdefault(identity, []).append(obj)
-    for objects in grouped.values():
-        if sum(o not in hidden for o in objects) > 16:
-            raise ValueError("源 Mesh %s 超过运行时 16 个 partner 的上限" % objects[0].name)
-    return {"objects": [o for objects in grouped.values() for o in objects],
-            "sources": list(grouped.values()), "groups": group_defs,
-            "bindings": bindings, "hidden": hidden}
-
-
 def unique_export_section(requested, used, prefix):
     name = re.sub(r"[^a-zA-Z0-9_]", "_", str(requested))
     if not name.lower().startswith(prefix.lower()):
@@ -2047,11 +2042,12 @@ def unique_export_section(requested, used, prefix):
 
 
 def package_physics_dependencies(plan, armatures, physics_objects):
-    """Validate selected runtime Physics and return its explicit dependencies.
+    """Resolve authored Physics used by the selected Mesh dependency closure.
 
-    A selected author group applies to every selected Render action whose Mesh uses
-    the same shared Rig. The Rig is part of that resource closure, so selecting
-    the group adds it to the package without requiring a third manual selection.
+    Explicitly selected groups remain supported. In addition, a group is inferred
+    when a selected visible Mesh has positive vertex weights on one of its nodes.
+    This keeps Mesh-only export optional while preventing a physical Mesh export
+    from silently dropping the Physics resource that drives those bones.
     """
     result_armatures = []
     seen_armatures = set()
@@ -2072,12 +2068,37 @@ def package_physics_dependencies(plan, armatures, physics_objects):
         if identity in seen_groups:
             continue
         seen_groups.add(identity)
-        if len(obj.eiem_physics.colliders):
-            raise ValueError("当前游戏运行时尚未接入物理碰撞体；请先取消这些碰撞体引用")
         groups.append(obj)
 
     visible_meshes = [obj for obj in plan["objects"] if obj not in plan["hidden"]]
     visible_rigs = {obj.find_armature() for obj in visible_meshes if obj.find_armature()}
+    weighted_bones_by_rig = {}
+    for obj in visible_meshes:
+        rig = obj.find_armature()
+        if not rig:
+            continue
+        names_by_index = {group.index: group.name for group in obj.vertex_groups}
+        weighted = weighted_bones_by_rig.setdefault(rig, set())
+        for vertex in obj.data.vertices:
+            for membership in vertex.groups:
+                if membership.weight > 1e-8 and membership.group in names_by_index:
+                    weighted.add(names_by_index[membership.group])
+
+    for obj in bpy.data.objects:
+        if not hasattr(obj, "eiem_physics") or obj.eiem_physics.kind != "GROUP":
+            continue
+        rig = obj.eiem_physics.rig
+        if rig not in visible_rigs or obj.as_pointer() in seen_groups:
+            continue
+        node_ids = {node.bone_id for node in obj.eiem_physics.nodes}
+        node_names = {
+            bone.name for bone in rig.data.bones
+            if str(bone.get("eiem_physics_id", "")) in node_ids
+        }
+        if node_names & weighted_bones_by_rig.get(rig, set()):
+            seen_groups.add(obj.as_pointer())
+            groups.append(obj)
+
     by_rig = {}
     for group in groups:
         rig = group.eiem_physics.rig
@@ -2135,101 +2156,6 @@ def export_package(root, mesh_objects=None, armatures=None, physics_objects=None
         return stats
 
 
-def plan_shape_controls(objects):
-    declarations = []
-    bindings = {}
-    shared = {}
-    for obj in objects:
-        identity = obj.data.as_pointer()
-        if identity not in shared:
-            sync_new_shape_controls(obj)
-            mesh_id = author_identity(obj.data, bpy.data.meshes)
-            actions = []
-            used = set()
-            for control in obj.data.eiem_shape_controls:
-                if not control.enabled:
-                    continue
-                keys = obj.data.shape_keys
-                key = keys.key_blocks.get(control.shape) if keys else None
-                if key is None or key == keys.reference_key or key.name in used:
-                    raise ValueError("%s 的形态键控制缺失、重复或指向 Basis：%s" % (obj.name, control.shape))
-                used.add(key.name)
-                # Imported multi-frame channels map Blender keys to one Unity channel.
-                # V1 controls one-frame channels only; do not invent a different name.
-                channel_name = key.name
-                for channel in parse_json_property(obj.data, "eiem_blend_shapes_json", []):
-                    if any(frame.get("key") == key.name for frame in channel.get("frames", [])):
-                        if len(channel["frames"]) != 1:
-                            raise ValueError("多帧形态键暂不支持生成滑条：" + key.name)
-                        channel_name = channel["name"]
-                if (not channel_name.strip() or channel_name != channel_name.strip() or
-                        any(c in channel_name for c in "=\r\n") or len(channel_name.encode("utf-8")) >= 192):
-                    raise ValueError("形态键名称不能包含换行/等号/首尾空格，UTF-8 长度须小于 192：" + channel_name)
-                values = ((key.value, key.slider_min, key.slider_max) if control.automatic else
-                          (control.default, control.minimum, control.maximum))
-                if (not all(math.isfinite(v) for v in values) or not control.minimum < control.maximum or
-                        not control.minimum <= control.default <= control.maximum):
-                    raise ValueError("形态键滑条的默认值或范围无效：" + key.name)
-                if not control.identity:
-                    control.identity = uuid.uuid4().hex[:16]
-                variable = "$shape_%s_%s" % (mesh_id, control.identity)
-                label = (control.label or key.name).replace("\r", " ").replace("\n", " ")
-                declarations.append((variable, label, *values))
-                actions.append("shape.%s=%s" % (channel_name, variable))
-            shared[identity] = actions
-        bindings[obj] = shared[identity]
-    return declarations, bindings
-
-
-def lua_string(value):
-    # Lua decimal escapes preserve control characters without JSON unicode escapes.
-    return '"' + ''.join(('\\%03d' % ord(c) if ord(c) < 32 else
-                          '\\' + c if c in {'"', '\\'} else c)
-                         for c in str(value)) + '"'
-
-
-def generate_mod_ui(groups, shape_controls, scene=None):
-    scene = scene or bpy.context.scene
-    key = validate_switch_key(scene.eiem_ui_key) if scene.eiem_ui_key.strip() else ""
-    if key.split('+')[-1] == 'INSERT':
-        raise ValueError("Mod UI 不使用 INSERT，请修改 UI 开关键")
-    if any(key == group[3] for group in groups):
-        raise ValueError("Mod UI 开关键与切换组按键重复，请修改 UI 开关键")
-    lines = ["-- Optional Blender template. All window behavior belongs to this Lua file.",
-             "return function()"]
-    if key:
-        lines.append('  if mod.get("$ui_open") == 0 then return end')
-    lines.append("  imgui.SetNextWindowSize(360, 0, imgui.Cond.FirstUseEver)")
-    if key:
-        lines.extend([
-            "  local visible, open = imgui.Begin(%s, true)" % lua_string(scene.eiem_ui_title),
-            '  if not open then mod.set("$ui_open", 0) end', "  if visible then"])
-    else:
-        lines.append("  if imgui.Begin(%s) then" % lua_string(scene.eiem_ui_title))
-    for group, states, default, group_key, variable in groups:
-        lines.append("    imgui.Text(%s)" % lua_string(group.name))
-        for value, state in zip(switch_state_values(group), states):
-            lines.extend([
-                "    if imgui.RadioButton(%s, mod.get(%s) == %d) then" % (
-                    lua_string(state.name + "##" + variable + str(value)), lua_string(variable), value),
-                "      mod.set(%s, %d)" % (lua_string(variable), value), "    end"])
-        lines.append("    imgui.Separator()")
-    for variable, label, default, minimum, maximum in shape_controls:
-        lines.extend([
-            "    do",
-            "      local changed, value = imgui.SliderFloat(%s, mod.get(%s), %.9g, %.9g)" % (
-                lua_string(label + "##" + variable), lua_string(variable), minimum, maximum),
-            "      if changed then mod.set(%s, value) end" % lua_string(variable), "    end"])
-    variables = [g[4] for g in groups] + [c[0] for c in shape_controls]
-    if variables:
-        lines.append('    if imgui.Button("恢复默认值") then')
-        for variable in variables:
-            lines.append("      mod.set(%s, mod.default(%s))" % (lua_string(variable), lua_string(variable)))
-        lines.append("    end")
-    lines.extend(["  end", "  imgui.End()", "end", ""])
-    return key, '\n'.join(lines)
-
-
 def write_export_package(root, plan, armatures, physics_objects=None):
     # A hidden selection declares skip only: its geometry, materials, textures
     # and shape controls must not become resource dependencies.
@@ -2280,8 +2206,15 @@ def write_export_package(root, plan, armatures, physics_objects=None):
     render_lines = []
     seen_render_sections = set()
     object_actions = {}
-    shape_controls, shape_bindings = plan_shape_controls(mesh_objects)
-    ui_payload = generate_mod_ui(plan["groups"], shape_controls) if bpy.context.scene.eiem_ui_template else None
+    shape_controls, shape_bindings, shape_hotkeys = plan_shape_controls(mesh_objects)
+    used_hotkeys = {group[3] for group in plan["groups"]}
+    for control in shape_hotkeys:
+        if control["key"] in used_hotkeys:
+            raise ValueError("多个控制使用同一快捷键：" + control["key"])
+        used_hotkeys.add(control["key"])
+    ui_payload = generate_mod_ui(
+        plan["groups"], shape_controls, shape_hotkeys
+    ) if bpy.context.scene.eiem_ui_template else None
     if plan["groups"] or shape_controls or ui_payload:
         resource_lines.append("[Constants]")
         if ui_payload and ui_payload[0]:
@@ -2292,10 +2225,21 @@ def write_export_package(root, plan, armatures, physics_objects=None):
             resource_lines.append("persist %s=%.9g" % (variable, default))
         resource_lines.append("")
         for index, (group, states, default, key, variable) in enumerate(plan["groups"], 1):
-            resource_lines.extend([
+            key_lines = [
                 "; " + group.name.replace("\n", " ").replace("\r", " "),
                 "[KeySwitch%d]" % index, "key=" + key, "type=cycle",
-                variable + "=" + ",".join(str(i) for i in switch_state_values(group)), "",
+                variable + "=" + ",".join(str(i) for i in switch_state_values(group)),
+            ]
+            resource_lines.extend(key_lines + [""])
+        for index, control in enumerate(shape_hotkeys, 1):
+            resource_lines.extend([
+                "; " + control["label"].replace("\n", " ").replace("\r", " "),
+                "[KeyShape%d]" % index,
+                "key=" + control["key"],
+                "type=cycle",
+                control["variable"] + "=" + ",".join(
+                    "%.9g" % value for value in control["values"]),
+                "",
             ])
         if ui_payload:
             ui_key, ui_source = ui_payload
@@ -2340,11 +2284,6 @@ def write_export_package(root, plan, armatures, physics_objects=None):
         directory = root / "physics" / section
         filename = "physics/" + section + "/" + section + ".physics"
         payload = physics_authoring.author_document(groups, "skeleton.skeleton")
-        # Native v2 and collider data remain valid authoring inputs, but the
-        # production adapter currently executes author bone groups without
-        # colliders. Keep that runtime boundary explicit in generated Mods.
-        if payload["colliders"]:
-            raise ValueError("当前游戏运行时尚未接入物理碰撞体；请先取消这些碰撞体引用")
         directory.mkdir(parents=True, exist_ok=True)
         (root / filename).write_bytes(
             physics_authoring.document.encode(payload))
@@ -2414,8 +2353,12 @@ def write_export_package(root, plan, armatures, physics_objects=None):
             partner = unique_export_section(root_render + "Part%d" % slot, seen_render_sections, "Render")
             binding = plan["bindings"].get(obj)
             if binding:
-                render_lines.extend(["if %s == %d" % binding,
-                                     "    partner.%d=%s" % (slot, partner), "endif"])
+                variable, values = binding
+                if values:
+                    condition = " || ".join("%s == %d" % (variable, value)
+                                            for value in values)
+                    render_lines.extend(["if " + condition,
+                                         "    partner.%d=%s" % (slot, partner), "endif"])
             else:
                 render_lines.append("partner.%d=%s" % (slot, partner))
             templates.extend(["[" + partner + "]"] + object_actions[obj] + [""])
@@ -2439,12 +2382,20 @@ def write_export_package(root, plan, armatures, physics_objects=None):
 
     if referenced_images:
         (root / "textures").mkdir(exist_ok=True)
+    output_textures = {}
     for section in sorted(referenced_images):
         image = images_by_section.get(section)
         if image is None:
             raise ValueError("Material references missing Texture section " + section)
-        filename = "textures/" + section + ".png"
-        write_texture(root / filename, image)
+        disk_name = texture_output_filename(image)
+        filename = "textures/" + disk_name
+        collision = output_textures.get(disk_name.lower())
+        if collision is not None and collision is not image and not texture_images_equal(collision, image):
+            raise ValueError(
+                "Two modified textures use the same filename with different content: " + disk_name)
+        if collision is None:
+            write_texture(root / filename, image)
+            output_textures[disk_name.lower()] = image
         declaration = [
             "[" + section + "]", "path=" + filename,
             "source=" + str(image.get("eiem_source", "")),
@@ -2656,43 +2607,15 @@ class EIEM_PG_shape_control(bpy.types.PropertyGroup):
     default: FloatProperty(name="默认值", default=0.0)
     minimum: FloatProperty(name="最小值", default=0.0)
     maximum: FloatProperty(name="最大值", default=1.0)
-
-
-def add_shape_control(obj, name, automatic=False):
-    key = obj.data.shape_keys.key_blocks.get(name) if obj.data.shape_keys else None
-    if key is None or key == obj.data.shape_keys.reference_key:
-        raise ValueError("请先选择一个非 Basis 的形态键")
-    for control in obj.data.eiem_shape_controls:
-        if control.shape == name:
-            control.enabled = True
-            control.automatic = automatic
-            return control
-    control = obj.data.eiem_shape_controls.add()
-    control.shape = name
-    control.automatic = automatic
-    control.identity = uuid.uuid4().hex[:16]
-    control.label = name
-    control.default = key.value
-    control.minimum = key.slider_min
-    control.maximum = key.slider_max
-    return control
-
-
-def sync_new_shape_controls(obj):
-    keys = obj.data.shape_keys
-    if not keys:
-        return
-    native = {frame["key"] for channel in parse_json_property(obj.data, "eiem_blend_shapes_json", [])
-              for frame in channel.get("frames", [])}
-    declared = {control.shape for control in obj.data.eiem_shape_controls}
-    # Removed automatic channels disappear; explicit broken bindings remain an error.
-    for i in reversed(range(len(obj.data.eiem_shape_controls))):
-        control = obj.data.eiem_shape_controls[i]
-        if control.automatic and control.shape not in keys.key_blocks:
-            obj.data.eiem_shape_controls.remove(i)
-    for key in keys.key_blocks:
-        if key != keys.reference_key and key.name not in native and key.name not in declared:
-            add_shape_control(obj, key.name, automatic=True)
+    hotkey_increase: StringProperty(
+        name="增大按键", default="",
+        description="按下后只把形态键目标设为最大值；留空则不生成该按键")
+    hotkey_decrease: StringProperty(
+        name="减小按键", default="",
+        description="按下后只把形态键目标设为最小值；留空则不生成该按键")
+    hotkey_speed: FloatProperty(
+        name="变化速度/秒", default=1.0, min=0.001,
+        description="形态键实际权重每秒向按键指定的目标变化多少")
 
 
 class EIEM_OT_shape_control(bpy.types.Operator):
@@ -2716,6 +2639,109 @@ class EIEM_OT_shape_control(bpy.types.Operator):
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
         return {"FINISHED"}
+
+
+class EIEM_OT_shape_key_record(bpy.types.Operator):
+    bl_idname = "eiem.shape_key_record"
+    bl_label = "录制形态键按键"
+    bl_description = "为增大或减小动作录制独立按键；Esc 取消"
+    bl_options = {"REGISTER", "UNDO"}
+    control_index: IntProperty(options={"HIDDEN"})
+    direction: StringProperty(options={"HIDDEN"})
+    clear: BoolProperty(default=False, options={"HIDDEN"})
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.object
+        return bool(obj and obj.type == "MESH"
+                    and hasattr(obj.data, "eiem_shape_controls"))
+
+    def _status(self, context, text=None):
+        workspace = getattr(context, "workspace", None)
+        if workspace and hasattr(workspace, "status_text_set"):
+            workspace.status_text_set(text=text)
+
+    def _control(self, context):
+        controls = context.object.data.eiem_shape_controls
+        if not 0 <= self.control_index < len(controls):
+            raise ValueError("形态键控制已改变，请重新操作")
+        if self.direction not in {"INCREASE", "DECREASE"}:
+            raise ValueError("形态键按键方向无效")
+        return controls[self.control_index]
+
+    def invoke(self, context, event):
+        if self.clear:
+            return self.execute(context)
+        try:
+            control = self._control(context)
+        except ValueError as error:
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+        self._object = context.object
+        direction = "增大" if self.direction == "INCREASE" else "减小"
+        self._status(context, "录制形态键%s按键：请按一个键或组合键；Esc 取消" % direction)
+        context.window_manager.modal_handler_add(self)
+        self.report({'INFO'}, "请按下用于%s %s 的游戏快捷键；Esc 取消" %
+                    (direction, control.shape))
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        if event.value != "PRESS":
+            return {'RUNNING_MODAL'}
+        if event.type == "ESC" and not (event.ctrl or event.shift or event.alt):
+            self._status(context)
+            return {'CANCELLED'}
+        if event.type in {"LEFT_CTRL", "RIGHT_CTRL", "LEFT_SHIFT", "RIGHT_SHIFT",
+                          "LEFT_ALT", "RIGHT_ALT", "OSKEY"}:
+            return {'RUNNING_MODAL'}
+        try:
+            if context.object != self._object:
+                raise ValueError("当前网格已改变，请重新录制")
+            control = self._control(context)
+            key = switch_key_from_event(event)
+            set_shape_control_hotkey(
+                context.object, control, key, self.direction, context.scene)
+        except ValueError as error:
+            self._status(context, "无法录制：%s；请按其他键，Esc 取消" % error)
+            self.report({'WARNING'}, str(error))
+            return {'RUNNING_MODAL'}
+        self._status(context)
+        self.report({'INFO'}, "%s → %s（%s）" % (
+            key, control.shape,
+            "增大" if self.direction == "INCREASE" else "减小"))
+        return {'FINISHED'}
+
+    def execute(self, context):
+        try:
+            control = self._control(context)
+            set_shape_control_hotkey(
+                context.object, control, "", self.direction, context.scene)
+            return {'FINISHED'}
+        except ValueError as error:
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+
+    def cancel(self, context):
+        self._status(context)
+
+
+def draw_shape_hotkey_rows(layout, control, index):
+    """Draw the same directional key editor in Properties and the N-panel."""
+    for direction, attribute, label, icon in (
+            ("INCREASE", "hotkey_increase", "增大到最大值", "TRIA_UP"),
+            ("DECREASE", "hotkey_decrease", "减小到最小值", "TRIA_DOWN")):
+        row = layout.row(align=True)
+        key_value = getattr(control, attribute) or "未设置"
+        row.label(text="%s：%s" % (label, key_value), icon=icon)
+        op = row.operator("eiem.shape_key_record", text="录制", icon="REC")
+        op.control_index, op.direction = index, direction
+        if getattr(control, attribute):
+            op = row.operator("eiem.shape_key_record", text="清除", icon="X")
+            op.control_index, op.direction, op.clear = index, direction, True
+    if control.hotkey_increase or control.hotkey_decrease:
+        draw_eiem_rna_property(layout, control, "hotkey_speed",
+                               "变化速度/秒", factor=0.32)
+        layout.label(text="增大键只到最大值；减小键只到最小值")
 
 
 class EIEM_PT_shape_controls(bpy.types.Panel):
@@ -2757,6 +2783,9 @@ class EIEM_PT_shape_controls(bpy.types.Panel):
                 if control.automatic and prop != "label":
                     continue
                 draw_eiem_rna_property(body, control, prop, label)
+            body.separator()
+            body.label(text="独立按键控制", icon="EVENT_F")
+            draw_shape_hotkey_rows(body, control, index)
         layout.label(text="新增形态键自动导出变量；原生通道需主动接管")
         layout.label(text="勾选“生成简单 UI”可同时生成独立控制窗口")
 
@@ -2932,6 +2961,104 @@ class EIEM_OT_switch_key_record(bpy.types.Operator):
         self._status(context)
 
 
+class EIEM_UL_switch_states(bpy.types.UIList):
+    """Compact, ordered outfit-state list."""
+
+    def draw_item(self, context, layout, data, item, icon, active_data,
+                  active_propname, index):
+        if not item.get("eiem_switch_state"):
+            layout.label(text=item.name, icon="COLLECTION_NEW")
+            return
+        row = layout.row(align=True)
+        drag = row.operator("eiem.switch_state_drag", text="", icon="GRIP",
+                            emboss=False)
+        drag.state_name = item.name
+        default = row.operator(
+            "eiem.switch_state", text="", icon=(
+                "RADIOBUT_ON" if item.get("eiem_default") else "RADIOBUT_OFF"),
+            emboss=False)
+        default.action, default.state_name = "DEFAULT", item.name
+        row.prop(item, "name", text="", emboss=False)
+        row.label(text="%d/%d" % (
+            len(switch_meshes(item)), len(switch_members(data))))
+        preview = row.operator("eiem.switch_state", text="", icon="HIDE_OFF",
+                               emboss=False)
+        preview.action, preview.state_name = "PREVIEW", item.name
+
+
+class EIEM_OT_switch_state_drag(bpy.types.Operator):
+    bl_idname = "eiem.switch_state_drag"
+    bl_label = "拖动款式排序"
+    bl_description = "按住并上下拖动，改变该快捷键的循环顺序"
+    bl_options = {"REGISTER", "UNDO", "BLOCKING"}
+    state_name: StringProperty(options={"HIDDEN"})
+
+    def _status(self, context, text=None):
+        workspace = getattr(context, "workspace", None)
+        if workspace and hasattr(workspace, "status_text_set"):
+            workspace.status_text_set(text=text)
+
+    def invoke(self, context, event):
+        group = context.scene.eiem_switch_active
+        state = next((candidate for candidate in switch_states(group)
+                      if candidate.name == self.state_name), None) if group else None
+        if state is None:
+            self.report({'ERROR'}, "款式不存在，请重新操作")
+            return {'CANCELLED'}
+        self._group = group
+        self._state = state
+        self._original = switch_states(group)
+        self._anchor_y = event.mouse_y
+        self._step = max(16, round(
+            20 * float(context.preferences.system.ui_scale)))
+        self._status(context, "上下拖动调整款式循环顺序；松开完成，Esc 取消")
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        if event.type in {"ESC", "RIGHTMOUSE"}:
+            try:
+                set_switch_state_order(self._group, self._original)
+                self._group.eiem_switch_state_index = self._original.index(
+                    self._state)
+            except (ReferenceError, ValueError):
+                pass
+            self._status(context)
+            if context.area:
+                context.area.tag_redraw()
+            return {'CANCELLED'}
+        if event.type == "LEFTMOUSE" and event.value == "RELEASE":
+            self._status(context)
+            return {'FINISHED'}
+        if event.type != "MOUSEMOVE":
+            return {'RUNNING_MODAL'}
+        try:
+            states = switch_states(self._group)
+            current = states.index(self._state)
+            delta = event.mouse_y - self._anchor_y
+            while delta >= self._step and current > 0:
+                current = reorder_switch_state(
+                    self._group, self._state, current - 1)
+                self._anchor_y += self._step
+                delta = event.mouse_y - self._anchor_y
+            while delta <= -self._step and current < len(states) - 1:
+                current = reorder_switch_state(
+                    self._group, self._state, current + 1)
+                self._anchor_y -= self._step
+                delta = event.mouse_y - self._anchor_y
+            self._group.eiem_switch_state_index = current
+        except (ReferenceError, ValueError) as error:
+            self._status(context)
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+        if context.area:
+            context.area.tag_redraw()
+        return {'RUNNING_MODAL'}
+
+    def cancel(self, context):
+        self._status(context)
+
+
 class EIEM_OT_switch_state(bpy.types.Operator):
     bl_idname = "eiem.switch_state"
     bl_label = "编辑切换状态"
@@ -2943,42 +3070,61 @@ class EIEM_OT_switch_state(bpy.types.Operator):
         group = context.scene.eiem_switch_active
         if not group or not group.get("eiem_switch_group"):
             return {'CANCELLED'}
-        state = next((s for s in switch_states(group) if s.name == self.state_name), None)
         try:
+            if self.action == "DELETE_GROUP":
+                delete_switch_group(group, context.scene, context)
+                return {'FINISHED'}
+            states = switch_states(group)
+            if self.action == "REMOVE_ACTIVE" and states:
+                index = max(0, min(group.eiem_switch_state_index,
+                                   len(states) - 1))
+                state = states[index]
+            else:
+                state = next((s for s in states
+                              if s.name == self.state_name), None)
+                if state is None and states and not self.state_name:
+                    index = max(0, min(group.eiem_switch_state_index,
+                                       len(states) - 1))
+                    state = states[index]
             if self.action == "ADD":
-                add_switch_state(group, "新款式")
-            elif self.action == "UNASSIGN":
+                state = add_switch_state(group, "款式 %d" % (len(switch_states(group)) + 1))
+                capture_switch_state(group, state, context)
+                group.eiem_switch_state_index = len(switch_states(group)) - 1
+            elif self.action == "MEMBER_ADD":
+                if not context.selected_objects:
+                    raise ValueError("请先选择要加入当前组的 EIEM 网格")
+                assign_switch_meshes(switch_states(group)[0], context.selected_objects,
+                                     context.scene)
+            elif self.action == "MEMBER_REMOVE":
                 assign_switch_meshes(None, context.selected_objects, context.scene)
-            elif state is None:
-                raise ValueError("状态不存在，请重新选择")
-            elif self.action == "ASSIGN":
-                assign_switch_meshes(state, context.selected_objects, context.scene)
-            elif self.action == "DEFAULT":
-                set_switch_default(group, state)
-            elif self.action == "PREVIEW":
-                preview_switch(group, state, context)
-            elif self.action == "SELECT":
+            elif self.action == "SELECT_MEMBERS":
                 bpy.ops.object.select_all(action="DESELECT")
-                for obj in switch_meshes(state):
+                for obj in switch_members(group):
                     if obj.name in context.view_layer.objects:
                         obj.select_set(True)
-            elif self.action == "REMOVE":
+            elif state is None:
+                raise ValueError("状态不存在，请重新选择")
+            elif self.action == "DEFAULT":
+                set_switch_default(group, state)
+            elif self.action == "CAPTURE":
+                capture_switch_state(group, state, context)
+            elif self.action == "PREVIEW":
+                preview_switch(group, state, context)
+            elif self.action in {"REMOVE", "REMOVE_ACTIVE"}:
                 if len(switch_states(group)) <= 2:
-                    raise ValueError("至少保留两个状态；隐藏状态应为空集合")
-                # Removing a state never deletes its geometry. Direct members
-                # become ordinary always-visible parts, retaining LOD links.
+                    raise ValueError("至少保留两个款式")
                 if state.children:
                     raise ValueError("请先移出状态的子集合再删除状态")
-                objects = switch_meshes(state)
-                restore_switch_preview(objects, context)
+                restore_switch_preview(switch_members(group), context)
                 for obj in list(state.objects):
                     state.objects.unlink(obj)
-                    if not obj.users_collection:
-                        context.scene.collection.objects.link(obj)
                 was_default = state.get("eiem_default")
                 bpy.data.collections.remove(state)
                 if was_default:
                     set_switch_default(group, switch_states(group)[0])
+                group.eiem_switch_state_index = min(
+                    group.eiem_switch_state_index,
+                    len(switch_states(group)) - 1)
             return {'FINISHED'}
         except ValueError as error:
             self.report({'ERROR'}, str(error))
@@ -2987,7 +3133,7 @@ class EIEM_OT_switch_state(bpy.types.Operator):
 
 class EIEM_OT_switch_restore(bpy.types.Operator):
     bl_idname = "eiem.switch_restore_preview"
-    bl_label = "恢复编辑显隐"
+    bl_label = "恢复预览前状态"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -3021,32 +3167,42 @@ class EIEM_PT_switches(bpy.types.Panel):
                 mapping.label(text="%s  →  %s" % (candidate.get("eiem_key", "未设置"), candidate.name))
         group = context.scene.eiem_switch_active
         if group and group.get("eiem_switch_group"):
-            draw_eiem_rna_property(layout, group, "name", "组名", factor=0.3)
+            name_row = layout.row(align=True)
+            draw_eiem_rna_property(name_row, group, "name", "组名", factor=0.3)
+            op = name_row.operator("eiem.switch_state", text="删除当前组", icon="TRASH")
+            op.action = "DELETE_GROUP"
             key_row = layout.row(align=True)
             key_row.label(text="当前按键：" + str(group.get("eiem_key", "未设置")))
             key_row.operator("eiem.switch_key_record", text="录制按键", icon="REC")
-            layout.label(text="状态：初始 / 名称 / 预览", icon="INFO")
-            for state in switch_states(group):
-                box = layout.box()
-                row = box.row(align=True)
-                op = row.operator("eiem.switch_state", text="", icon=(
-                    "RADIOBUT_ON" if state.get("eiem_default") else "RADIOBUT_OFF"))
-                op.action, op.state_name = "DEFAULT", state.name
-                row.prop(state, "name", text="")
-                op = row.operator("eiem.switch_state", text="预览", icon="HIDE_OFF")
-                op.action, op.state_name = "PREVIEW", state.name
-                box.label(text="%d 个网格%s" % (len(switch_meshes(state)),
-                                             "（此状态隐藏整组）" if not switch_meshes(state) else ""))
-                row = box.row(align=True)
-                op = row.operator("eiem.switch_state", text="所选归入")
-                op.action, op.state_name = "ASSIGN", state.name
-                op = row.operator("eiem.switch_state", text="选择成员")
-                op.action, op.state_name = "SELECT", state.name
-                op = row.operator("eiem.switch_state", text="", icon="X")
-                op.action, op.state_name = "REMOVE", state.name
+            members = switch_members(group)
             row = layout.row(align=True)
-            row.operator("eiem.switch_state", text="添加款式", icon="ADD").action = "ADD"
-            row.operator("eiem.switch_state", text="所选改为常显").action = "UNASSIGN"
+            op = row.operator("eiem.switch_state", text="所选加入组", icon="ADD")
+            op.action = "MEMBER_ADD"
+            op = row.operator("eiem.switch_state", text="所选移出组", icon="REMOVE")
+            op.action = "MEMBER_REMOVE"
+            op = row.operator("eiem.switch_state", text="选择组内物体")
+            op.action = "SELECT_MEMBERS"
+            layout.label(text="%d 个受控网格；调整眼睛显隐后记录款式" % len(members),
+                         icon="INFO")
+            states = switch_states(group)
+            if states:
+                active_index = max(
+                    0, min(group.eiem_switch_state_index, len(states) - 1))
+                row = layout.row()
+                row.template_list(
+                    "EIEM_UL_switch_states", "", group, "children", group,
+                    "eiem_switch_state_index", rows=max(3, min(7, len(states))))
+                buttons = row.column(align=True)
+                buttons.operator("eiem.switch_state", text="", icon="ADD").action = "ADD"
+                buttons.operator(
+                    "eiem.switch_state", text="", icon="REMOVE").action = "REMOVE_ACTIVE"
+                layout.label(text="拖动每行左侧手柄可改变游戏内循环顺序")
+                current = states[active_index]
+                row = layout.row(align=True)
+                op = row.operator("eiem.switch_state", text="用当前视图覆盖", icon="REC")
+                op.action, op.state_name = "CAPTURE", current.name
+                op = row.operator("eiem.switch_state", text="预览当前款式", icon="HIDE_OFF")
+                op.action, op.state_name = "PREVIEW", current.name
         layout.operator("eiem.switch_restore_preview", icon="LOOP_BACK")
         layout.separator()
         layout.label(text="只导出所选网格与作者物理组；相机关=游戏隐藏")
@@ -3130,9 +3286,12 @@ classes = (
     EIEM_OT_import_material,
     EIEM_PG_shape_control,
     EIEM_OT_shape_control,
+    EIEM_OT_shape_key_record,
     EIEM_PT_shape_controls,
     EIEM_OT_switch_create,
     EIEM_OT_switch_key_record,
+    EIEM_UL_switch_states,
+    EIEM_OT_switch_state_drag,
     EIEM_OT_switch_state,
     EIEM_OT_switch_restore,
     EIEM_PT_switches,
@@ -3151,6 +3310,8 @@ def register():
     bpy.types.Scene.eiem_ui_template = BoolProperty(name="生成简单 UI", default=False)
     bpy.types.Scene.eiem_ui_key = StringProperty(name="UI 开关键", default="", description="用户指定；留空生成常显 UI")
     bpy.types.Scene.eiem_ui_title = StringProperty(name="UI 标题", default="Mod controls")
+    bpy.types.Collection.eiem_switch_state_index = IntProperty(
+        name="当前款式", default=0, min=0)
     bpy.types.Scene.eiem_switch_active = PointerProperty(
         name="切换组", type=bpy.types.Collection,
         poll=lambda self, collection: bool(collection.get("eiem_switch_group")))
@@ -3166,6 +3327,7 @@ def unregister():
     del bpy.types.Scene.eiem_ui_key
     del bpy.types.Scene.eiem_ui_template
     del bpy.types.Scene.eiem_ui_title
+    del bpy.types.Collection.eiem_switch_state_index
     del bpy.types.Mesh.eiem_shape_controls
     for cls in reversed(classes): bpy.utils.unregister_class(cls)
 

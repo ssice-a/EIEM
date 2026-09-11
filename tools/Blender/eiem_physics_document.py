@@ -1,7 +1,7 @@
 """EIEM Physics authoring interchange; contains no live native identifiers.
 
-Capsule span is the distance between cap centres in this authoring schema.
-It is not the as-yet-unverified native SetSize(length) parameter.
+Capsule span is the distance between cap centres. Native SetSize length is
+therefore span + start radius + end radius.
 """
 import math
 import re
@@ -11,7 +11,8 @@ from pathlib import Path
 MAGIC = b"EIEPHYS\0"
 LEGACY_VERSION = 1
 RADIUS_VERSION = 3
-VERSION = 4  # Version 2 belongs to the native source-graph format.
+NATIVE_PARAMETER_VERSION = 4
+VERSION = 5  # Version 2 belongs to the native source-graph format.
 COORDINATE = "unity-y-up-left-handed"
 PARAMETERS = ("gravity", "stablizationTimeAfterReset", "gravityFalloff",
               "blendWeight", "animationPoseRatio")
@@ -94,7 +95,7 @@ def native_parameter(value):
 def validate(document, bone_paths=None):
     keys(document, "version purpose coordinate backend id skeleton groups colliders", "document")
     require(type(document["version"]) is int and document["version"] in
-            (LEGACY_VERSION, RADIUS_VERSION, VERSION),
+            (LEGACY_VERSION, RADIUS_VERSION, NATIVE_PARAMETER_VERSION, VERSION),
             "unsupported version")
     require(document["purpose"] == "authoring", "unsupported resource purpose")
     require(document["coordinate"] == COORDINATE and document["backend"] == "BeyondDynamicBone",
@@ -118,7 +119,8 @@ def validate(document, bone_paths=None):
         require(bone_paths is None or value in bone_paths, "missing Skeleton bone: " + value)
 
     for collider in colliders:
-        keys(collider, "id name bone shape position rotation radius span", "collider")
+        keys(collider, "id name bone shape position rotation radius span" +
+             (" endRadius alignedOnCenter" if document["version"] >= VERSION else ""), "collider")
         unique(collider)
         collider_ids.add(collider["id"])
         bone(collider["bone"])
@@ -127,13 +129,23 @@ def validate(document, bone_paths=None):
         vector(collider["rotation"], 4)
         require(abs(sum(x*x for x in collider["rotation"]) - 1) <= 0.001, "unnormalized rotation")
         number(collider["radius"], 1.401298464324817e-45)
+        if document["version"] >= VERSION:
+            number(collider["endRadius"], 1.401298464324817e-45)
+            require(type(collider["alignedOnCenter"]) is bool,
+                    "invalid collider alignment")
         number(collider["span"])
-        require(collider["shape"] != "SPHERE" or collider["span"] == 0, "sphere span must be zero")
+        require(collider["shape"] != "SPHERE" or
+                (collider["span"] == 0 and collider.get("endRadius", collider["radius"]) == collider["radius"]),
+                "sphere span and radii are invalid")
+        if (document["version"] >= VERSION and collider["shape"] == "CAPSULE" and
+                collider["alignedOnCenter"]):
+            require(collider["span"] >= abs(collider["radius"] - collider["endRadius"]),
+                    "centered capsule cannot represent the requested cap-centre span")
     used_colliders = set()
     for group in groups:
         keys(group, "id name nodes parameters colliders" +
              (" radius" if document["version"] >= RADIUS_VERSION else "") +
-             (" nativeParameters" if document["version"] == VERSION else ""), "group")
+             (" nativeParameters" if document["version"] >= NATIVE_PARAMETER_VERSION else ""), "group")
         unique(group)
         nodes = group["nodes"]
         require(isinstance(nodes, list) and 2 <= len(nodes) <= 16384, "a chain needs 2..16384 nodes")
@@ -179,7 +191,7 @@ def validate(document, bone_paths=None):
                         "invalid node radius infinity mode")
             require(type(radius["rotationOrder"]) is int and 0 <= radius["rotationOrder"] <= 5,
                     "invalid node radius rotation order")
-        if document["version"] == VERSION:
+        if document["version"] >= NATIVE_PARAMETER_VERSION:
             parameters = group["nativeParameters"]
             require(isinstance(parameters, list) and len(parameters) <= MAX_NATIVE_PARAMETERS,
                     "invalid native parameter count")
@@ -250,7 +262,11 @@ def encode(document):
         w.value("B", SHAPES.index(c["shape"]))
         w.value("3f", *c["position"])
         w.value("4f", *c["rotation"])
-        w.value("2f", c["radius"], c["span"])
+        if document["version"] >= VERSION:
+            w.value("3f", c["radius"], c["endRadius"], c["span"])
+            w.value("B", int(c["alignedOnCenter"]))
+        else:
+            w.value("2f", c["radius"], c["span"])
     w.value("I", len(document["groups"]))
     for g in document["groups"]:
         w.string(g["id"])
@@ -268,7 +284,7 @@ def encode(document):
                 w.value("4fI2f", key["time"], key["value"], key["inSlope"], key["outSlope"],
                         key["weightedMode"], key["inWeight"], key["outWeight"])
             w.value("3i", radius["preInfinity"], radius["postInfinity"], radius["rotationOrder"])
-        if document["version"] == VERSION:
+        if document["version"] >= NATIVE_PARAMETER_VERSION:
             w.value("I", len(g["nativeParameters"]))
             for parameter in g["nativeParameters"]:
                 w.string(parameter["path"])
@@ -285,7 +301,7 @@ def decode(data):
     r = Reader(data)
     require(r.raw(8) == MAGIC, "invalid magic")
     version, = r.value("I")
-    require(version in (LEGACY_VERSION, RADIUS_VERSION, VERSION), "unsupported version")
+    require(version in (LEGACY_VERSION, RADIUS_VERSION, NATIVE_PARAMETER_VERSION, VERSION), "unsupported version")
     d = {"version": version}
     for key in ("purpose", "coordinate", "backend", "id", "skeleton"):
         d[key] = r.string()
@@ -295,7 +311,13 @@ def decode(data):
         shape, = r.value("B")
         require(shape < len(SHAPES), "unsupported collider type")
         c.update(shape=SHAPES[shape], position=list(r.value("3f")), rotation=list(r.value("4f")))
-        c["radius"], c["span"] = r.value("2f")
+        if version >= VERSION:
+            c["radius"], c["endRadius"], c["span"] = r.value("3f")
+            aligned, = r.value("B")
+            require(aligned <= 1, "invalid collider alignment")
+            c["alignedOnCenter"] = bool(aligned)
+        else:
+            c["radius"], c["span"] = r.value("2f")
         d["colliders"].append(c)
     d["groups"] = []
     for _ in range(r.count(1024)):
@@ -316,7 +338,7 @@ def decode(data):
                     "inWeight": in_weight, "outWeight": out_weight})
             radius["preInfinity"], radius["postInfinity"], radius["rotationOrder"] = r.value("3i")
             g["radius"] = radius
-        if version == VERSION:
+        if version >= NATIVE_PARAMETER_VERSION:
             g["nativeParameters"] = []
             for _ in range(r.count(MAX_NATIVE_PARAMETERS)):
                 path, floating = r.string(), r.value("B")[0]

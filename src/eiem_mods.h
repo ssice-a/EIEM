@@ -77,12 +77,26 @@ static bool EiemSameRenderAssembly(EiemModRule a, EiemModRule b) {
   memset(a.shapeNames, 0, sizeof(a.shapeNames)); memset(b.shapeNames, 0, sizeof(b.shapeNames));
   memset(a.shapeWeights, 0, sizeof(a.shapeWeights)); memset(b.shapeWeights, 0, sizeof(b.shapeWeights));
   a.shapeCount = b.shapeCount = 0;
+  memset(a.shapeSpeedNames, 0, sizeof(a.shapeSpeedNames));
+  memset(b.shapeSpeedNames, 0, sizeof(b.shapeSpeedNames));
+  memset(a.shapeSpeeds, 0, sizeof(a.shapeSpeeds));
+  memset(b.shapeSpeeds, 0, sizeof(b.shapeSpeeds));
+  a.shapeSpeedCount = b.shapeSpeedCount = 0;
+  return memcmp(&a, &b, sizeof(a)) == 0;
+}
+
+static bool EiemSameRenderWithoutPartnerLinks(EiemModRule a,
+                                              EiemModRule b) {
+  memset(a.partners, 0, sizeof(a.partners));
+  memset(b.partners, 0, sizeof(b.partners));
+  a.partnerCount = b.partnerCount = 0;
   return memcmp(&a, &b, sizeof(a)) == 0;
 }
 
 static bool EiemPrepareInputUpdate(const std::vector<EiemModInputEvent> &events,
                                   EiemModProgram *next, std::vector<std::string> *affected,
-                                  bool *shapesOnly = nullptr) {
+                                  bool *shapesOnly = nullptr,
+                                  bool *partnerLinksOnly = nullptr) {
   AcquireSRWLockShared(&s_eiemModLock);
   *next = s_eiemModProgram;
   const LONG generation = s_eiemModGeneration;
@@ -115,6 +129,12 @@ static bool EiemPrepareInputUpdate(const std::vector<EiemModInputEvent> &events,
     *shapesOnly = before.size() == next->rules.size();
     for (size_t i = 0; *shapesOnly && i < before.size(); ++i)
       *shapesOnly = EiemSameRenderAssembly(before[i], next->rules[i]);
+  }
+  if (partnerLinksOnly) {
+    *partnerLinksOnly = before.size() == next->rules.size();
+    for (size_t i = 0; *partnerLinksOnly && i < before.size(); ++i)
+      *partnerLinksOnly =
+          EiemSameRenderWithoutPartnerLinks(before[i], next->rules[i]);
   }
   return !affected->empty();
 }

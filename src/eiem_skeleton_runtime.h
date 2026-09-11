@@ -1,6 +1,7 @@
 #pragma once
 #include <cctype>
 #include <mutex>
+#include <unordered_set>
 #include "eiem_skeleton_document.h"
 
 // Only instantiated on the Unity thread. Consumers keep leases until their
@@ -74,10 +75,77 @@ static void EiemCollectSkeletonInstances() {
   }
 }
 
+// Resolve only the requested resource path below an anchored Transform. A
+// live hierarchy may contain Mod-owned Partner objects beside the source
+// skeleton; walking the entire subtree would make those unrelated objects
+// look like duplicate source bones.
+static bool EiemSkeletonResolveLivePath(void *root, const std::string &relative,
+                                        const std::string &display,
+                                        void **out, std::string &error) {
+  *out = root;
+  if (relative.empty()) return true;
+  size_t begin = 0;
+  while (begin < relative.size()) {
+    const size_t end = relative.find('/', begin);
+    const std::string segment = relative.substr(
+        begin, end == std::string::npos ? std::string::npos : end - begin);
+    if (segment.empty()) {
+      error = "Invalid live Skeleton path: " + display;
+      return false;
+    }
+    void *boxed = nullptr;
+    if (!EiemSkeletonCall(g_transform_get_childCount, *out, nullptr, &boxed) || !boxed) {
+      error = "Cannot enumerate live Skeleton path: " + display;
+      return false;
+    }
+    const int count = *(int *)((char *)boxed + 16);
+    if (count < 0 || count > 16384) {
+      error = "Invalid live Skeleton child count: " + display;
+      return false;
+    }
+    void *match = nullptr;
+    for (int i = 0; i < count; ++i) {
+      void *child = nullptr, *name = nullptr;
+      void *args[] = {&i};
+      char text[256] = {};
+      if (!EiemSkeletonCall(g_transform_GetChild, *out, args, &child) || !child ||
+          !EiemSkeletonCall(g_object_get_name, child, nullptr, &name) || !name) {
+        error = "Cannot read live Skeleton child: " + display;
+        return false;
+      }
+      ReadStrUtf8(name, text, sizeof(text));
+      if (!text[0]) {
+        error = "Unnamed live Skeleton child: " + display;
+        return false;
+      }
+      if (segment == text) {
+        if (match) {
+          error = "Ambiguous live Skeleton path: " + display;
+          return false;
+        }
+        match = child;
+      }
+    }
+    if (!match) {
+      *out = nullptr;
+      return true;
+    }
+    *out = match;
+    if (end == std::string::npos) break;
+    begin = end + 1;
+  }
+  return true;
+}
+
 // Anchor a document to ONE existing rig through original bone paths. This
-// also supports the empty prefab-root path exported by AnimeStudio.
-static bool EiemSkeletonSourceNodes(const EiemSkeletonDocument &document, void *renderer,
-                                     std::vector<void *> &nodes, std::string &error) {
+// also supports the empty prefab-root path exported by AnimeStudio. Physics
+// colliders may name a source path that is absent from a UI/NPC hierarchy;
+// those explicitly declared paths are returned as null so the caller can
+// create an owned anchor with the exported local TRS.
+static bool EiemSkeletonSourceNodes(
+    const EiemSkeletonDocument &document, void *renderer,
+    const std::unordered_set<std::string> *virtualPaths,
+    std::vector<void *> &nodes, std::string &error) {
   nodes.assign(document.nodes.size(),nullptr);
   void *palette = nullptr;
   if (!EiemSkeletonCall(g_smr_get_bones,renderer,nullptr,&palette)) { error="Cannot read source bone palette"; return false; }
@@ -118,29 +186,34 @@ static bool EiemSkeletonSourceNodes(const EiemSkeletonDocument &document, void *
   if (!rootPath.empty() && rootPath.back()=='/') rootPath.pop_back();
   const auto root=ancestors.find(rootPath);
   if (root==ancestors.end()) { error="Skeleton source root is absent"; return false; }
-  std::vector<void *> live{root->second};
-  std::vector<std::string> paths{document.nodes.front().path};
-  std::unordered_map<std::string,void *> byPath;
-  for (size_t i=0;i<live.size();++i) {
-    if (live.size()>16384 || EiemNativeObjectStatus(live[i])!=1) { error="Invalid live Skeleton hierarchy"; return false; }
-    if (!byPath.emplace(paths[i],live[i]).second) { error="Ambiguous live Skeleton path: "+paths[i]; return false; }
-    void *boxed=nullptr;
-    if (!EiemSkeletonCall(g_transform_get_childCount,live[i],nullptr,&boxed) || !boxed) return false;
-    int count=*(int *)((char *)boxed+16);
-    if (count<0 || count>16384) return false;
-    for (int j=0;j<count;++j) {
-      void *child=nullptr,*name=nullptr; void *args[]={&j}; char text[256]={};
-      if (!EiemSkeletonCall(g_transform_GetChild,live[i],args,&child) || !child ||
-          !EiemSkeletonCall(g_object_get_name,child,nullptr,&name) || !name) return false;
-      ReadStrUtf8(name,text,sizeof(text));
-      if (!text[0]) return false;
-      live.push_back(child); paths.push_back(paths[i].empty()?text:paths[i]+"/"+text);
-    }
+  const std::string rootDocumentPath = document.nodes.front().path;
+  if (EiemNativeObjectStatus(root->second) != 1) {
+    error = "Invalid live Skeleton root";
+    return false;
   }
-  for (size_t i=0;i<document.nodes.size();++i) if (document.nodes[i].source) {
-    const auto found=byPath.find(document.nodes[i].path);
-    if (found==byPath.end()) { error="Source bone is missing (not a new bone): "+document.nodes[i].path; return false; }
-    nodes[i]=found->second;
+  for (size_t i = 0; i < document.nodes.size(); ++i) {
+    const auto &node = document.nodes[i];
+    if (!node.source) continue;
+    std::string relative = node.path;
+    if (!rootDocumentPath.empty()) {
+      if (node.path == rootDocumentPath) relative.clear();
+      else if (node.path.rfind(rootDocumentPath + '/', 0) == 0)
+        relative = node.path.substr(rootDocumentPath.size() + 1);
+      else {
+        error = "Skeleton source path is outside its root: " + node.path;
+        return false;
+      }
+    }
+    void *resolved = nullptr;
+    if (!EiemSkeletonResolveLivePath(
+            root->second, relative, prefix + node.path, &resolved, error))
+      return false;
+    if (!resolved) {
+      if (i != 0 && virtualPaths && virtualPaths->count(node.path)) continue;
+      error = "Source bone is missing (not a new bone): " + node.path;
+      return false;
+    }
+    nodes[i] = resolved;
   }
   return true;
 }
@@ -155,7 +228,8 @@ static std::string EiemSkeletonInstanceKey(const char *modPath,
 
 static bool EiemAcquireSkeletonDocument(
     std::string key,uint64_t stamp,EiemSkeletonDocument document,void *renderer,
-    std::shared_ptr<EiemSkeletonInstance> &out,char *message,size_t messageSize) {
+    std::shared_ptr<EiemSkeletonInstance> &out,char *message,size_t messageSize,
+    const std::unordered_set<std::string> *virtualPaths = nullptr) {
   out.reset(); std::string error;
   auto fail=[&](const std::string &why) {
     if (message) strncpy_s(message,messageSize,why.c_str(),_TRUNCATE);
@@ -163,14 +237,24 @@ static bool EiemAcquireSkeletonDocument(
   };
   if (!EiemOnUnityThread()) return fail("Skeleton requires Unity thread");
   std::vector<void *> source;
-  if (!EiemSkeletonSourceNodes(document,renderer,source,error)) return fail(error.empty()?"Cannot resolve source Skeleton":error);
+  if (!EiemSkeletonSourceNodes(document,renderer,virtualPaths,source,error)) return fail(error.empty()?"Cannot resolve source Skeleton":error);
   EiemCollectSkeletonInstances();
   for (const auto &cached:s_eiemSkeletonInstances) {
     if (cached->key!=key || cached->anchor.Target()!=source.front() || cached->anchor.Status()!=1) continue;
     // Old generations can be waiting for deferred partner destruction.
     // Their private nodes must not be reused by the new generation.
     if (!cached->ready) continue;
-    if (cached->stamp!=stamp) return fail("Skeleton changed while in use; reload before rebinding");
+    if (cached->stamp!=stamp) {
+      // Added nodes are private to one instance. Keep this generation alive
+      // for Renderers/native jobs that already reference it, but stop handing
+      // it to new consumers and build the changed file as a separate
+      // generation. This makes F10 a real rollover instead of requiring a
+      // second control event after deferred Unity destruction.
+      cached->ready=false;
+      Log("[SKELETON] Superseded generation retained during reload: %s",
+          cached->key.c_str());
+      continue;
+    }
     for (const auto &node:cached->nodes) if (node.Status()!=1) return fail("Skeleton node was destroyed; reload to rebuild");
     out=cached; return true;
   }
@@ -182,7 +266,7 @@ static bool EiemAcquireSkeletonDocument(
   s_eiemSkeletonInstances.push_back(instance);
   for (size_t i=0;i<instance->document.nodes.size();++i) {
     const auto &node=instance->document.nodes[i]; void *transform=source[i];
-    if (!node.source) {
+    if (!node.source || !source[i]) {
       if (!g_gameObjectClass || !il2cpp_object_new || !il2cpp_string_new ||
           !g_gameObject_ctor || !g_transform_set_parent || !g_transform_set_localPosition ||
           !g_transform_set_localRotation || !g_transform_set_localScale || !g_object_destroy)
@@ -234,9 +318,18 @@ static bool EiemAcquireSkeleton(const EiemModRule &rule, void *renderer,
     if (message) strncpy_s(message,messageSize,error.c_str(),_TRUNCATE);
     return false;
   }
+  // A Render action explicitly paired with Physics may use a Skeleton
+  // exported from a larger PFB than the current UI/NPC hierarchy. Allow the
+  // declared source nodes to become owned anchors for that Physics path;
+  // Mesh-only Skeleton actions keep strict source matching below.
+  std::unordered_set<std::string> virtualPaths;
+  if (rule.hasPhysics)
+    for (const auto &node : document.nodes)
+      if (node.source) virtualPaths.insert(node.path);
   return EiemAcquireSkeletonDocument(
       EiemSkeletonInstanceKey(rule.modPath,path),EiemMeshResourceFileStamp(path),
-      std::move(document),renderer,out,message,messageSize);
+      std::move(document),renderer,out,message,messageSize,
+      rule.hasPhysics ? &virtualPaths : nullptr);
 }
 
 static bool EiemWatchSkeletonPartner(EiemSkeletonInstance &instance, void *partner) {
