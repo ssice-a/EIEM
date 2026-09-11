@@ -13,6 +13,7 @@
 // on Unity's main thread. Keep this outside the game's WM_USER range.
 #define WM_EIEM_MOD_RECONCILE (WM_APP + 0x316)
 #define WM_EIEM_MOD_KEY (WM_APP + 0x317)
+static constexpr UINT_PTR kEiemModRetryTimer = 0xE13A;
 
 static HANDLE g_logHandle = INVALID_HANDLE_VALUE;
 static CRITICAL_SECTION g_logLock;

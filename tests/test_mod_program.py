@@ -96,6 +96,11 @@ int main(int argc, char **argv) {
     CHECK(order == "SA"); // future state changes do not reparse disk
     CHECK(queue.Take() == 0);
     CHECK(queue.Request(EiemModUpdate::Reload)); // requests after drain are schedulable
+    const uint32_t retry = queue.Take();
+    CHECK(retry == (uint32_t)EiemModUpdate::Reload);
+    queue.Requeue(retry); // a failed post/API readiness must not lose F10
+    CHECK(queue.HasPending());
+    CHECK(queue.Take() == retry);
   } else if (scenario == "publish") {
     EiemReloadMods();
     std::vector<EiemModRule> rules;

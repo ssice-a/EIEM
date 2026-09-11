@@ -178,6 +178,7 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
   } else {
     Log("[WARN] Failed to subclass game window (err=%lu)", GetLastError());
   }
+  EiemPostPendingModUpdate("game window attached");
 
   // Key edges only. Registration and foreground gating are shared by global
   // controls and mod cycles; no polling fallback or repeat-driven toggles.

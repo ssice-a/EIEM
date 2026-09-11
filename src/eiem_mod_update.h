@@ -15,6 +15,11 @@ class EiemModUpdateQueue {
   bool Request(EiemModUpdate request) {
     return pending_.fetch_or((uint32_t)request) == 0;
   }
+  // A taken request is incomplete until the Unity-side APIs accept it.
+  void Requeue(uint32_t requests) {
+    if (requests) pending_.fetch_or(requests);
+  }
+  bool HasPending() const { return pending_.load() != 0; }
   uint32_t Take() { return pending_.exchange(0); }
  private:
   std::atomic<uint32_t> pending_{0};

@@ -1614,16 +1614,32 @@ static bool EiemSetPartnerLodMembership(void *sourceRenderer,
         if (items[index] == partnerRenderer) partnerIndex = index;
       }
       if (add) {
-        if (sourceIndex == SIZE_MAX || partnerIndex != SIZE_MAX) continue;
-        void *arrayClass = il2cpp_object_get_class(renderers);
-        if (!arrayClass) continue;
-        void *replacement = il2cpp_array_new_specific(arrayClass, rendererCount + 1);
-        if (!replacement) continue;
-        void **outItems = (void **)((char *)replacement + 32);
-        memcpy(outItems, items, rendererCount * sizeof(void *));
-        outItems[rendererCount] = partnerRenderer;
-        lod->renderers = replacement;
-        changed = true;
+        if (sourceIndex != SIZE_MAX) {
+          if (partnerIndex != SIZE_MAX) continue;
+          void *arrayClass = il2cpp_object_get_class(renderers);
+          if (!arrayClass) continue;
+          void *replacement = il2cpp_array_new_specific(arrayClass,
+                                                         rendererCount + 1);
+          if (!replacement) continue;
+          void **outItems = (void **)((char *)replacement + 32);
+          memcpy(outItems, items, rendererCount * sizeof(void *));
+          outItems[rendererCount] = partnerRenderer;
+          lod->renderers = replacement;
+          changed = true;
+        } else if (partnerIndex != SIZE_MAX) {
+          // The game can rebuild LOD arrays during a scene transition. Do not
+          // leave a partner in a level where its source Renderer is absent.
+          void *arrayClass = il2cpp_object_get_class(renderers);
+          if (!arrayClass) continue;
+          void *replacement = il2cpp_array_new_specific(arrayClass,
+                                                        rendererCount - 1);
+          if (!replacement) continue;
+          void **outItems = (void **)((char *)replacement + 32);
+          for (size_t index = 0, outIndex = 0; index < rendererCount; ++index)
+            if (index != partnerIndex) outItems[outIndex++] = items[index];
+          lod->renderers = replacement;
+          changed = true;
+        }
       } else {
         if (partnerIndex == SIZE_MAX) continue;
         void *arrayClass = il2cpp_object_get_class(renderers);
@@ -4103,15 +4119,35 @@ static void EiemQueueModKey(EiemKeyChord chord, LONG generation) {
   EiemQueueModInput(std::move(event));
 }
 
+static void EiemPostPendingModUpdate(const char *reason) {
+  if (g_shutdownRequested || !g_gameHwnd || !IsWindow(g_gameHwnd) ||
+      !s_eiemModUpdates.HasPending())
+    return;
+  if (PostMessageW(g_gameHwnd, WM_EIEM_MOD_RECONCILE, 0, 0)) return;
+  SetTimer(g_gameHwnd, kEiemModRetryTimer, 100, nullptr);
+  Log("[MOD] Pending reconcile post failed (%s): err=%lu",
+      reason ? reason : "unknown", GetLastError());
+}
+
 static void EiemRequestModUpdate(EiemModUpdate request, const char *reason) {
-  if (g_shutdownRequested || !g_gameHwnd || !IsWindow(g_gameHwnd)) {
+  if (g_shutdownRequested) {
     Log("[MOD] Reconcile not queued (%s): game window is unavailable",
         reason ? reason : "unknown");
     return;
   }
-  if (!s_eiemModUpdates.Request(request)) return;
+  const bool first = s_eiemModUpdates.Request(request);
+  if (!g_gameHwnd || !IsWindow(g_gameHwnd)) {
+    Log("[MOD] Reconcile pending (%s): game window is unavailable",
+        reason ? reason : "unknown");
+    return;
+  }
+  if (!first) {
+    EiemPostPendingModUpdate(reason);
+    return;
+  }
   if (!PostMessageW(g_gameHwnd, WM_EIEM_MOD_RECONCILE, 0, 0)) {
-    s_eiemModUpdates.Take();
+    s_eiemModUpdates.Requeue((uint32_t)request);
+    SetTimer(g_gameHwnd, kEiemModRetryTimer, 100, nullptr);
     Log("[MOD] Reconcile post failed (%s): err=%lu",
         reason ? reason : "unknown", GetLastError());
     return;
@@ -4138,6 +4174,9 @@ static void EiemRunModReconcile() {
       LoadEiemConfig();
       EiemReportCameraFade();
     }
+    s_eiemModUpdates.Requeue(requests);
+    if (g_gameHwnd)
+      SetTimer(g_gameHwnd, kEiemModRetryTimer, 100, nullptr);
     Log("[MOD] Reconcile skipped: renderer APIs are not ready");
     return;
   }

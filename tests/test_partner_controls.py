@@ -20,6 +20,13 @@ def function(text, name):
 
 
 class PartnerControlsTests(unittest.TestCase):
+    def test_lod_membership_reconciles_stale_partner_levels(self):
+        trace = (ROOT / "src/il2cpp_trace.h").read_text(encoding="utf-8")
+        membership = function(trace, "EiemSetPartnerLodMembership")
+        self.assertIn("sourceIndex != SIZE_MAX", membership)
+        self.assertIn("else if (partnerIndex != SIZE_MAX)", membership)
+        self.assertIn("rendererCount - 1", membership)
+
     def test_control_reconcile_has_selective_partner_retirement_path(self):
         trace = (ROOT / "src/il2cpp_trace.h").read_text(encoding="utf-8")
         function(trace, "EiemPartnerDesired")
