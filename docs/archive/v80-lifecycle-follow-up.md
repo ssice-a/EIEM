@@ -17,7 +17,8 @@ from being silently dropped during a scene transition.
 Partner membership is reconciled in both directions. When a source Renderer is
 present in a LOD level, its partner is added once. When the source is absent,
 any stale partner is removed from that level. The change does not infer a
-character, Mesh, LOD number, or switch name.
+character, Mesh, LOD number, or switch name. The existing skin assembly
+boundaries re-run this reconciliation after the game rebuilds its LOD arrays.
 
 ## Validation boundary
 

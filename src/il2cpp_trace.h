@@ -1796,13 +1796,36 @@ static size_t EiemSyncPartnerRootBones(void *sourceRenderer = nullptr) {
   return changed;
 }
 
+static size_t EiemReconcilePartnerLodMemberships(void *sourceRenderer = nullptr) {
+  std::vector<std::pair<void *, void *>> partners;
+  AcquireSRWLockShared(&s_eiemPartnerLock);
+  for (const auto &state : s_eiemPartners) {
+    if (sourceRenderer && state.sourceRenderer != sourceRenderer) continue;
+    if (state.sourceDrawRenderer && state.partnerRenderer)
+      partners.emplace_back(state.sourceDrawRenderer, state.partnerRenderer);
+  }
+  ReleaseSRWLockShared(&s_eiemPartnerLock);
+  size_t changed = 0;
+  for (const auto &pair : partners) {
+    if (EiemNativeObjectStatus(pair.first) != 1 ||
+        EiemNativeObjectStatus(pair.second) != 1)
+      continue;
+    if (EiemSetPartnerLodMembership(pair.first, pair.second, true)) ++changed;
+  }
+  return changed;
+}
+
 static size_t EiemSyncPartnerRootBonesFromArray(void *renderers) {
   const size_t count = EiemManagedArrayLength(renderers);
-  if (!renderers || count > 8192) return 0;
+  if (!renderers || count > 8192) {
+    EiemReconcilePartnerLodMemberships();
+    return 0;
+  }
   void **items = (void **)((char *)renderers + IL2CPP_ARRAY_DATA);
   size_t changed = 0;
   for (size_t index = 0; index < count; ++index)
     changed += EiemSyncPartnerRootBones(items[index]);
+  EiemReconcilePartnerLodMemberships();
   return changed;
 }
 

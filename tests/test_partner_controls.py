@@ -23,9 +23,11 @@ class PartnerControlsTests(unittest.TestCase):
     def test_lod_membership_reconciles_stale_partner_levels(self):
         trace = (ROOT / "src/il2cpp_trace.h").read_text(encoding="utf-8")
         membership = function(trace, "EiemSetPartnerLodMembership")
+        root_sync = function(trace, "EiemSyncPartnerRootBonesFromArray")
         self.assertIn("sourceIndex != SIZE_MAX", membership)
         self.assertIn("else if (partnerIndex != SIZE_MAX)", membership)
         self.assertIn("rendererCount - 1", membership)
+        self.assertIn("EiemReconcilePartnerLodMemberships", root_sync)
 
     def test_control_reconcile_has_selective_partner_retirement_path(self):
         trace = (ROOT / "src/il2cpp_trace.h").read_text(encoding="utf-8")
