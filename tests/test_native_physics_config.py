@@ -20,6 +20,7 @@ static Klass dataClass{"ClothSerializeData","BeyondDynamicBone",{{".ctor","Syste
     {{".ctor","System.Void",0,{"UnityEngine.Keyframe[]"}},
      {"get_keys","UnityEngine.Keyframe[]",0,{}}},{}},
   keyframeClass{"Keyframe","UnityEngine",{},{}},
+  float3Class{"float3","Unity.Mathematics",{},{}},
   enumClass{"ClothType","BeyondDynamicBone.ClothProcess",{},{}},
   angleClass{"AngleLimitConstraintData","BeyondDynamicBone",{},{}},
   listClass{"List","System.Collections.Generic",{{".ctor","System.Void",0,{}},
@@ -93,13 +94,13 @@ static void ConfigureHost() {
   Setup();
   nativeImage.classes.erase(std::remove(nativeImage.classes.begin(),nativeImage.classes.end(),&data2Class),nativeImage.classes.end());
   nativeImage.classes.push_back(&dataClass);nativeImage.classes.push_back(&configData2Class);
-  nativeImage.classes.push_back(&curveDataClass);
+  nativeImage.classes.push_back(&curveDataClass);nativeImage.classes.push_back(&float3Class);
   dataClass.fields.push_back({"rootBones","System.Collections.Generic.List<UnityEngine.Transform>"});
   dataClass.fields.push_back({"ignoreFromRootBones","System.Collections.Generic.List<UnityEngine.Transform>"});
   dataClass.fields.push_back({"clothType","BeyondDynamicBone.ClothProcess.ClothType"});
   dataClass.fields.push_back({"connectionMode","BeyondDynamicBone.RenderSetupData.BoneConnectionMode"});
   dataClass.fields.push_back({"radius","BeyondDynamicBone.CurveSerializeData"});
-  dataClass.fields.push_back({"gravityDirection","UnityEngine.Vector3"});
+  dataClass.fields.push_back({"gravityDirection","Unity.Mathematics.float3"});
   dataClass.fields.push_back({"angleLimitConstraint","BeyondDynamicBone.AngleLimitConstraintData"});
   angleClass.fields.push_back({"useAngleLimit","System.Boolean"});
   angleClass.fields.push_back({"stiffness","System.Single"});
@@ -117,6 +118,7 @@ static void ConfigureHost() {
     if(!strcmp(name,"BeyondDynamicBone.AngleLimitConstraintData"))return &angleClass;
     if(!strcmp(name,"BeyondDynamicBone.CurveSerializeData"))return &curveDataClass;
     if(!strcmp(name,"BeyondDynamicBone.ClothProcess.ClothType"))return &enumClass;
+    if(!strcmp(name,"Unity.Mathematics.float3"))return &float3Class;
     return nullptr;
   };
   il2cpp_class_get_type=+[](void *k)->void * {
@@ -129,14 +131,18 @@ static void ConfigureHost() {
     objects.back()->klass=(Klass *)k;return objects.back().get();
   };
   il2cpp_class_value_size=+[](void *k,uint32_t *align)->int32_t {
-    *align=4;return k==&keyframeClass?28:k==&enumClass?4:0;
+    *align=4;
+    if(k==&keyframeClass)return 28;
+    if(k==&enumClass)return 4;
+    if(k==&float3Class)return mode=="gravity-layout-mismatch"?16:12;
+    return 0;
   };
   il2cpp_type_get_type=+[](void *t)->int {
     const char *name=(const char *)t;
     if(!strcmp(name,"System.Boolean"))return 0x02;
     if(!strcmp(name,"System.Int32"))return 0x08;
     if(!strcmp(name,"System.Single"))return 0x0c;
-    if(!strcmp(name,"UnityEngine.Vector3"))return 0x11;
+    if(!strcmp(name,"UnityEngine.Vector3")||!strcmp(name,"Unity.Mathematics.float3"))return 0x11;
     if(!strcmp(name,"BeyondDynamicBone.ClothProcess.ClothType"))return 0x11;
     return 0x12;
   };
@@ -278,6 +284,12 @@ int main(int argc,char **argv) {
       CHECK(draft.Groups()[0].data.Target()!=oldData && draft.Groups()[0].data2.Target()!=oldData2);
       CHECK(((Object *)oldData)->scalars[0]==9.8f && ((Object *)draft.Groups()[0].data.Target())->scalars[0]==3);
       CHECK(roots.size()==rooted);
+    } else if(mode=="collider") {
+      EiemPhysicsAuthorCollider collider;collider.id=std::string(32,'c');collider.name="Sphere";collider.bone="Hair";collider.radius=.1f;
+      document.colliders.push_back(collider);document.groups[0].colliders.push_back(collider.id);
+      CHECK(draft.Prepare(api,document,bindings,error));
+      CHECK(error.empty() && draft.Groups().size()==1);
+      CHECK(draft.Groups()[0].data.Target()!=oldData && draft.Groups()[0].data2.Target()!=oldData2);
     } else {
       if(mode=="missing-node")bindings.erase("Hair/Tip");
       if(mode=="alias-node")bindings["Hair/Tip"]=&root;
@@ -291,15 +303,11 @@ int main(int argc,char **argv) {
         auto second=document.groups.front();second.id=std::string(32,'d');second.name="Second";
         document.groups.push_back(second);
       }
-      if(mode=="collider") {
-        EiemPhysicsAuthorCollider collider;collider.id=std::string(32,'c');collider.name="Sphere";collider.bone="Hair";collider.radius=.1f;
-        document.colliders.push_back(collider);document.groups[0].colliders.push_back(collider.id);
-      }
       CHECK(!draft.Prepare(api,document,bindings,error));
       CHECK(!error.empty() && draft.Groups()[0].data.Target()==oldData && draft.Groups()[0].data2.Target()==oldData2);
       CHECK(((Object *)oldData)->scalars[0]==9.8f && roots.size()==rooted);
       if(mode=="missing-node"||mode=="alias-node"||mode=="wrong-parent"||mode=="wrong-node-type"||
-         mode=="dead-node"||mode=="invalid-parameters"||mode=="off-thread"||mode=="v2"||mode=="collider")CHECK(created==before);
+         mode=="dead-node"||mode=="invalid-parameters"||mode=="off-thread"||mode=="v2")CHECK(created==before);
     }
   }
   CHECK(roots.empty() && unexpectedCalls==0 && allocated==freed);
@@ -335,7 +343,8 @@ class NativePhysicsConfigTests(unittest.TestCase):
     def test_incomplete_or_ambiguous_contract_is_rejected_before_allocation(self):self.run_case('resolve-type','resolve-radius-type','resolve-duplicate','resolve-off-thread')
     def test_missing_or_aliased_bindings_preserve_existing_draft(self):self.run_case('missing-node','alias-node')
     def test_actual_parent_type_and_native_liveness_are_checked(self):self.run_case('wrong-parent','wrong-node-type','dead-node')
-    def test_unsupported_formats_and_collision_mapping_do_not_coerce(self):self.run_case('v2','collider')
+    def test_gravity_float3_layout_is_validated_before_write(self):self.run_case('gravity-layout-mismatch')
+    def test_v2_is_not_coerced_but_author_colliders_reach_the_runtime_stage(self):self.run_case('v2','collider')
     def test_invalid_scalar_and_wrong_thread_do_not_allocate(self):self.run_case('invalid-parameters','off-thread')
     def test_failed_allocation_or_ctor_preserves_previous_draft(self):self.run_case('allocation-failure','ctor-failure')
     def test_scalar_write_or_readback_failure_is_transactional(self):self.run_case('scalar-mismatch','scalar-exception')

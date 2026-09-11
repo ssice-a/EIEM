@@ -34,7 +34,9 @@ def fixture():
                 {"path": "serializeData.radius.curve.m_PreInfinity", "floating": False, "value": 2}],
             "colliders": ["2"*32]}],
         "colliders": [{"id": "2"*32, "name": "胶囊", "bone": "Rig/Root", "shape": "CAPSULE",
-            "position": [0.25, -0.5, 0.75], "rotation": [0,0,0,1], "radius": 0.03125, "span": 0.125}]}
+            "position": [0.25, -0.5, 0.75], "rotation": [0,0,0,1],
+            "radius": 0.03125, "endRadius": 0.046875, "span": 0.125,
+            "alignedOnCenter": False}]}
 
 
 SOURCE = r'''
@@ -56,10 +58,12 @@ int main(int argc,char **argv) {
   if(ok) {
     if(d.version>=3 && (d.groups[0].radius.keys.size()<2 || d.groups[0].radius.value<=0)) return 1;
     bool anyV4Count=argc==4 && std::string(argv[3])=="any-v4-count";
-    if(d.version==4 && anyV4Count && d.groups[0].nativeParameters.empty()) return 1;
-    if(d.version==4 && !anyV4Count && (d.groups[0].nativeParameters.size()!=5 ||
+    if(d.version>=4 && anyV4Count && d.groups[0].nativeParameters.empty()) return 1;
+    if(d.version>=4 && !anyV4Count && (d.groups[0].nativeParameters.size()!=5 ||
        d.groups[0].nativeParameters[1].floatingValue!=-1.0 ||
        d.groups[0].nativeParameters[2].integerValue!=1)) return 1;
+    if(d.version>=5 && !anyV4Count &&
+       (d.colliders[0].endRadius!=.046875f || d.colliders[0].alignedOnCenter)) return 1;
     printf("%zu %zu\n",d.groups.size(),d.colliders.size());
   }
   return 0;
@@ -95,6 +99,7 @@ class PhysicsDocumentTests(unittest.TestCase):
     def test_legacy_v1_still_roundtrips_without_inventing_radius_bytes(self):
         doc = fixture(); doc["version"] = codec.LEGACY_VERSION
         for group in doc["groups"]: group.pop("radius"); group.pop("nativeParameters")
+        for collider in doc["colliders"]: collider.pop("endRadius"); collider.pop("alignedOnCenter")
         encoded = codec.encode(doc)
         decoded = codec.decode(encoded)
         self.assertEqual(decoded["version"], 1)
@@ -104,9 +109,19 @@ class PhysicsDocumentTests(unittest.TestCase):
     def test_v3_still_roundtrips_without_v4_parameter_bytes(self):
         doc = fixture(); doc["version"] = codec.RADIUS_VERSION
         for group in doc["groups"]: group.pop("nativeParameters")
+        for collider in doc["colliders"]: collider.pop("endRadius"); collider.pop("alignedOnCenter")
         encoded = codec.encode(doc); decoded = codec.decode(encoded)
         self.assertEqual(decoded["version"], 3)
         self.assertNotIn("nativeParameters", decoded["groups"][0])
+        self.assertEqual(codec.encode(decoded), encoded)
+
+    def test_v4_still_roundtrips_with_equal_radius_colliders(self):
+        doc = fixture(); doc["version"] = codec.NATIVE_PARAMETER_VERSION
+        for collider in doc["colliders"]:
+            collider.pop("endRadius"); collider.pop("alignedOnCenter")
+        encoded = codec.encode(doc); decoded = codec.decode(encoded)
+        self.assertEqual(decoded["version"], 4)
+        self.assertNotIn("endRadius", decoded["colliders"][0])
         self.assertEqual(codec.encode(decoded), encoded)
 
     def test_invalid_schema_topology_references_and_numbers(self):
@@ -130,6 +145,8 @@ class PhysicsDocumentTests(unittest.TestCase):
                    lambda d: d["groups"][0].update(colliders=["2"*32]*2),
                    lambda d: d["colliders"][0].update(id="1"*32),
                    lambda d: d["colliders"][0].update(radius=0),
+                   lambda d: d["colliders"][0].update(endRadius=0),
+                   lambda d: d["colliders"][0].update(alignedOnCenter=2),
                    lambda d: d["colliders"][0].update(shape="SPHERE"),
                    lambda d: d["colliders"][0].update(rotation=[0,0,0,2])]
         for change in changes:

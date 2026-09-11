@@ -36,16 +36,17 @@ struct EiemPhysicsAuthorCollider {
   std::string id, name, bone;
   uint8_t shape = 0;
   float position[3] = {}, rotation[4] = {0,0,0,1};
-  float radius = 0, span = 0; // span = distance between cap centres, NOT native length
+  float radius = 0, endRadius = 0, span = 0; // native length = span + both radii
+  uint8_t alignedOnCenter = 1;
 };
 struct EiemPhysicsAuthorGroup {
   std::string id, name;
   std::vector<EiemPhysicsAuthorNode> nodes;
   // gravity, stablizationTimeAfterReset, gravityFalloff, blendWeight, animationPoseRatio
   float parameters[5] = {};
-  // Present on author formats v3/v4. Version 2 is reserved for the native source graph.
+  // Present on author formats v3+. Version 2 is reserved for the native source graph.
   EiemPhysicsAuthorRadius radius;
-  // V4 primitive ClothSerializeData edits. Topology and runtime-result fields
+  // V4+ primitive ClothSerializeData edits. Topology and runtime-result fields
   // are forbidden by the wire validator.
   std::vector<EiemPhysicsAuthorParameter> nativeParameters;
   std::vector<std::string> colliders;
@@ -104,7 +105,7 @@ static bool EiemPhysicsNativeParameterPath(const std::string &s) {
 }
 static bool EiemValidatePhysicsAuthor(const EiemPhysicsDocument &d, std::string &error) {
   auto fail=[&](const char *why) { error=why; return false; };
-  if ((d.version!=1 && d.version!=3 && d.version!=4) || !EiemPhysicsAuthorId(d.id) || !EiemPhysicsAuthorPath(d.skeleton) ||
+  if ((d.version!=1 && d.version!=3 && d.version!=4 && d.version!=5) || !EiemPhysicsAuthorId(d.id) || !EiemPhysicsAuthorPath(d.skeleton) ||
       d.skeleton.size()<9 || d.skeleton.substr(d.skeleton.size()-9)!=".skeleton" ||
       d.groups.empty() || d.groups.size()>1024 || d.colliders.size()>4096)
     return fail("Invalid Physics authoring header/dependencies");
@@ -114,8 +115,13 @@ static bool EiemValidatePhysicsAuthor(const EiemPhysicsDocument &d, std::string 
   };
   for (const auto &c:d.colliders) {
     if (!unique(c.id,c.name) || !EiemPhysicsAuthorPath(c.bone,true) || c.shape>1 ||
-        !std::isfinite(c.radius) || c.radius<=0 || !std::isfinite(c.span) || c.span<0 ||
-        (c.shape==0 && c.span!=0)) return fail("Invalid Physics collider");
+        !std::isfinite(c.radius) || c.radius<=0 ||
+        (d.version>=5 && (!std::isfinite(c.endRadius) || c.endRadius<=0)) ||
+        !std::isfinite(c.span) || c.span<0 || c.alignedOnCenter>1 ||
+        (c.shape==0 && (c.span!=0 || (d.version>=5 && c.endRadius!=c.radius))) ||
+        (d.version>=5 && c.shape==1 && c.alignedOnCenter &&
+         c.span<std::abs(c.radius-c.endRadius)))
+      return fail("Invalid Physics collider");
     for (float f:c.position) if (!std::isfinite(f)) return fail("Non-finite Physics position");
     double norm=0;
     for (float f:c.rotation) { if (!std::isfinite(f)) return fail("Non-finite Physics rotation"); norm+=double(f)*f; }
@@ -161,7 +167,7 @@ static bool EiemValidatePhysicsAuthor(const EiemPhysicsDocument &d, std::string 
         previous=key.time;
       }
     }
-    if (d.version==4) {
+    if (d.version>=4) {
       if (g.nativeParameters.size()>4096) return fail("Invalid native Physics parameter count");
       std::set<std::string> paths;
       for (const auto &parameter:g.nativeParameters) {
@@ -227,14 +233,17 @@ static bool EiemReadPhysicsAuthor(Reader &source,EiemPhysicsDocument &out,std::s
     if (!EiemValidatePhysicsNative(*tree,next.id,next.skeleton,next.nativeComponents,error)) return false;
     next.version=2; next.native=std::move(tree); out=std::move(next); error.clear(); return true;
   }
-  if ((version!=1 && version!=3 && version!=4) || !r.String(purpose) || purpose!="authoring" || !r.String(coordinate) || coordinate!="unity-y-up-left-handed" ||
+  if ((version!=1 && version!=3 && version!=4 && version!=5) || !r.String(purpose) || purpose!="authoring" || !r.String(coordinate) || coordinate!="unity-y-up-left-handed" ||
       !r.String(backend) || backend!="BeyondDynamicBone" || !r.String(next.id) || !r.String(next.skeleton) ||
       !r.Count(count,4096)) return invalid();
   next.version=version; next.colliders.resize(count);
-  for (auto &c:next.colliders)
+  for (auto &c:next.colliders) {
     if (!r.String(c.id) || !r.String(c.name) || !r.String(c.bone) || !r.Value(c.shape) ||
         !r.Bytes(c.position,sizeof(c.position)) || !r.Bytes(c.rotation,sizeof(c.rotation)) ||
-        !r.Value(c.radius) || !r.Value(c.span)) return invalid();
+        !r.Value(c.radius) || (version>=5 && !r.Value(c.endRadius)) ||
+        !r.Value(c.span) || (version>=5 && !r.Value(c.alignedOnCenter))) return invalid();
+    if (version<5) c.endRadius=c.radius;
+  }
   if (!r.Count(count,1024)) return invalid();
   next.groups.resize(count);
   for (auto &g:next.groups) {
@@ -252,7 +261,7 @@ static bool EiemReadPhysicsAuthor(Reader &source,EiemPhysicsDocument &out,std::s
       if (!r.Value(g.radius.preInfinity) || !r.Value(g.radius.postInfinity) ||
           !r.Value(g.radius.rotationOrder)) return invalid();
     }
-    if (version==4) {
+    if (version>=4) {
       if (!r.Count(count,4096)) return invalid();
       g.nativeParameters.resize(count);
       for (auto &parameter:g.nativeParameters) {

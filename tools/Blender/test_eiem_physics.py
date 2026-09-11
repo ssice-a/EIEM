@@ -143,6 +143,8 @@ assert abs(payload["groups"][0]["radius"]["value"] - .02) < 1e-7
 assert payload["groups"][0]["radius"]["useCurve"]
 assert abs(payload["groups"][0]["radius"]["keys"][-1]["value"] - .25) < 1e-7
 assert len(payload["colliders"]) == 1
+assert payload["colliders"][0]["endRadius"] == payload["colliders"][0]["radius"]
+assert payload["colliders"][0]["alignedOnCenter"] is True
 assert all(g["colliders"] == [collider.eiem_physics.identity] for g in payload["groups"])
 skel = addon.read_skeleton(output / payload["skeleton"])
 assert [n[0] for n in skel["nodes"]][-2:] == ["Rig/Extra", "Rig/Extra/Tip"]
@@ -205,9 +207,10 @@ except ValueError as error: assert "不覆盖" in str(error)
 assert file.read_bytes() == original
 
 # Legacy author v1 remains importable; it acquires the documented flat default
-# radius in Blender and exports as the current author v4 format.
+# radius in Blender and exports as the current author v5 format.
 legacy_payload = pycopy.deepcopy(payload); legacy_payload["version"] = physics.document.LEGACY_VERSION
 for record in legacy_payload["groups"]: record.pop("radius"); record.pop("nativeParameters")
+for record in legacy_payload["colliders"]: record.pop("endRadius"); record.pop("alignedOnCenter")
 legacy_file = output / "legacy.physics"; legacy_file.write_bytes(physics.document.encode(legacy_payload))
 legacy_rig, legacy_groups = physics.import_physics(legacy_file)
 assert all(abs(item.eiem_physics.node_radius - .006) < 1e-8 for item in legacy_groups)

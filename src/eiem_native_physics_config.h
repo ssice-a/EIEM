@@ -15,7 +15,9 @@ static_assert(sizeof(EiemPhysicsManagedKeyframe)==28,"UnityEngine.Keyframe layou
 // Factory preparation ONLY: detached managed configuration objects. Nothing
 // here creates a Unity component, starts a process, or owns/releases bones.
 // V1 roles map only to the verified root/ignore input accepted by BoneCloth.
-// V2 selection graphs and collider geometry remain separate contracts.
+// V2 selection graphs remain a separate contract. Author collider components
+// are instantiated and attached by the per-model runtime after this detached
+// ClothSerializeData draft has been prepared.
 struct EiemPhysicsConfigApi {
   void *data=nullptr,*data2=nullptr,*transform=nullptr,*rootList=nullptr;
   void *curveData=nullptr,*animationCurve=nullptr,*keyframe=nullptr;
@@ -371,11 +373,39 @@ class EiemPhysicsConfigDraft {
       }
       Vector3 value{(float)axis[0]->floatingValue,(float)axis[1]->floatingValue,
                     (float)axis[2]->floatingValue},actual{};
-      void *field=EiemPhysicsField(api.data,"gravityDirection","UnityEngine.Vector3");
-      if (!field || !Write(candidate.data.Target(),field,&value) ||
-          !EiemPhysicsReadField(candidate.data.Target(),field,actual) ||
-          memcmp(&value,&actual,sizeof(value))) {
-        error="Native Physics gravityDirection readback mismatch"; return false;
+      void *field=EiemPhysicsField(api.data,"gravityDirection");
+      if (!field) {
+        error="Native Physics gravityDirection field is missing or ambiguous"; return false;
+      }
+      void *fieldType=il2cpp_field_get_type(field);
+      const std::string typeName=EiemPhysicsTypeName(fieldType);
+      if (typeName!="UnityEngine.Vector3" &&
+          typeName!="Unity.Mathematics.float3") {
+        error="Native Physics gravityDirection type changed: "+typeName; return false;
+      }
+      void *fieldClass=il2cpp_class_from_type(fieldType);
+      uint32_t fieldAlign=0;
+      const int32_t fieldSize=fieldClass?
+          il2cpp_class_value_size(fieldClass,&fieldAlign):0;
+      if (fieldSize!=sizeof(Vector3) || fieldAlign!=alignof(float)) {
+        char details[256]={};
+        snprintf(details,sizeof(details),
+                 "Native Physics gravityDirection layout changed: type=%s size=%d align=%u",
+                 typeName.c_str(),fieldSize,fieldAlign);
+        error=details; return false;
+      }
+      if (!Write(candidate.data.Target(),field,&value)) {
+        error="Native Physics gravityDirection write failed"; return false;
+      }
+      if (!EiemPhysicsReadField(candidate.data.Target(),field,actual)) {
+        error="Native Physics gravityDirection readback failed"; return false;
+      }
+      if (actual.x!=value.x || actual.y!=value.y || actual.z!=value.z) {
+        char details[256]={};
+        snprintf(details,sizeof(details),
+                 "Native Physics gravityDirection readback mismatch expected=(%.9g,%.9g,%.9g) actual=(%.9g,%.9g,%.9g)",
+                 value.x,value.y,value.z,actual.x,actual.y,actual.z);
+        error=details; return false;
       }
       handled.insert(axes[0]); handled.insert(axes[1]); handled.insert(axes[2]);
     }
@@ -410,10 +440,9 @@ class EiemPhysicsConfigDraft {
         !api.connectionModeField || !api.listCount || !api.listItem || !api.transform ||
         std::find(api.scalars.begin(),api.scalars.end(),nullptr)!=api.scalars.end())
       return fail("Resolve detached physics configuration APIs before preparation");
-    if (document.version!=1 && document.version!=3 && document.version!=4)
+    if (document.version!=1 && document.version!=3 && document.version!=4 && document.version!=5)
       return fail("Native source v2 graph construction is not implemented; no author coercion");
     if (!EiemValidatePhysicsAuthor(document,error)) return false;
-    if (!document.colliders.empty()) return fail("Native collider geometry conversion is unverified; no collider configuration prepared");
     std::vector<EiemPhysicsConfigGroup> staged;
     std::vector<std::vector<size_t>> rootIndices;
     std::vector<std::vector<size_t>> ignoreIndices;
@@ -512,7 +541,7 @@ class EiemPhysicsConfigDraft {
             !EiemPhysicsReadField(candidate.data.Target(),api.scalars[i],actual) || actual!=value)
           return fail(std::string("Detached physics scalar readback mismatch: ")+api.ScalarName(i));
       }
-      if (document.version==4 &&
+      if (document.version>=4 &&
           !ApplyNativeParameters(api,document.groups[g].nativeParameters,candidate,error))
         return false;
       void *result=nullptr;

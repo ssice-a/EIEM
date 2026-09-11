@@ -1,7 +1,7 @@
-# Physics 作者资源 v1 / v3 / v4
+# Physics 作者资源 v1 / v3 / v4 / v5
 
-当前线格式版本：4；版本 1/3 保持读取/重编码兼容；版本 2 保留给原生源图格式，不用于新增作者组。
-作者工具初次交付于 Blender 插件 0.11.0，当前源码为 0.26.2。
+当前线格式版本：5；版本 1/3/4 保持读取/重编码兼容；版本 2 保留给原生源图格式，不用于新增作者组。
+作者工具初次交付于 Blender 插件 0.11.0，当前源码为 0.30.3。
 原始 Prefab 源图保留和编辑使用独立的[源作者 v2](physics-authoring-v2.md)，不改变本文 v1 格式含义。
 工作区接入和验证状态统一见[文档索引](README.md)。
 
@@ -27,16 +27,23 @@
 链位置、当前参数倍率和实际值，并可在该位置增加关键点。底层仍保留完整 AnimationCurve，未编辑源曲线精确往返。
 0.26.2 修正新增作者组角度锥的坐标空间：作者骨骼 `head_local` 已是 Blender Rig 局部坐标，预览不再重复执行
 Unity→Blender 基变换。节点半径球、骨链与角度锥现在共用同一坐标约定；原生 v2 源图仍保留自身的一次基变换。
+0.30.0 升级为作者 v5：球体和胶囊可进入组合 Mod；胶囊分别保存首端/末端半径、两端球心距离及
+`alignedOnCenter`。从原生组复制来的球体或胶囊在导出时转换为这份可移植记录，同一个碰撞组件可以被多个
+作者组共享。无限平面仍只保留在原生 v2 源图中，作者 v5 导出会明确拒绝。
+0.30.1 在 Mesh 导出时按最终序列化法线校验切线。连接、拆分或法线编辑后仍非零但已不正交的旧切线，只在
+对应角点从 UV0 重建并正交化；未受影响的原切线和原法线继续保留。
 没有粘贴原生模板的新组仍使用 `ClothSerializeData` 构造默认值，只显式覆盖这五项参数与节点半径曲线。
-组合 Mod 入口可把所选 **无独立碰撞体作者组**与同一共享 Rig 的所选 Mesh 一起写出，并在相同 Mesh 命中规则的
-Render 动作中生成 `skeleton=` 与 `physics=`；未选物理组时仍是原有 Mesh 增量导出。
+组合 Mod 入口可把所选作者组及其球体/胶囊碰撞体与同一共享 Rig 的所选 Mesh 一起写出，并在相同 Mesh 命中规则的
+Render 动作中生成 `skeleton=` 与 `physics=`。0.30.3 起，若所选可见 Mesh 对某作者物理组的节点骨骼具有
+正权重，即使没有手动选中该组 Empty，也会把它作为真实依赖自动带入；不使用这些骨骼的 Mesh 仍是纯 Mesh 增量导出。
 v67 DLL 已在游戏中从 `Render.physics` 建立三个运行实例，并验证两个角色 UI 实例随 owner 卸载完成原生
 Team/Process 注销。实机同时发现原生 `rootBones` 会递归纳入未声明的叶子 Nub；v68 已用作者边界外的直接
 子节点补充 `ignoreFromRootBones`，实机原生 setup 精确只含三个作者节点。v68 的 Selection 属性统计因装箱
 值类型调用错误而无效；v69 修正后已实机读回 `fixed / move / move`，并由原生长发组的已知分布交叉验证。
 v70 已验证同一四节点链在主模型、角色 UI 和 NPC 中建立并产生可见蒙皮响应；v71 以 F10 实机完成
-`blendWeight=1 → 0 → 1` 双向响应及旧实例最终退休。v4 完整参数的游戏内响应、碰撞体转换和 v2 原生实例化
-尚未完成。
+`blendWeight=1 → 0 → 1` 双向响应及旧实例最终退休。v72 建立作者 v5 球/胶囊组件、绑定骨骼、碰撞列表和
+实例退休，但首轮作者 v5 实机在 `gravityDirection` 配置回读阶段失败，未到 `BuildAndRun`。v73 增加精确诊断
+和确定性失败收敛，已通过本地构建并部署；碰撞响应、位置/方向和卸载仍需新进程验证。
 
 ## 使用
 
@@ -60,7 +67,7 @@ v70 已验证同一四节点链在主模型、角色 UI 和 NPC 中建立并产�
    设置根端倍率、末端倍率和线性/平滑变化；需要局部变化时展开“高级关键点”，以 0～1 链位置和倍率精确编辑。
    根端与末端不可删除，中间点可增删；半径球和角度锥会自动刷新。
 4. 先在 Rig 上选择独立碰撞体的绑定骨骼，然后在面板添加球体或胶囊。
-   用位移/旋转工具编辑骨骼局部变换，用面板修改半径和两端球心间距。
+   用位移/旋转工具编辑骨骼局部变换；胶囊可分别设置首端/末端半径、两端球心间距和中心对齐方式。
    对象缩放、增量变换和额外约束在导出时拒绝，避免显示与文件不一致。
 5. **当前组**指定共享引用的目标。选择已有碰撞体，点击**加入当前物理组**；
    面板列出所有引用组。**复制物理组**生成新身份、复制参数，并保留共享碰撞引用。
@@ -71,9 +78,10 @@ v70 已验证同一四节点链在主模型、角色 UI 和 NPC 中建立并产�
 7. 保存 `.blend` 继续编辑。导入 `.physics` 时，如果当前选中相同的 EIEM Rig，
    校验完整节点/姿态/来源标志后复用；否则创建独立 Rig。
    同一 Rig 上重复导入相同身份会报错，不合并或覆盖原组。
-8. 需要生成可加载 Mod 时，在物体模式同时选中目标 Mesh 与作者物理组，点击**导出所选 mod**。
-   所选组自动带入共享 Skeleton，并绑定到所有使用该 Rig 的所选 Render。当前此入口拒绝带独立碰撞体的作者组、
-   原生 v2 组及没有同 Rig 可见 Mesh 的组；它们仍可使用独立作者导出保存。
+8. 需要生成可加载 Mod 时，在物体模式选中目标 Mesh，点击**导出所选 mod**。可以同时显式选中作者物理组；
+   若 Mesh 已对该组节点骨骼刷有正权重，插件也会自动推导该依赖，避免覆盖旧包时意外删掉 Physics。
+   解析出的组自动带入共享 Skeleton，并绑定到所有使用该 Rig 的所选 Render。作者球体/胶囊及已引用的原生
+   球体/胶囊会进入 v5；原生无限平面、原生 v2 组及没有同 Rig 可见 Mesh 的组仍不能进入组合 Mod。
 
 源骨骼路径保持来源身份；新增骨骼通过独立作者身份关联，改显示名后导出当前完整路径。
 删除引用骨骼会报错，不改绑到根或同名骨骼。编辑绑定姿态后可用**刷新骨骼绑定**；
@@ -94,9 +102,9 @@ v70 已验证同一四节点链在主模型、角色 UI 和 NPC 中建立并产�
   因此它是新增链的完整参数模板，不是原始 BeyondBoneCloth 组件字节与引用图的无损往返；后者仍由源作者 v2 负责。
 - 节点角色为作者层 `FIXED/MOVE/IGNORE`，不是原生 VertexAttribute 的位值，
   文件节点序也不是 setupIndex、Mesh palette 或 Animator 写回槽。
-- 球体保存半径；胶囊沿自身 Unity 局部 Y 轴，两端球心为 `±span/2`，半径相等，
-  作者显示总长为 `span + 2*radius`。`span` **不是已验证的原生 SetSize(length)**；
-  原生转换还须解决调查记录中的端点、方向及缩放语义。
+- 球体保存半径；胶囊沿自身 Unity 局部 Y 轴保存首端半径、末端半径与两端球心距离 `span`。
+  DLL 调用原生 `SetSize(startRadius, endRadius, span + startRadius + endRadius)`。关闭中心对齐时首端球心
+  位于碰撞物体原点；开启时由原生居中公式放置两端。v5 校验会拒绝原生居中公式无法精确表示的极端异径尺寸。
 - Blender 辅助体通过 Child Of 约束跟随 Rig；原骨骼的源 TRS 缩放参与绑定补偿。
   这里只显示作者几何，没有 Blender 物理模拟。
 
@@ -110,15 +118,15 @@ team ID、Transform 实例 ID 或运行时任务状态。
 
 | 顺序 | 内容 |
 |---|---|
-| 头部 | 8 字节 `EIEPHYS\0`；u32 版本 `4`（读取器仍接受版本 1/3） |
+| 头部 | 8 字节 `EIEPHYS\0`；u32 版本 `5`（读取器仍接受版本 1/3/4） |
 | 5 个字符串 | `authoring`、`unity-y-up-left-handed`、`BeyondDynamicBone`、资源 UUID、Skeleton 相对文件路径 |
 | 碰撞体列表 | u32 数量，最多 4096 |
-| 每个碰撞体 | id/name/bone 三个字符串；u8 shape（0 球、1 胶囊）；float32 position[3]、rotation[4]（xyzw）、radius、span |
+| 每个碰撞体 | id/name/bone 三个字符串；u8 shape（0 球、1 胶囊）；float32 position[3]、rotation[4]（xyzw）、startRadius、endRadius、span；u8 alignedOnCenter |
 | 组列表 | u32 数量，1～1024 |
 | 每个组 | id/name；u32 节点数，2～16384；各节点 bone 字符串 + u8 role（0 固定、1 运动、2 忽略） |
 | 组参数 | float32[5]，按上面列出的参数名称顺序 |
-| v3/v4 节点半径 | float32 基础值；u8 useCurve；u32 关键帧数（2～64）；每帧 `4×float32 + u32 weightedMode + 2×float32`；最后为 3×int32 曲线元数据 |
-| v4 原生参数 | u32 数量（最多 4096）；每项为字段路径字符串、u8 floating；浮点值为 float32，整数/布尔/枚举为 int32 |
+| v3/v4/v5 节点半径 | float32 基础值；u8 useCurve；u32 关键帧数（2～64）；每帧 `4×float32 + u32 weightedMode + 2×float32`；最后为 3×int32 曲线元数据 |
+| v4/v5 原生参数 | u32 数量（最多 4096）；每项为字段路径字符串、u8 floating；浮点值为 float32，整数/布尔/枚举为 int32 |
 | 组碰撞引用 | u32 数量，最多 4096；各引用为碰撞体 UUID 字符串 |
 
 所有身份为 32 位小写十六进制作者 UUID。组与碰撞体身份不重复；重复名称允许。
@@ -135,11 +143,12 @@ Skeleton 存在相邻 `skeletons/<完整SHA256>.skeleton`，包含同一 Rig 的
 
 - [Python 编解码](../tools/Blender/eiem_physics_document.py)
 - [Blender 作者工具](../tools/Blender/eiem_physics_authoring.py)
-- [C++ reader/validator](../src/eiem_physics_document.h)：失败保留调用者原 document；[依赖读取](../src/eiem_physics_asset.h)已通过针对性宿主测试和本地构建，未接原生执行，记录见[原生调查第 16 节](native-physics-investigation.md)。
+- [C++ reader/validator](../src/eiem_physics_document.h)：失败保留调用者原 document；[依赖读取](../src/eiem_physics_asset.h)及
+  [运行时适配器](../src/eiem_native_physics_runtime.h)已通过针对性宿主测试和本地构建。
 - [实际 Blender 测试](../tools/Blender/test_eiem_physics.py)：编辑模式按钮、节点基础半径与数值化位置曲线、按深度变化的
   真实半径球、完整参数快照和旧工程迁移、碰撞集合复制/加入/移除、局部变换和胶囊量测、保存重开、
   骨骼改名、隐藏辅助体、无权重骨骼、
-  失效引用、错误导出不覆盖原文件、独立 Rig 导入。
+  异径胶囊、中心/非中心对齐、源碰撞体转换、失效引用、错误导出不覆盖原文件、独立 Rig 导入。
 - [跨语言/坏文件测试](../tests/test_physics_document.py)：C++ 读取 Python/Blender 输出；
   截断、尾随数据、UTF-8、数量限制、拓扑、身份和数值错误。
 
@@ -151,6 +160,6 @@ Skeleton 存在相邻 `skeletons/<完整SHA256>.skeleton`，包含同一 Rig 的
 DLL 通过元数据名称解析 `ClothSerializeData` 的嵌套字段、`CurveSerializeData`、
 `AnimationCurve(Keyframe[])` 和 28 字节 `Keyframe`。v4 普通标量、布尔/枚举、`gravityDirection` 与九类曲线
 写入新建配置后逐项回读；任一字段缺失、类型变化或回读不一致都不发布该批草稿。Typhoea 249 项参数的
-Blender 往返、C++ v1/v3/v4 读取、嵌套字段/曲线宿主测试和完整 DLL 构建通过。
-旧 v1 组的创建、运动及退休已有既往实机记录；**v4 参数对游戏模拟结果的影响尚未逐项实机验证，不能由离线
-曲线显示或配置回读替代。**独立碰撞体转换仍未接入。
+Blender 往返、C++ v1/v3/v4/v5 读取、嵌套字段/曲线及碰撞列表宿主测试和完整 DLL 构建通过。
+旧 v1 组的创建、运动及退休已有既往实机记录；**v4/v5 参数与碰撞体对游戏模拟结果的影响尚未逐项实机验证，
+不能由离线曲线显示、字段回读或成功构建代替。**
