@@ -2078,7 +2078,13 @@ static void TraceSkinnedMeshSetBones(void *self, void *bones,
   // Measure the skinning result at the one boundary where the bone palette
   // changes. `localBounds` cannot answer this: it is authored data and does not
   // move when the binding breaks, whereas the skinned extent does.
-  if (TraceTakeBudget(&s_traceSkinProbeCount, 200)) {
+  //
+  // The guard is written out rather than routed through TraceTakeBudget: that
+  // function is a stub returning a constant false (asset-path exploration is
+  // finished), so MSVC folds `budget(...)` to false and deletes the whole block
+  // as dead code at /O2. A diagnostic that silently compiles away is worse than
+  // no diagnostic, so this block must stay on a real condition.
+  if (InterlockedIncrement(&s_traceSkinProbeCount) <= 200) {
     const EiemSkinProbe::Result measurement = EiemSkinProbe::Measure(self);
     EiemSkinProbe::LogResult(
         EiemIsPartnerRenderer(self) ? "[SKIN-PROBE] phase=setBones partner=1"
@@ -3482,8 +3488,11 @@ static void *EiemCreatePartnerRenderer(void *sourceMeshOwner,
   // Measure both sides of the handover at the moment the Partner is complete.
   // The source Renderer is the control: its skinning is the game's own, so a
   // Partner whose skinned extent disagrees with this one is the defect.
+  //
+  // No TraceTakeBudget here: it is a stub returning constant false, and pairing
+  // it with && made MSVC delete this block as dead code.
   if (EiemModEquals(rendererType, "SkinnedMeshRenderer") &&
-      TraceTakeBudget(&s_traceSkinProbeCount, 200)) {
+      InterlockedIncrement(&s_traceSkinProbeCount) <= 200) {
     const EiemSkinProbe::Result sourceSide =
         EiemSkinProbe::Measure(sourceMeshOwner);
     EiemSkinProbe::LogResult("[SKIN-PROBE] phase=create source=1", sourceSide);
