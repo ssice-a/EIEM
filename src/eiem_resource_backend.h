@@ -331,6 +331,7 @@ static void *s_eiemMeshGetBindPoses = nullptr;
 static void *s_eiemMeshAddBlendShapeFrame = nullptr;
 static void *s_eiemMeshGetBlendShapeFrameCount = nullptr;
 static void *s_eiemMaterialClass = nullptr;
+static void *s_eiemShaderClass = nullptr;
 static void *s_eiemRendererClass = nullptr;
 static void *s_eiemResourceManagerClass = nullptr;
 static void *s_eiemProxyHandleClass = nullptr;
@@ -340,6 +341,11 @@ static void *s_eiemMaterialSetInt = nullptr;
 static void *s_eiemMaterialSetColor = nullptr;
 static void *s_eiemMaterialSetTextureScale = nullptr;
 static void *s_eiemMaterialSetTextureOffset = nullptr;
+// Shader introspection. Used to enumerate a material's properties at runtime so a
+// hide/fade property can be found by name instead of being guessed.
+static void *g_eiemShaderGetPropertyCount = nullptr;
+static void *g_eiemShaderGetPropertyName = nullptr;
+static void *g_eiemShaderGetPropertyType = nullptr;
 static void *s_eiemRendererSetSharedMaterials = nullptr;
 static void *s_eiemResourceManagerLoad = nullptr;
 static void *s_eiemProxyLoadImmediate = nullptr;
@@ -553,6 +559,7 @@ static void EiemResolveResourceBackend(void **assemblies, size_t assemblyCount) 
   s_eiemInt32Class = FindClass("System", "Int32", assemblies, assemblyCount);
   s_eiemObjectClass = FindClass("UnityEngine", "Object", assemblies, assemblyCount);
   s_eiemMaterialClass = FindClass("UnityEngine", "Material", assemblies, assemblyCount);
+  s_eiemShaderClass = FindClass("UnityEngine", "Shader", assemblies, assemblyCount);
   s_eiemRendererClass = FindClass("UnityEngine", "Renderer", assemblies, assemblyCount);
   s_eiemResourceManagerClass = FindClass("Beyond.Resource.Runtime", "BundleResourceManager",
                                          assemblies, assemblyCount);
@@ -658,9 +665,16 @@ static void EiemResolveResourceBackend(void **assemblies, size_t assemblyCount) 
         s_eiemTexture2DClass, ".ctor", textureCtorTypes,
         _countof(textureCtorTypes));
   }
+  if (s_eiemShaderClass) {
+    static const char *const intTypes[] = {"System.Int32"};
+    g_eiemShaderGetPropertyCount = FindMethod(s_eiemShaderClass, "GetPropertyCount", 0);
+    g_eiemShaderGetPropertyName = EiemFindMethodWithParamTypes(
+        s_eiemShaderClass, "GetPropertyName", intTypes, _countof(intTypes));
+    g_eiemShaderGetPropertyType = EiemFindMethodWithParamTypes(
+        s_eiemShaderClass, "GetPropertyType", intTypes, _countof(intTypes));
+  }
   if (s_eiemTextureClass) {
-    static const char *const filterTypes[] = {"UnityEngine.FilterMode"};
-    static const char *const wrapTypes[] = {"UnityEngine.TextureWrapMode"};
+    static const char *const filterTypes[] = {"UnityEngine.FilterMode"};    static const char *const wrapTypes[] = {"UnityEngine.TextureWrapMode"};
     static const char *const intTypes[] = {"System.Int32"};
     static const char *const floatTypes[] = {"System.Single"};
     s_eiemTextureSetFilterMode = EiemFindMethodWithParamTypes(
@@ -1619,6 +1633,55 @@ static bool EiemBuildTextureResource(const EiemModRule &rule, const char *sectio
   return true;
 }
 
+// Name every property the source material's shader exposes, with its type.
+// A material file can request this with `dump_properties=true` so a hide or fade
+// property can be identified from real data rather than guessed; guessing is
+// unsafe because `Material.SetFloat` on a name the shader does not declare is a
+// silent no-op.
+static void EiemLogShaderProperties(void *material, const char *section) {
+  if (!material || !g_material_get_shader || !g_eiemShaderGetPropertyCount ||
+      !g_eiemShaderGetPropertyName || !g_eiemShaderGetPropertyType) {
+    Log("[MAT-DUMP] section=%s unavailable: shader introspection APIs missing "
+        "getShader=%p count=%p name=%p type=%p",
+        section ? section : "<unknown>", g_material_get_shader,
+        g_eiemShaderGetPropertyCount, g_eiemShaderGetPropertyName,
+        g_eiemShaderGetPropertyType);
+    return;
+  }
+  void *shader = Invoke(g_material_get_shader, material);
+  if (!shader) {
+    Log("[MAT-DUMP] section=%s material has no shader", section ? section : "<unknown>");
+    return;
+  }
+  // Material.get_shader returns a boxed Int32 for a zero-argument method.
+  auto unboxInt = [](void *boxed) -> int32_t {
+    __try { return boxed ? *(int32_t *)((char *)boxed + 16) : -1; }
+    __except (1) { return -1; }
+  };
+  const int32_t count = unboxInt(Invoke(g_eiemShaderGetPropertyCount, shader));
+  if (count <= 0 || count > 512) {
+    Log("[MAT-DUMP] section=%s propertyCount=%d", section ? section : "<unknown>", count);
+    return;
+  }
+  char names[768] = {};
+  size_t used = 0;
+  for (int32_t index = 0; index < count; ++index) {
+    void *indexParams[] = {&index};
+    void *nameObject = Invoke(g_eiemShaderGetPropertyName, shader, indexParams);
+    void *typeObject = Invoke(g_eiemShaderGetPropertyType, shader, indexParams);
+    char name[192] = {};
+    if (nameObject) ReadStrUtf8(nameObject, name, sizeof(name));
+    if (!name[0]) continue;
+    const int32_t type = unboxInt(typeObject);
+    const int written = snprintf(names + used, sizeof(names) - used, "%s%s:%d",
+                                 used ? " " : "", name, type);
+    if (written <= 0 || (size_t)written >= sizeof(names) - used) break;
+    used += (size_t)written;
+  }
+  Log("[MAT-DUMP] section=%s properties=%d [%s]",
+      section ? section : "<unknown>", count, names);
+}
+
 static bool EiemBuildMaterialResource(const EiemModRule &rule, const char *section,
                                       void **outMaterial, char *error,
                                       size_t errorSize) {
@@ -1673,8 +1736,12 @@ static bool EiemBuildMaterialResource(const EiemModRule &rule, const char *secti
     return true;
   }
   std::string source;
-  for (const auto &pair : values)
+  bool dumpProperties = false;
+  for (const auto &pair : values) {
     if (_stricmp(pair.first.c_str(), "source") == 0) source = pair.second;
+    if (_stricmp(pair.first.c_str(), "dump_properties") == 0)
+      dumpProperties = pair.second == "true" || pair.second == "1";
+  }
   if (source.empty()) {
     if (error) strncpy_s(error, errorSize, "EIEM material has no source logical path", _TRUNCATE);
     return false;
@@ -1693,6 +1760,13 @@ static bool EiemBuildMaterialResource(const EiemModRule &rule, const char *secti
   }
   void *copyParams[] = {sourceMaterial};
   Invoke(s_eiemMaterialCtorCopy, material, copyParams);
+  if (dumpProperties) {
+    // Name the source material's properties instead of guessing at a hide/fade
+    // property. A `float.` entry that does not exist on the shader is silently
+    // ignored by Unity, so without this a wrong name looks exactly like a
+    // property that had no visible effect.
+    EiemLogShaderProperties(sourceMaterial, resource.section);
+  }
   size_t textureIndex = 0;
   for (const auto &pair : values) {
     const char *key = pair.first.c_str();
