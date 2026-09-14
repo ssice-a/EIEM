@@ -2376,6 +2376,28 @@ def export_package(root, mesh_objects=None, armatures=None, physics_objects=None
         return stats
 
 
+def merging_enabled():
+    """Whether same-source sibling parts are folded into one Mesh on export.
+
+    Both assembly shapes are supported by the runtime and they fail differently,
+    so the choice has to be switchable rather than settled in code:
+
+      merged (default)  one Mesh with one submesh per material slot, mounted on
+                        the game's own Renderer as a direct mesh replacement.
+                        Nothing is created at runtime, so nothing can miss the
+                        game's renderer registry, but the whole group shares one
+                        Renderer and therefore one skin binding.
+      partners          one Renderer per part, created by the plugin after the
+                        game finished assembling. Each part keeps its own skin
+                        binding, at the cost of being registered late.
+
+    Set EIEM_DISABLE_MERGE=1 in the environment Blender runs with to export the
+    partner form instead. The flag is read per export so a single session can
+    produce both and the two packages can be compared directly.
+    """
+    return os.environ.get("EIEM_DISABLE_MERGE", "").strip() not in ("1", "true", "yes")
+
+
 def build_merged_action(mesh_objects, plan, root, object_actions, shape_bindings,
                         material_sections, material_payloads, exported_armatures,
                         physics_sections, seen_mesh_sections, shared_mesh_sections,
@@ -2395,6 +2417,10 @@ def build_merged_action(mesh_objects, plan, root, object_actions, shape_bindings
     single direct mesh replacement with no Partners.
     """
     groups = {}
+    if not merging_enabled():
+        # Partner form requested: leave every part as its own Mesh resource so
+        # the partner declarations below describe all of them.
+        return
     for obj in mesh_objects:
         if obj in plan["hidden"]:
             continue
