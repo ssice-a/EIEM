@@ -1821,6 +1821,12 @@ static bool EiemBuildRendererMaterials(const EiemModRule &rule, void **outArray,
     if (!EiemBuildMaterialResource(rule, rule.materials[index], &items[slot], error, errorSize))
       return false;
   }
+  // Same rule as the sourced path: a slot the Mesh needs but the config does not
+  // declare must not stay null, or Unity draws that submesh with the magenta
+  // error shader.
+  if (arrayCount > 0 && rule.materialCount > 0)
+    for (uint32_t slot = 0; slot < arrayCount; ++slot)
+      if (!items[slot]) items[slot] = items[0];
   EiemApplySubmeshMaterialMap(rule, items, arrayCount);
   if (outArray) *outArray = array;
   return true;
@@ -1856,6 +1862,18 @@ static bool EiemBuildRendererMaterialsForSource(const EiemModRule &rule,
   if (sourceMaterials && sourceCount > 0)
     memcpy(items, (char *)sourceMaterials + IL2CPP_ARRAY_DATA,
            (size_t)sourceCount * sizeof(void *));
+  // A submesh count above the source's material count only happens when the
+  // replacement Mesh carries more submeshes than the source Renderer had
+  // materials -- typically a merged Mesh whose submeshes are the sibling parts.
+  // The slots we do not declare must not be left null: a null slot makes Unity
+  // draw that submesh with no material, which shows as the magenta error
+  // shader. Before the parts were merged each part was its own Renderer and its
+  // first slot received the source's primary material, so extending that
+  // material across the undeclared slots reproduces the previous appearance
+  // instead of inventing one.
+  if (sourceMaterials && sourceCount > 0)
+    for (int slot = sourceCount; slot < requiredCount; ++slot)
+      items[slot] = items[0];
   for (uint32_t i = 0; i < rule.materialCount; ++i) {
     const int slot = rule.materialSlots[i] >= 0 ? rule.materialSlots[i] : (int)i;
     if (!EiemBuildMaterialResource(rule, rule.materials[i], &items[slot],

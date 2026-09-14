@@ -578,7 +578,7 @@ static DWORD WINAPI InitThread(LPVOID) {
       (unsigned long)GetCurrentProcessId(), (unsigned long)GetCurrentThreadId(),
       (unsigned long long)GetTickCount64(),
       InterlockedCompareExchange(&s_eiemModGeneration, 0, 0));
-  Log("[BUILD] resource-runtime-v119-world-bounds-probe dll=%s %s", __DATE__,
+  Log("[BUILD] resource-runtime-v120-material-slot-fill dll=%s %s", __DATE__,
       __TIME__);
 
   if (!Resolve()) {

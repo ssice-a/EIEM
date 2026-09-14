@@ -282,22 +282,28 @@ def derive_name(meshes: list[Mesh], explicit: str | None) -> str:
     return f"{prefix}_MERGED" if prefix else f"{stems[0]}_MERGED"
 
 
-def merge(meshes: list[Mesh], name: str) -> tuple[bytes, dict]:
+def merge(meshes: list[Mesh], name: str, allow_uv_padding: bool = False) -> tuple[bytes, dict]:
     if not meshes:
         raise ValueError("nothing to merge")
 
     palette = union_palette(meshes)
     palette_index = {path: index for index, path in enumerate(palette)}
     uv_dimensions = [mesh.uv_dimensions() for mesh in meshes]
-    # One merged channel cannot hold two different component counts, so every
-    # part must agree per channel.
+    # One merged channel cannot hold two different component counts. Narrowing a
+    # channel would truncate real data, so the default is to refuse. Widening is
+    # safe but must be asked for explicitly, because padding a channel that a
+    # shader actually samples changes what the extra parts read.
+    uv_mismatches = []
     for channel in range(UV_CHANNELS):
-        widths = {dimensions[channel] for dimensions in uv_dimensions}
+        widths = sorted({dimensions[channel] for dimensions in uv_dimensions})
         if len(widths) > 1:
-            raise ValueError(
-                f"uv{channel} is {sorted(widths)} components per vertex across the "
-                "parts; the merged channel needs one width"
-            )
+            uv_mismatches.append((channel, widths))
+    if uv_mismatches and not allow_uv_padding:
+        detail = ", ".join(f"uv{channel}={widths}" for channel, widths in uv_mismatches)
+        raise ValueError(
+            f"{detail}; the merged channel needs one width. Pass --pad-uv to widen "
+            "each channel to the widest part and zero-fill the rest."
+        )
     merged_uv_dimensions = [
         max((dimensions[channel] for dimensions in uv_dimensions), default=0)
         for channel in range(UV_CHANNELS)
@@ -308,6 +314,7 @@ def merge(meshes: list[Mesh], name: str) -> tuple[bytes, dict]:
         "palette": len(palette),
         "palette_union": len({path for mesh in meshes for path in mesh.bone_paths}),
         "uv_dimensions": merged_uv_dimensions,
+        "uv_padded_channels": [channel for channel, _ in uv_mismatches],
     }
 
     # Blend shapes are all-or-nothing: a part with channels cannot be merged
@@ -357,14 +364,22 @@ def merge(meshes: list[Mesh], name: str) -> tuple[bytes, dict]:
         tangents.extend(mesh.tangents)
         colors.extend(mesh.colors)
         for channel, values in enumerate(mesh.uvs):
-            uvs[channel].extend(values)
-            # Pad a part that omits a channel another part supplies, so the
-            # merged channel stays a whole number of vertices per part.
-            if merged_uv_dimensions[channel] > uv_dimensions[position][channel]:
-                missing = (
-                    merged_uv_dimensions[channel] - uv_dimensions[position][channel]
-                )
-                uvs[channel].extend([0.0] * (part_count * missing))
+            # A merged channel is a contiguous block per part at the common
+            # width, so a narrower part is padded per vertex, not appended as a
+            # flat tail. Appending flat would shift every following part.
+            width = merged_uv_dimensions[channel]
+            part_width = uv_dimensions[position][channel]
+            if width == part_width:
+                uvs[channel].extend(values)
+                continue
+            padded = [0.0] * (part_count * width)
+            for vertex in range(part_count):
+                source = vertex * part_width
+                target = vertex * width
+                padded[target : target + part_width] = values[
+                    source : source + part_width
+                ]
+            uvs[channel].extend(padded)
 
         # --- one submesh per part --------------------------------------------
         triangles: list[int] = []
@@ -436,21 +451,29 @@ def merge(meshes: list[Mesh], name: str) -> tuple[bytes, dict]:
             writer.f32(value)
         for value in bones:
             writer.u32(value)
-    # The merged bind poses are the union palette in its declared order. Two
-    # parts that disagree about a shared bone's bind pose cannot be merged into
-    # one palette, so that is a hard error rather than a silent first-wins.
+    # The merged bind poses are the union palette in its declared order. Parts
+    # exported from one skeleton agree to float precision, so a shared bone is
+    # taken from the first part that declares it and the spread is recorded.
+    # A materially different matrix means the parts do not share one skin, which
+    # is a hard error rather than a silent first-wins.
+    bindpose_tolerance = 1e-4
     bindpose_by_path: dict[str, list[float]] = {}
+    bindpose_spread = 0.0
     for mesh in meshes:
         for path, matrix in zip(mesh.bone_paths, mesh.bindposes):
             existing = bindpose_by_path.get(path)
             if existing is None:
                 bindpose_by_path[path] = matrix
-            elif any(abs(a - b) > 1e-5 for a, b in zip(existing, matrix)):
+                continue
+            worst = max(abs(a - b) for a, b in zip(existing, matrix))
+            bindpose_spread = max(bindpose_spread, worst)
+            if worst > bindpose_tolerance:
                 raise ValueError(
-                    "bind pose for %s differs between %s and %s; "
-                    "these parts do not share one skin"
-                    % (path, meshes[0].path.name, mesh.path.name)
+                    "bind pose for %s differs by %.6g between parts (tolerance "
+                    "%.0e); these parts do not share one skin"
+                    % (path, worst, bindpose_tolerance)
                 )
+    report["bindpose_spread"] = bindpose_spread
     writer.i32(len(palette))
     for path in palette:
         matrix = bindpose_by_path.get(path)
@@ -524,6 +547,15 @@ def main() -> int:
         help="mod.ini material section per part, in the same order",
     )
     parser.add_argument("--report", help="write the merge report as JSON to this path")
+    parser.add_argument(
+        "--pad-uv",
+        action="store_true",
+        help=(
+            "widen every UV channel to the widest part and zero-fill the rest; "
+            "required when parts disagree, e.g. uv2 is 2 floats in one group and "
+            "4 in another"
+        ),
+    )
     args = parser.parse_args()
 
     targets = list(args.parts)
@@ -552,7 +584,7 @@ def main() -> int:
 
     name = derive_name(meshes, args.name)
     try:
-        payload, report = merge(meshes, name)
+        payload, report = merge(meshes, name, allow_uv_padding=args.pad_uv)
     except ValueError as error:
         print(f"error: {error}", file=sys.stderr)
         return 3

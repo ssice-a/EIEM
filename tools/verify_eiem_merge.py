@@ -21,7 +21,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from merge_eiem_mesh import Mesh  # noqa: E402
 
 
-def compare(merged: Mesh, part: Mesh, offset: int, submesh_index: int) -> list[str]:
+def compare(
+    merged: Mesh, part: Mesh, offset: int, submesh_index: int, uv_padded: bool = False
+) -> list[str]:
     problems: list[str] = []
     span = part.vertex_count
 
@@ -56,27 +58,43 @@ def compare(merged: Mesh, part: Mesh, offset: int, submesh_index: int) -> list[s
         merged_values = getattr(merged, label)[offset * stride : (offset + span) * stride]
         same(label, merged_values, getattr(part, label))
     # UV channels are not fixed at two components; compare each channel at its
-    # own declared width, padding the narrower side the way the merge does.
+    # own declared width. When the merge widened a channel, the extra components
+    # must be exactly zero -- that is the contract -- so they are checked rather
+    # than skipped, and the part's own values must survive unchanged.
     part_uv = part.uv_dimensions()
     merged_uv = merged.uv_dimensions()
     for channel in range(8):
         width = merged_uv[channel]
         part_width = part_uv[channel]
-        expected = list(part.uvs[channel])
-        if width > part_width:
-            padded = []
-            for vertex in range(span):
-                start = vertex * part_width
-                padded.extend(expected[start : start + part_width])
-                padded.extend([0.0] * (width - part_width))
-            expected = padded
         if width == 0 and part_width == 0:
             continue
-        same(
-            f"uv{channel}",
-            merged.uvs[channel][offset * width : (offset + span) * width],
-            expected,
-        )
+        merged_values = merged.uvs[channel][offset * width : (offset + span) * width]
+        same(f"uv{channel} width", [len(merged_values)], [span * width])
+        expected = list(part.uvs[channel])
+        if width == part_width:
+            same(f"uv{channel}", merged_values, expected)
+            continue
+        if width < part_width:
+            problems.append(
+                f"uv{channel}: merged is {width} components, part needs {part_width}"
+            )
+            continue
+        # Merged is wider: check the real components and the zero padding.
+        trimmed: list[float] = []
+        padding: list[float] = []
+        for vertex in range(span):
+            start = vertex * width
+            trimmed.extend(merged_values[start : start + part_width])
+            padding.extend(merged_values[start + part_width : start + width])
+        same(f"uv{channel} values", trimmed, expected)
+        if not uv_padded:
+            problems.append(
+                f"uv{channel}: merged is wider ({width} vs {part_width}) but the "
+                "merge did not declare UV padding"
+            )
+        elif any(value != 0.0 for value in padding):
+            non_zero = next(value for value in padding if value != 0.0)
+            problems.append(f"uv{channel} padding is not zero (found {non_zero!r})")
 
     # --- indices, re-based back to part-local vertex numbers -----------------
     topology, start, count, _base, first, vertices = merged.submeshes[submesh_index]
@@ -124,10 +142,17 @@ def compare(merged: Mesh, part: Mesh, offset: int, submesh_index: int) -> list[s
             break
 
     # --- skeleton assets, remapped through the part's own palette -----------
+    # Parts exported from one skeleton agree on bind poses only to float
+    # precision, so this checks the same tolerance the merge enforces instead of
+    # demanding bit equality.
     for index, path in enumerate(part.bone_paths):
         merged_index = palette_index[path]
-        if merged.bindposes[merged_index] != part.bindposes[index]:
-            problems.append(f"bindpose[{path}] differs")
+        worst = max(
+            abs(a - b)
+            for a, b in zip(merged.bindposes[merged_index], part.bindposes[index])
+        )
+        if worst > 1e-4:
+            problems.append(f"bindpose[{path}] differs by {worst:.6g}")
             break
     return problems
 
@@ -136,6 +161,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("merged", help="merged EIEMESH file")
     parser.add_argument("parts", nargs="+", help="original part files in submesh order")
+    parser.add_argument(
+        "--pad-uv",
+        action="store_true",
+        help="the merged file was written with widened, zero-filled UV channels",
+    )
     args = parser.parse_args()
 
     merged = Mesh(Path(args.merged))
@@ -151,7 +181,7 @@ def main() -> int:
     failed = 0
     for position, target in enumerate(args.parts):
         part = Mesh(Path(target))
-        problems = compare(merged, part, offset, position)
+        problems = compare(merged, part, offset, position, args.pad_uv)
         status = "OK" if not problems else f"FAIL ({len(problems)})"
         print(f"[{position}] {part.path.name}: {status}")
         for problem in problems[:10]:
