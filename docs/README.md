@@ -13,7 +13,7 @@
 | Physics 源作者 v2 | 正常解包输出源图、完整字段/曲线/原始字节、物理 Transform、共享引用、三种原生碰撞体外形、参数复制和 C++ 树读取 | AnimeStudio .NET 9 Release 与 Blender 5 正常整包导入通过；源球/胶囊可转换到作者 v5；无限平面与整份 v2 图仍不由 DLL 实例化 |
 | DLL 配置准备 | v80 在既有参数写入、LOD 与蒙皮调度基础上，为纯 partner 列表变化增加差集更新，不再整 Mod 销毁/重建无关 Renderer | MSVC 宿主回归与完整 DLL 构建通过并已部署；按键后贴地是否消失仍待新进程实机验证，F10 仍是完整重建路径 |
 | 原生物理研究 | v65 实机已完成最小 BoneCloth 的配置、`BuildAndRun`、异步 Team 构建和 Animator 接纳；v66 确认 MOVE 节点写回和场景卸载注销；v70 确认新增节点产生可见 Mesh 变形 | team 编号可复用；v71 已验证 `blendWeight` 响应；作者 v5 碰撞体和 v2 源图实例化仍未验证 |
-| Physics 实例所有者调查 | v61 已按 Mesh 命中记录注册模型的 Animator/现有 Cloth，并在 NPC `_BuildBeyondCloth → StartNPC → ReleaseAvatar/OnRelease` 边界关联模型根、Animator 与 Avatar owner | v70 实机确认两个目标 NPC 创建 Physics；v71 F10 与自然卸载均观察到 NPC 最终 `retired` 和 Skeleton 自有节点退休 |
+| Physics 实例所有者调查 | v61 已按 Mesh 命中记录注册模型的 Animator/现有 Cloth，并在 NPC `StartNPC → ReleaseAvatar/OnRelease` 边界关联模型根、Animator 与 Avatar owner | v70 实机确认两个目标 NPC 创建 Physics；v71 F10 与自然卸载均观察到 NPC 最终 `retired` 和 Skeleton 自有节点退休 |
 | Physics 生产适配器 | v67～v71 已按同一 Mesh 规则为主模型、角色 UI 和 NPC 建立独立实例；v72～v79 将作者碰撞体、参数、Skeleton 代际纳入相同实例所有权与退休收集 | 03:46 前日志确认 Team ready、12/12 MOVE 节点变化且 5 个碰撞体进入实例；03:46 后当前包已无 Physics，必须重导后再验收视觉强度 |
 
 当前 03:46 生成的 Typhoea 包没有 `.physics`、`[Physics...]` 或 `physics=`；F10 日志已从

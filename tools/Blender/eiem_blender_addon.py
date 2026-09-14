@@ -2347,6 +2347,33 @@ def write_export_package(root, plan, armatures, physics_objects=None):
         if len(objects) == 1 and first in object_actions and first not in plan["bindings"]:
             render_lines.extend(object_actions[first] + [""])
             continue
+
+        # A split source Render represents one model-level dependency graph.
+        # When every emitted part uses the same Skeleton/Physics resource,
+        # publish those dependencies once on the source Render.  Repeating
+        # them on each Partner made the INI look like each extra Renderer owned
+        # an independent skeleton/physics instance, while the runtime already
+        # treats Physics as model-level and Partners as renderer templates.
+        # Keep mixed-resource groups explicit: do not silently choose the
+        # first part's dependency and discard another part's binding.
+        active_objects = [obj for obj in objects if obj in object_actions]
+        dependency_pairs = []
+        for obj in active_objects:
+            dependency = {"skeleton": "", "physics": ""}
+            for line in object_actions[obj]:
+                if line.startswith("skeleton="):
+                    dependency["skeleton"] = line.split("=", 1)[1]
+                elif line.startswith("physics="):
+                    dependency["physics"] = line.split("=", 1)[1]
+            dependency_pairs.append((dependency["skeleton"], dependency["physics"]))
+        shared_skeleton = shared_physics = ""
+        if dependency_pairs and all(pair == dependency_pairs[0]
+                                    for pair in dependency_pairs):
+            shared_skeleton, shared_physics = dependency_pairs[0]
+            if shared_skeleton:
+                render_lines.append("skeleton=" + shared_skeleton)
+            if shared_physics:
+                render_lines.append("physics=" + shared_physics)
         render_lines.append("handling=skip")
         templates = []
         for slot, obj in enumerate(o for o in objects if o in object_actions):
@@ -2361,7 +2388,13 @@ def write_export_package(root, plan, armatures, physics_objects=None):
                                          "    partner.%d=%s" % (slot, partner), "endif"])
             else:
                 render_lines.append("partner.%d=%s" % (slot, partner))
-            templates.extend(["[" + partner + "]"] + object_actions[obj] + [""])
+            partner_action = object_actions[obj]
+            if shared_skeleton or shared_physics:
+                partner_action = [
+                    line for line in partner_action
+                    if not line.startswith(("skeleton=", "physics="))
+                ]
+            templates.extend(["[" + partner + "]"] + partner_action + [""])
         render_lines.extend([""] + templates)
 
     if material_payloads:

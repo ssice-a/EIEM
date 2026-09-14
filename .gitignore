@@ -16,6 +16,10 @@ bin/
 /tmp_*
 /tools/_inspect_skel.py
 
+# Pre-deploy plugin binaries kept for quick rollback. These are build outputs,
+# not sources; the corresponding releases live outside the repository.
+/backups/
+
 # AnimeStudio keeps its own source-control history.
 /tools/AnimeStudio/
 

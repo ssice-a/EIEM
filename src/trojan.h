@@ -806,134 +806,12 @@ static float s_curFootTargetL[3] = {};
 static float s_curFootTargetR[3] = {};
 static float s_baseAnkleHeight = 0.12f;
 
-static void *s_origMoveTick = nullptr;
 static void *s_cachedMovementComp = nullptr;
 static void *s_cachedEntity = nullptr;
 
 typedef void (__fastcall *FindFloorNative_t)(
   void *self, float *position, void *outResult, float stepDown, void *methodInfo);
 static FindFloorNative_t s_findFloorNativeFn = nullptr;
-
-static void __fastcall Hooked_MovementComponent_Tick(void *self, float deltaTime, void *methodInfo) {
-  typedef void (__fastcall *fn)(void *, float, void *);
-
-  if (g_shutdownRequested) {
-    if (s_origMoveTick)
-      ((fn)s_origMoveTick)(self, deltaTime, methodInfo);
-    return;
-  }
-  
-  if (!s_cachedMovementComp && g_cachedAnimator) {
-    __try {
-      void *entity = *(void **)((char *)self + g_offBaseCompEntity);
-      if (entity && (uintptr_t)entity > 0x10000) {
-        if (entity == g_mainCharEntity || !g_mainCharEntity) {
-          s_cachedMovementComp = self;
-          s_cachedEntity = entity;
-          Log("[GF2-HOOK] MATCH! MovementComponent=%p Entity=%p", self, entity);
-        }
-      }
-    } __except(1) {}
-  }
-  
-  if (s_origMoveTick)
-    ((fn)s_origMoveTick)(self, deltaTime, methodInfo);
-}
-
-static void *s_origUpdateSolver = nullptr;
-static void __fastcall Hooked_IK_UpdateSolver(void *self, void *methodInfo);
-
-static void *s_origOnUpdate = nullptr;
-
-static void __fastcall Hooked_OnUpdate(void *self, void *methodInfo) {
-  typedef void (__fastcall *fn)(void *, void *);
-
-  if (g_shutdownRequested) {
-    if (s_origOnUpdate)
-      ((fn)s_origOnUpdate)(self, methodInfo);
-    return;
-  }
-
-  __try {
-    if (g_mmdIKActive) {
-      if (self == g_activeLfSolver && g_activeLfSolver) {
-        *(float *)((char *)self + OFF_IKSOLVER_IKPOS_X) = s_curFootTargetL[0];
-        *(float *)((char *)self + OFF_IKSOLVER_IKPOS_Y) = s_curFootTargetL[1];
-        *(float *)((char *)self + OFF_IKSOLVER_IKPOS_Z) = s_curFootTargetL[2];
-        *(float *)((char *)self + OFF_IKSOLVER_IKPOS_WEIGHT) = 1.0f;
-      }
-      else if (self == g_activeRfSolver && g_activeRfSolver) {
-        *(float *)((char *)self + OFF_IKSOLVER_IKPOS_X) = s_curFootTargetR[0];
-        *(float *)((char *)self + OFF_IKSOLVER_IKPOS_Y) = s_curFootTargetR[1];
-        *(float *)((char *)self + OFF_IKSOLVER_IKPOS_Z) = s_curFootTargetR[2];
-        *(float *)((char *)self + OFF_IKSOLVER_IKPOS_WEIGHT) = 1.0f;
-      }
-    }
-  } __except (EXCEPTION_EXECUTE_HANDLER) {}
-
-  if (s_origOnUpdate) {
-    ((fn)s_origOnUpdate)(self, methodInfo);
-  }
-}
-
-static void __fastcall Hooked_IK_UpdateSolver(void *self, void *methodInfo) {
-  typedef void (__fastcall *fn)(void *, void *);
-
-  if (g_shutdownRequested) {
-    if (s_origUpdateSolver)
-      ((fn)s_origUpdateSolver)(self, methodInfo);
-    return;
-  }
-  __try {
-    if (g_mmdIKActive && self) {
-      void *solvers = *(void **)((char *)self + OFF_BIPEDIK_SOLVERS);
-      if (solvers) {
-        void *lh = *(void **)((char *)solvers + OFF_SOLVERS_LEFT_HAND);
-        void *rh = *(void **)((char *)solvers + OFF_SOLVERS_RIGHT_HAND);
-        void *sp = *(void **)((char *)solvers + OFF_SOLVERS_SPINE);
-        void *la = *(void **)((char *)solvers + OFF_SOLVERS_LOOKAT);
-        void *aim = *(void **)((char *)solvers + OFF_SOLVERS_AIM);
-        void *pelvis = *(void **)((char *)solvers + 0x48);
-
-        if (lh) {
-          *(float *)((char *)lh + OFF_IKSOLVER_IKPOS_WEIGHT) = 0.0f;
-          *(void **)((char *)lh + OFF_IKTRIG_TARGET) = nullptr;
-        }
-        if (rh) {
-          *(float *)((char *)rh + OFF_IKSOLVER_IKPOS_WEIGHT) = 0.0f;
-          *(void **)((char *)rh + OFF_IKTRIG_TARGET) = nullptr;
-        }
-        if (sp) {
-          *(float *)((char *)sp + OFF_IKSOLVER_IKPOS_WEIGHT) = 0.0f;
-          *(void **)((char *)sp + OFF_IKTRIG_TARGET) = nullptr;
-        }
-        if (la) {
-          *(float *)((char *)la + OFF_IKSOLVER_IKPOS_WEIGHT) = 0.0f;
-          *(float *)((char *)la + 0xA0) = 0.0f; 
-          *(float *)((char *)la + 0xA4) = 0.0f; 
-          *(float *)((char *)la + 0xA8) = 0.0f; 
-          *(float *)((char *)la + 0xAC) = 0.0f; 
-          *(void **)((char *)la + 0x58) = nullptr; 
-        }
-        if (aim) {
-          *(float *)((char *)aim + OFF_IKSOLVER_IKPOS_WEIGHT) = 0.0f;
-          *(float *)((char *)aim + 0xB4) = 0.0f; 
-          *(float *)((char *)aim + 0xC0) = 0.0f; 
-          *(void **)((char *)aim + 0x88) = nullptr; 
-        }
-        if (pelvis) {
-          *(float *)((char *)pelvis + 0x38) = 0.0f; 
-          *(float *)((char *)pelvis + 0x54) = 0.0f; 
-          *(void **)((char *)pelvis + 0x18) = nullptr; 
-        }
-      }
-    }
-  } __except(1) {}
-
-  if (s_origUpdateSolver) {
-    ((fn)s_origUpdateSolver)(self, methodInfo);
-  }
-}
 
 static void PreSampleVmdCenter() {
   s_vmdCenterSampled = false;
@@ -2303,7 +2181,6 @@ static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
   // proxy hooks.
   if (!s_eiemUnityThreadId) s_eiemUnityThreadId = GetCurrentThreadId();
   EiemStartPhysicsAutoTraceOnUnityThread();
-  EiemPhysicsRuntimePeriodic("window-main-thread");
 
   // Capture the original procedure before signalling worker threads. The
   // hotkey thread restores the subclass asynchronously during shutdown.
@@ -2382,6 +2259,10 @@ static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     return 0;
   }
   if (msg == WM_EIEM_MOD_RECONCILE) {
+    // Consume the wake-up token before taking the request bitmask.  Requests
+    // arriving while reconcile runs can then post exactly one follow-up
+    // message instead of being stranded behind this message.
+    InterlockedExchange(&s_eiemModUpdateMessagePosted, 0);
     EiemRunModReconcile();
     return 0;
   }

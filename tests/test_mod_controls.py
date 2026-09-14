@@ -73,10 +73,6 @@ static const char *EiemModelOwnerKindName(EiemModelOwnerKind kind) {
   return "Unknown";
 }
 static void EiemReleaseModelPhysics(void *, const char *) {}
-static void EiemPhysicsOwnerProbeObserveModel(
-    const char *, void *, void *, const char *) {}
-static void EiemPhysicsOwnerProbeObserveRelease(
-    const char *, void *, void *, const char *) {}
 '''
 
 MAIN = r'''
@@ -141,6 +137,10 @@ int main(int argc, char **argv) {
       "[RenderPart]\nmesh=MeshNew\n");
     CHECK(EiemModParseStream(input, "a/mod.ini", program, &error));
     EiemPublishModState(program); s_eiemModGeneration = 9;
+    std::vector<EiemModRule> potential;
+    EiemFindPotentialPartnerRules("a/mod.ini", "RenderMain", &potential);
+    CHECK(potential.size() == 1);
+    CHECK(std::string(potential[0].section) == "RenderPart");
     EiemModProgram next; std::vector<std::string> affected;
     bool shapesOnly = false, partnerLinksOnly = false;
     CHECK(EiemPrepareInputUpdate({{{VK_F6,0},9}}, &next, &affected,

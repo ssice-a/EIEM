@@ -15,6 +15,9 @@ class NativePhysicsRuntimeContracts(unittest.TestCase):
             ROOT / "src" / "eiem_skeleton_runtime.h"
         ).read_text(encoding="utf-8")
         cls.trace = (ROOT / "src" / "il2cpp_trace.h").read_text(encoding="utf-8")
+        cls.registration = (
+            ROOT / "src" / "eiem_registration_trace.h"
+        ).read_text(encoding="utf-8")
         cls.mods = (ROOT / "src" / "eiem_mods.h").read_text(encoding="utf-8")
         cls.diagnostic = (
             ROOT / "src" / "eiem_native_physics_diagnostic.h"
@@ -23,8 +26,11 @@ class NativePhysicsRuntimeContracts(unittest.TestCase):
 
     def test_resource_runtime_is_automatic_and_separate_from_dump_ui(self):
         self.assertIn('#include "eiem_native_physics_runtime.h"', self.trace)
-        self.assertNotIn('#include "eiem_native_physics_factory_probe.h"', self.trace)
-        self.assertIn('EiemPhysicsRuntimePeriodic("window-main-thread")', self.trojan)
+        self.assertNotIn('eiem_native_physics_factory_probe.h', self.trace)
+        self.assertNotIn("EiemPhysicsRuntimePeriodic", self.trojan)
+        self.assertIn('EiemPhysicsRuntimeBoundary("mod reconcile begin")', self.trace)
+        self.assertIn("s_eiemPhysicsRuntimePendingReady", self.runtime)
+        self.assertIn("EiemPhysicsRuntimeRetireChangedAssets", self.runtime)
         self.assertNotIn("ImGui", self.runtime)
         self.assertNotIn("scene_dump", self.runtime)
 
@@ -63,8 +69,8 @@ class NativePhysicsRuntimeContracts(unittest.TestCase):
 
     def test_ready_requires_live_process_and_expected_animator(self):
         poll = self.runtime[
-            self.runtime.index("static void EiemPhysicsRuntimePollReady") :
-            self.runtime.index("static void EiemPhysicsRuntimePeriodic")
+            self.runtime.index("static void EiemPhysicsRuntimeCheckReady") :
+            self.runtime.index("static void EiemPhysicsRuntimeBoundary")
         ]
         for required in ("processValid", "processRunning", "processTeamId"):
             self.assertIn(required, poll)
@@ -79,7 +85,7 @@ class NativePhysicsRuntimeContracts(unittest.TestCase):
         self.assertIn("EiemPhysicsRuntimeDead", self.runtime)
         dead = self.runtime[
             self.runtime.index("static bool EiemPhysicsRuntimeDead") :
-            self.runtime.index("static void EiemPhysicsRuntimeCollect")
+            self.runtime.index("static size_t EiemPhysicsRuntimeCollect")
         ]
         self.assertIn("hostRef.Status()", dead)
         self.assertIn("componentRef.Status()", dead)
@@ -87,7 +93,7 @@ class NativePhysicsRuntimeContracts(unittest.TestCase):
         self.assertIn("collider.transformRef.Status()", dead)
         release = self.runtime[
             self.runtime.index("static void EiemReleaseModelPhysics") :
-            self.runtime.index("static void EiemPhysicsRuntimePollReady")
+            self.runtime.index("static void EiemPhysicsRuntimeCheckReady")
         ]
         self.assertIn("s_eiemPhysicsPendingReleases.push_back", release)
         self.assertIn("EiemPhysicsRuntimeDrainReleases", self.runtime)
@@ -135,18 +141,51 @@ class NativePhysicsRuntimeContracts(unittest.TestCase):
         self.assertIn("paletteHits", self.runtime)
         self.assertIn("palette=%zu selected=%zu paletteHits=%zu boundaryIgnores=%zu", self.runtime)
         self.assertIn("boundaryIgnores += group.boundaryIgnores.size()", self.runtime)
+        self.assertIn("instance=%p skeleton=%p anchor=%p", self.runtime)
+        self.assertIn("firstSelectedPath=%s", self.runtime)
+
+    def test_registration_probe_checks_partner_membership_in_game_arrays(self):
+        self.assertIn("EiemRegistrationTracePartnerEntry", self.registration)
+        self.assertIn("EiemRegistrationTraceArrayMembers", self.registration)
+        self.assertIn("EiemRegistrationTraceParallelArrays", self.registration)
+        self.assertIn("EiemTraceKnownPartnerParallelArrays", self.trace)
+        self.assertIn("EiemRegisterPartnersInSkinArrays", self.trace)
+        self.assertIn("EiemCopyExpandedRendererPointers", self.trace)
+        self.assertIn("rootBoneElementSize", self.trace)
+        self.assertIn('"AssignSkinPre"', self.trace)
+        self.assertIn('"CreateSMSInfoForPostModelPost"', self.trace)
+        self.assertIn("partnerHits=%zu/%zu", self.registration)
+        self.assertIn("firstVisibleMissing=%s", self.registration)
+        for boundary in (
+            '"AssignSkinPost"',
+            '"SetSMRRootBone"',
+            '"CreateSMSGO"',
+            '"CreateSMSInfoForPostModel"',
+        ):
+            self.assertIn(
+                f'EiemTraceKnownPartnerArrayMembers(\n      {boundary}',
+                self.trace,
+            )
+
+    def test_partner_commit_probe_distinguishes_public_assignment_from_game_registration(self):
+        self.assertIn("skinArrayObserved", self.trace)
+        self.assertIn("[PARTNER-COMMIT-v102]", self.trace)
+        self.assertIn('strcmp(boundary, "partner-created")', self.trace)
+        self.assertIn('strstr(boundary, "refresh")', self.trace)
+        self.assertIn("gameArray=%d", self.trace)
 
     def test_runtime_observes_visible_palette_and_move_node_writeback(self):
         self.assertIn("EiemPhysicsRuntimeLogPartnerBinding", self.runtime)
         self.assertIn("visible-binding generation=", self.runtime)
         self.assertIn("partner.skeleton == instance.skeleton", self.runtime)
-        self.assertIn("group.authorNodes[index].role != 1", self.runtime)
-        self.assertIn("EiemPhysicsRuntimeObserveMotion", self.runtime)
-        self.assertIn("maxLocalPositionDeltaSq", self.runtime)
-        self.assertIn("instance.motionSamples >= 16", self.runtime)
+        self.assertNotIn("EiemPhysicsRuntimeObserveMotion", self.runtime)
+        self.assertNotIn("maxLocalPositionDeltaSq", self.runtime)
+        self.assertNotIn("instance.motionSamples", self.runtime)
 
-    def test_deterministic_failure_is_not_rebuilt_every_periodic_poll(self):
+    def test_deterministic_failure_is_not_rebuilt_until_a_new_boundary(self):
         self.assertIn("struct EiemPhysicsRuntimeFailure", self.runtime)
+        self.assertIn("uint64_t assetStamp", self.runtime)
+        self.assertIn("EiemPhysicsRuntimeAssetStamp", self.runtime)
         self.assertIn("EiemPhysicsRuntimeFailureMatches", self.runtime)
         self.assertIn("EiemPhysicsRuntimeRememberFailure", self.runtime)
         reconcile = self.runtime[
@@ -156,7 +195,7 @@ class NativePhysicsRuntimeContracts(unittest.TestCase):
         self.assertIn("if (!failed && !EiemPhysicsRuntimeBuild", reconcile)
         self.assertIn("&&\n        !retryable", reconcile)
         self.assertIn("retry-suppressed", reconcile)
-        self.assertIn("failure.asset == intent.asset", reconcile)
+        self.assertIn("failure.assetStamp ==", reconcile)
 
     def test_shutdown_only_finishes_the_trace(self):
         finish = self.diagnostic[

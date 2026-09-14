@@ -1,8 +1,10 @@
 #pragma once
 #include <cctype>
+#include <cmath>
 #include <mutex>
 #include <unordered_set>
 #include "eiem_skeleton_document.h"
+#include "eiem_registration_trace.h"
 
 // Only instantiated on the Unity thread. Consumers keep leases until their
 // source Mesh/bones are restored. The registry owns the final retirement ref.
@@ -26,6 +28,22 @@ static std::mutex s_eiemSkeletonConsumerMutex;
 static void EiemRetainSkeletonConsumer(EiemSkeletonInstance &instance, const EiemUnityRef &reference) {
   std::lock_guard<std::mutex> guard(s_eiemSkeletonConsumerMutex);
   instance.retiringConsumers.push_back(reference);
+}
+
+// A live Partner can be rebound to a newer Skeleton generation during F10.
+// Remove its old deferred-retirement lease before releasing that generation;
+// otherwise the old instance would stay permanently "consumed" by a Renderer
+// that now points at the new node array.
+static void EiemReleaseSkeletonConsumer(EiemSkeletonInstance &instance,
+                                         void *consumer) {
+  std::lock_guard<std::mutex> guard(s_eiemSkeletonConsumerMutex);
+  for (size_t index = 0; index < instance.retiringConsumers.size();) {
+    if (consumer && instance.retiringConsumers[index].Target() != consumer) {
+      ++index;
+      continue;
+    }
+    instance.retiringConsumers.erase(instance.retiringConsumers.begin() + index);
+  }
 }
 
 static bool EiemSkeletonCall(void *method, void *object, void **args = nullptr, void **out = nullptr) {
@@ -145,8 +163,10 @@ static bool EiemSkeletonResolveLivePath(void *root, const std::string &relative,
 static bool EiemSkeletonSourceNodes(
     const EiemSkeletonDocument &document, void *renderer,
     const std::unordered_set<std::string> *virtualPaths,
-    std::vector<void *> &nodes, std::string &error) {
+    std::vector<void *> &nodes, std::string &error,
+    size_t *ancestryFallbacks = nullptr) {
   nodes.assign(document.nodes.size(),nullptr);
+  if (ancestryFallbacks) *ancestryFallbacks = 0;
   void *palette = nullptr;
   if (!EiemSkeletonCall(g_smr_get_bones,renderer,nullptr,&palette)) { error="Cannot read source bone palette"; return false; }
   const size_t count = EiemManagedArrayLength(palette);
@@ -208,6 +228,117 @@ static bool EiemSkeletonSourceNodes(
     if (!EiemSkeletonResolveLivePath(
             root->second, relative, prefix + node.path, &resolved, error))
       return false;
+    // Some model variants expose a bone in SkinnedMeshRenderer.bones and its
+    // ancestry, but the Transform child walk is not a complete view of that
+    // hierarchy (the game can insert a runtime wrapper or reorder children).
+    // The palette ancestry is still an exact path identity, so reuse that
+    // Animator-owned Transform before considering a private replacement.
+    if (!resolved) {
+      const std::string fullPath = prefix + node.path;
+      const auto exact = ancestors.find(fullPath);
+      if (exact != ancestors.end() &&
+          EiemNativeObjectStatus(exact->second) == 1) {
+        resolved = exact->second;
+        if (ancestryFallbacks) ++*ancestryFallbacks;
+      }
+    }
+    // Physics Skeleton files can be authored from a sibling PFB variant. A
+    // source node may then have the same parent and exported local TRS but a
+    // different variant-specific name (for example a generated collider or a
+    // renamed skirt segment). Do not immediately replace that source with a
+    // Mod-owned Transform: first resolve a unique live child under the already
+    // resolved parent. This keeps the slot in the Animator-owned hierarchy and
+    // avoids a static private bone putting the whole weighted section in a
+    // bind/T-pose. The match is data-driven and never contains character names.
+    if (!resolved && virtualPaths && virtualPaths->count(node.path) &&
+        node.parent >= 0 && (size_t)node.parent < nodes.size() &&
+        nodes[node.parent]) {
+      void *parentTransform = nodes[node.parent];
+      void *boxedCount = nullptr;
+      int childCount = -1;
+      if (EiemSkeletonCall(g_transform_get_childCount, parentTransform,
+                           nullptr, &boxedCount) && boxedCount)
+        childCount = *(int *)((char *)boxedCount + 16);
+      const size_t slash = node.path.find_last_of('/');
+      const std::string leaf = slash == std::string::npos
+                                   ? node.path
+                                   : node.path.substr(slash + 1);
+      void *nameMatch = nullptr;
+      void *trsMatch = nullptr;
+      size_t nameMatches = 0;
+      size_t trsMatches = 0;
+      auto readVector3 = [](void *getter, void *object, float out[3]) {
+        if (!getter || !object) return false;
+        void *boxed = nullptr;
+        if (!EiemSkeletonCall(getter, object, nullptr, &boxed) || !boxed)
+          return false;
+        const float *value = (const float *)((char *)boxed + 16);
+        out[0] = value[0]; out[1] = value[1]; out[2] = value[2];
+        return true;
+      };
+      auto readQuaternion = [](void *getter, void *object, float out[4]) {
+        if (!getter || !object) return false;
+        void *boxed = nullptr;
+        if (!EiemSkeletonCall(getter, object, nullptr, &boxed) || !boxed)
+          return false;
+        const float *value = (const float *)((char *)boxed + 16);
+        out[0] = value[0]; out[1] = value[1];
+        out[2] = value[2]; out[3] = value[3];
+        return true;
+      };
+      auto close = [](float left, float right, float tolerance) {
+        return std::fabs(left - right) <= tolerance;
+      };
+      if (childCount >= 0 && childCount <= 16384 &&
+          g_transform_GetChild && g_object_get_name) {
+        for (int child = 0; child < childCount; ++child) {
+          void *params[] = {&child};
+          void *candidate = nullptr;
+          if (!EiemSkeletonCall(g_transform_GetChild, parentTransform, params,
+                                &candidate) ||
+              !candidate || EiemNativeObjectStatus(candidate) != 1)
+            continue;
+          void *boxedName = nullptr;
+          if (!EiemSkeletonCall(g_object_get_name, candidate, nullptr,
+                                &boxedName) || !boxedName)
+            continue;
+          char candidateName[256] = {};
+          ReadStrUtf8(boxedName, candidateName, sizeof(candidateName));
+          if (leaf == candidateName) {
+            nameMatch = candidate;
+            ++nameMatches;
+          }
+
+          float position[3] = {}, rotation[4] = {}, scale[3] = {};
+          const bool hasTrs =
+              readVector3(g_transform_get_localPosition, candidate, position) &&
+              readQuaternion(g_transform_get_localRotation, candidate,
+                             rotation) &&
+              readVector3(g_transform_get_localScale, candidate, scale);
+          bool sameTrs = hasTrs;
+          for (size_t axis = 0; sameTrs && axis < 3; ++axis)
+            sameTrs = close(position[axis], node.position[axis], 0.001f) &&
+                      close(scale[axis], node.scale[axis], 0.001f);
+          for (size_t axis = 0; sameTrs && axis < 4; ++axis)
+            sameTrs = close(rotation[axis], node.rotation[axis], 0.002f);
+          if (sameTrs) {
+            trsMatch = candidate;
+            ++trsMatches;
+          }
+        }
+      }
+      if (nameMatches == 1)
+        resolved = nameMatch;
+      else if (!resolved && nameMatches == 0 && trsMatches == 1)
+        resolved = trsMatch;
+      if (resolved) {
+        if (ancestryFallbacks) ++*ancestryFallbacks;
+        Log("[SKELETON-BIND-FALLBACK] source=%s parent=%p resolved=%p "
+            "nameMatches=%zu trsMatches=%zu",
+            node.path.c_str(), parentTransform, resolved, nameMatches,
+            trsMatches);
+      }
+    }
     if (!resolved) {
       if (i != 0 && virtualPaths && virtualPaths->count(node.path)) continue;
       error = "Source bone is missing (not a new bone): " + node.path;
@@ -237,7 +368,28 @@ static bool EiemAcquireSkeletonDocument(
   };
   if (!EiemOnUnityThread()) return fail("Skeleton requires Unity thread");
   std::vector<void *> source;
-  if (!EiemSkeletonSourceNodes(document,renderer,virtualPaths,source,error)) return fail(error.empty()?"Cannot resolve source Skeleton":error);
+  size_t ancestryFallbacks = 0;
+  if (!EiemSkeletonSourceNodes(document,renderer,virtualPaths,source,error,
+                               &ancestryFallbacks))
+    return fail(error.empty()?"Cannot resolve source Skeleton":error);
+  size_t missingSource = 0, missingNew = 0;
+  std::string firstMissingSource, firstMissingNew;
+  for (size_t i = 0; i < document.nodes.size(); ++i) {
+    if (source[i]) continue;
+    if (document.nodes[i].source) {
+      ++missingSource;
+      if (firstMissingSource.empty()) firstMissingSource = document.nodes[i].path;
+    } else {
+      ++missingNew;
+      if (firstMissingNew.empty()) firstMissingNew = document.nodes[i].path;
+    }
+  }
+  Log("[SKELETON-BIND] key=%s anchor=%p sourceMissing=%zu newMissing=%zu "
+      "ancestryFallback=%zu firstSource=%s firstNew=%s",
+      key.c_str(), source.empty() ? nullptr : source.front(), missingSource,
+      missingNew, ancestryFallbacks,
+      firstMissingSource.empty() ? "<none>" : firstMissingSource.c_str(),
+      firstMissingNew.empty() ? "<none>" : firstMissingNew.c_str());
   EiemCollectSkeletonInstances();
   for (const auto &cached:s_eiemSkeletonInstances) {
     if (cached->key!=key || cached->anchor.Target()!=source.front() || cached->anchor.Status()!=1) continue;
@@ -256,6 +408,11 @@ static bool EiemAcquireSkeletonDocument(
       continue;
     }
     for (const auto &node:cached->nodes) if (node.Status()!=1) return fail("Skeleton node was destroyed; reload to rebuild");
+    if (EiemRegistrationTraceFirst("skeleton-cache", cached->key.c_str(),
+                                   cached.get(), source.front(), nullptr, -1))
+      Log("%s event=skeleton-cache instance=%p stamp=%llu anchor=%p nodes=%zu",
+          EiemRegistrationTraceTag, cached.get(),
+          (unsigned long long)cached->stamp, source.front(), cached->nodes.size());
     out=cached; return true;
   }
   auto instance=std::make_shared<EiemSkeletonInstance>();
@@ -299,6 +456,12 @@ static bool EiemAcquireSkeletonDocument(
   instance->ready=true;
   Log("[SKELETON] Ready resource=%s sourceRoot=%p nodes=%zu added=%zu (GPU validation separate)",
       key.c_str(),source.front(),instance->nodes.size(),instance->createdObjects.size());
+  if (EiemRegistrationTraceFirst("skeleton-rebuilt", instance->key.c_str(),
+                                 instance.get(), source.front(), nullptr, -1))
+    Log("%s event=skeleton-rebuilt instance=%p stamp=%llu anchor=%p nodes=%zu added=%zu",
+        EiemRegistrationTraceTag, instance.get(),
+        (unsigned long long)instance->stamp, source.front(),
+        instance->nodes.size(), instance->createdObjects.size());
   out=std::move(instance); return true;
 }
 

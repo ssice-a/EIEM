@@ -1,4 +1,4 @@
-"""Exercise actual partner retirement/ownership code without a game process."""
+"""Exercise Partner visibility and final retirement without a game process."""
 from pathlib import Path
 import shutil
 import subprocess
@@ -23,21 +23,122 @@ class PartnerControlsTests(unittest.TestCase):
     def test_lod_membership_reconciles_stale_partner_levels(self):
         trace = (ROOT / "src/il2cpp_trace.h").read_text(encoding="utf-8")
         membership = function(trace, "EiemSetPartnerLodMembership")
+        reconcile_lods = function(trace, "EiemReconcilePartnerLodMemberships")
         root_sync = function(trace, "EiemSyncPartnerRootBonesFromArray")
         self.assertIn("sourceIndex != SIZE_MAX", membership)
         self.assertIn("else if (partnerIndex != SIZE_MAX)", membership)
         self.assertIn("rendererCount - 1", membership)
+        # LOD membership is structural; hidden key states must also be
+        # reconciled so a later show does not leave the Partner outside LOD.
+        self.assertNotIn("state.controlVisible", reconcile_lods)
         self.assertIn("EiemReconcilePartnerLodMemberships", root_sync)
 
-    def test_control_reconcile_has_selective_partner_retirement_path(self):
+    def test_control_reconcile_changes_visibility_without_retirement(self):
         trace = (ROOT / "src/il2cpp_trace.h").read_text(encoding="utf-8")
         function(trace, "EiemPartnerDesired")
-        function(trace, "EiemDestroyUndesiredPartnerObjects")
+        visibility = function(trace, "EiemApplyPartnerControlVisibility")
+        visibility_only = function(trace, "EiemSetPartnerRendererVisibilityOnly")
         reconcile = function(trace, "EiemRunModReconcile")
+        self.assertIn("EiemSetPartnerRendererVisibilityOnly", visibility)
+        self.assertIn("EiemSetRendererEnabled", visibility_only)
+        self.assertNotIn("EiemSetPartnerLodMembership", visibility_only)
+        self.assertNotIn("EiemRetirePartner", visibility)
+        self.assertNotIn("s_eiemPartners.erase", visibility)
         self.assertIn("partnerLinksOnly", reconcile)
-        self.assertIn("EiemDestroyUndesiredPartnerObjects", reconcile)
+        self.assertIn("EiemApplyPartnerControlVisibility", reconcile)
+        self.assertIn("if (partnerLinksOnly)", reconcile)
+        self.assertIn("skipped model resource/Physics replay", reconcile)
+        self.assertIn("if (!reload) EiemDestroyPartnerObjects(affected)", reconcile)
 
-    def test_partner_is_retired_only_when_its_source_rule_drops_the_link(self):
+    def test_key_visibility_does_not_remove_lod_membership(self):
+        trace = (ROOT / "src/il2cpp_trace.h").read_text(encoding="utf-8")
+        visibility = function(trace, "EiemSetPartnerDrawVisibility")
+        self.assertIn("EiemSetPartnerLodMembership(change.sourceDrawRenderer,",
+                      visibility)
+        self.assertIn("change.partnerRenderer, true", visibility)
+        self.assertIn("change.visible && change.enabledWhenVisible", visibility)
+        self.assertNotIn("change.partnerRenderer, false", visibility)
+
+    def test_all_conditional_partners_are_prebuilt_once(self):
+        mods = (ROOT / "src/eiem_mods.h").read_text(encoding="utf-8")
+        trace = (ROOT / "src/il2cpp_trace.h").read_text(encoding="utf-8")
+        potential = function(mods, "EiemFindPotentialPartnerRules")
+        apply_partners = function(trace, "EiemApplyPartners")
+        self.assertIn("s_eiemModProgram.definitions", potential)
+        self.assertIn("EiemVisitStatements", potential)
+        self.assertIn('statement.key.compare(0, 8, "partner.")', potential)
+        self.assertIn("EiemFindPotentialPartnerRules", apply_partners)
+        self.assertIn("EiemSetPartnerDrawVisibility", apply_partners)
+        self.assertIn("sourceMesh, desired, error", apply_partners)
+        self.assertNotIn("!sourceRule.partnerCount", apply_partners)
+
+    def test_f10_reuses_partner_components_across_generation_reload(self):
+        trace = (ROOT / "src/il2cpp_trace.h").read_text(encoding="utf-8")
+        apply_partners = function(trace, "EiemApplyPartners")
+        reconcile = function(trace, "EiemRunModReconcile")
+        self.assertIn("EiemFindPartnerAnyGenerationLocked", apply_partners)
+        self.assertIn("EiemRefreshPartnerRenderer", apply_partners)
+        self.assertIn("s_eiemPartners[commitIndex] = std::move(refreshState)",
+                      apply_partners)
+        self.assertIn("if (!reload) EiemDestroyPartnerObjects(affected)",
+                      reconcile)
+
+    def test_model_replay_binds_early_partner_to_owner(self):
+        trace = (ROOT / "src/il2cpp_trace.h").read_text(encoding="utf-8")
+        apply_partners = function(trace, "EiemApplyPartners")
+        self.assertIn("if (s_eiemActivePrefabInstance)", apply_partners)
+        self.assertIn("state.ownerPrefabInstance = s_eiemActivePrefabInstance",
+                      apply_partners)
+
+    def test_refresh_rebinds_resources_without_allocating_a_gameobject(self):
+        trace = (ROOT / "src/il2cpp_trace.h").read_text(encoding="utf-8")
+        refresh = function(trace, "EiemRefreshPartnerRenderer")
+        self.assertIn("EiemBuildMeshResource", refresh)
+        self.assertIn("EiemSkeletonMeshBones", refresh)
+        self.assertIn("EiemAssignRendererMaterials", refresh)
+        self.assertIn("EiemSetSharedMesh(state.partnerRenderer", refresh)
+        self.assertNotIn("il2cpp_object_new", refresh)
+        self.assertNotIn("g_gameObject_AddComponent", refresh)
+
+    def test_game_skin_writes_replace_the_f10_source_baseline(self):
+        trace = (ROOT / "src/il2cpp_trace.h").read_text(encoding="utf-8")
+        remember_bones = function(trace, "EiemRememberGameSourceBones")
+        remember_root = function(trace, "EiemRememberGameSourceRootBone")
+        set_bones_start = trace.rindex("static void TraceSkinnedMeshSetBones")
+        assign_skin_start = trace.rindex("static void TraceAssignSkinPost")
+        set_root_start = trace.rindex("static void TraceSetSmrRootBone")
+        set_bones_source = trace[set_bones_start - 20 :]
+        assign_skin_source = trace[assign_skin_start - 20 :]
+        set_root_source = trace[set_root_start - 20 :]
+        set_bones = function(set_bones_source, "TraceSkinnedMeshSetBones")
+        assign_skin = function(assign_skin_source, "TraceAssignSkinPost")
+        set_root = function(set_root_source, "TraceSetSmrRootBone")
+        restore = function(trace, "EiemRestoreRenderOverrides")
+
+        self.assertIn("state.originalBonesHandle = handle", remember_bones)
+        self.assertIn("!replacementBinding", remember_bones)
+        self.assertIn("state.originalRootBoneHandle = handle", remember_root)
+        self.assertLess(set_bones.index("EiemRememberGameSourceBones"),
+                        set_bones.index("EiemPreserveSourceSkinning"))
+        self.assertIn("EiemRememberGameSourceSkinningFromArray", assign_skin)
+        self.assertIn("EiemRememberGameSourceSkinningFromArray", set_root)
+        self.assertIn("state.originalBonesHandle", restore)
+        self.assertIn("state.originalRootBoneHandle", restore)
+
+    def test_partner_bone_setter_probe_is_observational_and_deduplicated(self):
+        trace = (ROOT / "src/il2cpp_trace.h").read_text(encoding="utf-8")
+        snapshot = function(trace, "EiemSnapshotPartnerBones")
+        setter_start = trace.rindex("static void TraceSkinnedMeshSetBones")
+        setter = function(trace[setter_start - 20:], "TraceSkinnedMeshSetBones")
+        self.assertIn("state.partnerRenderer != renderer", snapshot)
+        self.assertIn("expectedBoneCount", snapshot)
+        self.assertIn('"partner-set-bones"', setter)
+        self.assertIn('"partner-set-bones-mismatch"', setter)
+        self.assertIn("s_eiemApplyingModMeshAssignment", setter)
+        self.assertIn("afterRead", setter)
+        self.assertNotIn("EiemPreserveSourceSkinning", setter[:setter.index("bool tracked")])
+
+    def test_partner_visibility_follows_its_source_rule_link(self):
         if not shutil.which("cl"):
             self.skipTest("Requires MSVC developer environment")
         trace = (ROOT / "src/il2cpp_trace.h").read_text(encoding="utf-8")
@@ -134,12 +235,13 @@ static bool s_eiemCreatingPartner = false;
 struct EiemResolvedRenderRule { EiemModRule rule; char source[768]; char asset[192]; };
 struct EiemPhysicsIntent {};
 static bool EiemCollectPhysicsIntent(const EiemModRule &, std::vector<EiemPhysicsIntent> *, void *) { return true; }
+static bool EiemRendererEligibleForRule(void *, void *) { return true; }
 static void EiemPrepareRenderInput(void*, void*, const char*, void**) { prepared = true; }
 static bool EiemReadLiveMeshIdentity(void*, char*, size_t, char*, size_t) { return false; }
 static bool EiemBuildRelativeRendererPath(void*, void*, char*, size_t) { return false; }
 static bool EiemRenderRuleMatches(const EiemModRule&, const char*, void*, const char*) { return false; }
 static bool EiemModAffected(const char*, const std::vector<std::string>*) { return true; }
-static bool EiemApplyResolvedRenderRule(void*, void*, void*, const char*, void*, const EiemResolvedRenderRule&, bool) { return true; }
+static bool EiemApplyResolvedRenderRule(void*, void*, void*, const char*, void*, const EiemResolvedRenderRule&, bool, bool) { return true; }
 '''
         code = shared + "\n" + "\n".join(function(trace, name) for name in (
             "EiemIsPartnerRenderer", "EiemRetirePartner", "EiemApplyRenderRuleSetToRenderer")) + r'''

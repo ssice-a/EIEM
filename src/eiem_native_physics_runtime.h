@@ -3,7 +3,7 @@
 // Per-model execution of validated Physics author resources. Matching and
 // immutable resource preparation stay in the Mod program; this adapter owns
 // only Unity objects and native processes for one concrete model generation.
-static constexpr const char *EiemPhysicsRuntimeTag = "[PHYSICS-RUNTIME-v81]";
+static constexpr const char *EiemPhysicsRuntimeTag = "[PHYSICS-RUNTIME-v93-ground-diagnostic]";
 
 struct EiemPhysicsRuntimeApi {
   void *clothClass = nullptr, *processClass = nullptr;
@@ -215,6 +215,10 @@ struct EiemPhysicsRuntimeCollider {
 struct EiemPhysicsRuntimeInstance {
   uint64_t generation = 0;
   std::string key;
+  // A freshly parsed INI creates a new shared_ptr even when the on-disk
+  // Physics payload is unchanged. Keep the resource identity stable across
+  // F10 using both the Physics file and its Skeleton dependency stamps.
+  uint64_t assetStamp = 0;
   std::shared_ptr<const EiemPhysicsAsset> asset;
   void *model = nullptr;
   void *renderer = nullptr;
@@ -228,21 +232,19 @@ struct EiemPhysicsRuntimeInstance {
   bool destroyNeeded = false;
   bool destroyRequested = false;
   bool ready = false;
-  std::vector<EiemUnityRef> motionNodes;
-  std::vector<Vector3> motionBaselinePositions;
-  std::vector<Quaternion> motionBaselineRotations;
-  ULONGLONG motionNextSample = 0;
-  uint32_t motionSamples = 0;
-  float motionMaxPositionDeltaSq = 0.0f;
-  float motionMaxRotationDeltaSq = 0.0f;
-  bool motionBindingLogged = false;
+  bool bindingLogged = false;
 };
 
 static std::vector<std::shared_ptr<EiemPhysicsRuntimeInstance>>
     s_eiemPhysicsRuntimeInstances;
+// Only instances whose asynchronous BuildAndRun has not yet been observed
+// ready enter this list. Boundary checks never rescan every active runtime.
+static std::vector<std::shared_ptr<EiemPhysicsRuntimeInstance>>
+    s_eiemPhysicsRuntimePendingReady;
 struct EiemPhysicsRuntimeFailure {
   void *model = nullptr;
   EiemUnityRef modelRef;
+  uint64_t assetStamp = 0;
   std::shared_ptr<const EiemPhysicsAsset> asset;
   std::string key;
 };
@@ -250,7 +252,6 @@ static std::vector<EiemPhysicsRuntimeFailure> s_eiemPhysicsRuntimeFailures;
 static EiemPhysicsRuntimeApi s_eiemPhysicsRuntimeApi;
 static bool s_eiemPhysicsRuntimeApiReady = false;
 static uint64_t s_eiemPhysicsRuntimeGeneration = 0;
-static ULONGLONG s_eiemPhysicsRuntimeNextPoll = 0;
 struct EiemPhysicsPendingRelease {
   void *model = nullptr;
   std::string stage;
@@ -266,11 +267,28 @@ static std::string EiemPhysicsRuntimeKey(const EiemPhysicsIntent &intent) {
   return key;
 }
 
+static uint64_t EiemPhysicsRuntimeAssetStamp(
+    const std::shared_ptr<const EiemPhysicsAsset> &asset) {
+  if (!asset) return 0;
+  const uint64_t physics =
+      EiemMeshResourceFileStamp(asset->path.u8string().c_str());
+  const uint64_t skeleton =
+      EiemMeshResourceFileStamp(asset->skeletonPath.u8string().c_str());
+  return physics ^
+         (skeleton + 0x9E3779B97F4A7C15ULL + (physics << 6) + (physics >> 2));
+}
+
+static uint64_t EiemPhysicsRuntimeAssetStamp(
+    const EiemPhysicsIntent &intent) {
+  return EiemPhysicsRuntimeAssetStamp(intent.asset);
+}
+
 static bool EiemPhysicsRuntimeFailureMatches(
     const EiemPhysicsRuntimeFailure &failure, void *model,
     const EiemPhysicsIntent &intent, const std::string &key) {
   return failure.model == model && failure.modelRef.Target() == model &&
-         failure.modelRef.Status() == 1 && failure.asset == intent.asset &&
+         failure.modelRef.Status() == 1 &&
+         failure.assetStamp == EiemPhysicsRuntimeAssetStamp(intent) &&
          failure.key == key;
 }
 
@@ -281,6 +299,7 @@ static void EiemPhysicsRuntimeRememberFailure(
   EiemPhysicsRuntimeFailure failure;
   failure.model = model;
   failure.modelRef = EiemUnityRef::Capture(model);
+  failure.assetStamp = EiemPhysicsRuntimeAssetStamp(intent);
   failure.asset = intent.asset;
   failure.key = key;
   if (failure.modelRef) s_eiemPhysicsRuntimeFailures.push_back(std::move(failure));
@@ -736,8 +755,9 @@ static bool EiemPhysicsRuntimeDead(
   return true;
 }
 
-static void EiemPhysicsRuntimeCollect() {
-  if (!EiemOnUnityThread()) return;
+static size_t EiemPhysicsRuntimeCollect() {
+  size_t retiredCount = 0;
+  if (!EiemOnUnityThread()) return retiredCount;
   for (size_t index = 0; index < s_eiemPhysicsRuntimeInstances.size();) {
     auto &instance = s_eiemPhysicsRuntimeInstances[index];
     if (!instance->retiring && instance->modelRef.Status() == 0)
@@ -751,10 +771,12 @@ static void EiemPhysicsRuntimeCollect() {
     Log("%s retired generation=%llu model=%p key=%s",
         EiemPhysicsRuntimeTag, (unsigned long long)instance->generation,
         instance->model, instance->key.c_str());
+    ++retiredCount;
     s_eiemPhysicsRuntimeInstances.erase(
         s_eiemPhysicsRuntimeInstances.begin() + index);
   }
   EiemCollectSkeletonInstances();
+  return retiredCount;
 }
 
 static bool EiemAcquirePhysicsSkeleton(
@@ -786,6 +808,11 @@ static bool EiemPhysicsRuntimeBuild(const EiemPhysicsIntent &intent,
                                     void *model, const char *stage,
                                     bool &retryable) {
   retryable = false;
+  const bool reloadTrace = stage && strcmp(stage, "global reload") == 0;
+  const ULONGLONG buildStarted = reloadTrace ? GetTickCount64() : 0;
+  if (reloadTrace)
+    Log("%s reload-build begin model=%p resource=%s",
+        EiemPhysicsRuntimeTag, model, intent.resourceSection);
   std::string error;
   if (!EiemOnUnityThread() || !intent.asset ||
       !EiemPhysicsRuntimeResolve(error)) {
@@ -806,6 +833,7 @@ static bool EiemPhysicsRuntimeBuild(const EiemPhysicsIntent &intent,
   auto instance = std::make_shared<EiemPhysicsRuntimeInstance>();
   instance->generation = ++s_eiemPhysicsRuntimeGeneration;
   instance->key = EiemPhysicsRuntimeKey(intent);
+  instance->assetStamp = EiemPhysicsRuntimeAssetStamp(intent);
   instance->asset = intent.asset;
   instance->model = model;
   instance->renderer = renderer;
@@ -823,6 +851,9 @@ static bool EiemPhysicsRuntimeBuild(const EiemPhysicsIntent &intent,
         skeletonError[0] ? skeletonError : "Cannot bind Physics Skeleton");
     return false;
   }
+  if (reloadTrace)
+    Log("%s reload-build skeleton-ready model=%p elapsed=%llums",
+        EiemPhysicsRuntimeTag, model, GetTickCount64() - buildStarted);
   std::unordered_map<std::string, void *> bindings;
   if (instance->skeleton->nodes.size() != intent.asset->skeleton.nodes.size()) {
     Log("%s rejected generation=%llu model=%p resource=%s error=Skeleton node count changed",
@@ -873,11 +904,15 @@ static bool EiemPhysicsRuntimeBuild(const EiemPhysicsIntent &intent,
       EiemPhysicsRuntimeTag, (unsigned long long)instance->generation, model,
       renderer, paletteCount, selectedCount, paletteHits, boundaryIgnores);
   s_eiemPhysicsRuntimeInstances.push_back(instance);
+  s_eiemPhysicsRuntimePendingReady.push_back(instance);
   void *host = nullptr;
   if (!EiemPhysicsRuntimeNewHost(*instance, &host, error)) {
     EiemPhysicsRuntimeBeginRetire(instance, true, "host construction failed");
     return false;
   }
+  if (reloadTrace)
+    Log("%s reload-build host-ready model=%p elapsed=%llums",
+        EiemPhysicsRuntimeTag, model, GetTickCount64() - buildStarted);
   if (!EiemPhysicsRuntimeCreateColliders(*instance, bindings, error)) {
     EiemPhysicsRuntimeBeginRetire(instance, true, error.c_str());
     return false;
@@ -889,7 +924,12 @@ static bool EiemPhysicsRuntimeBuild(const EiemPhysicsIntent &intent,
     EiemPhysicsRuntimeBeginRetire(instance, true, "component type unavailable");
     return false;
   }
+  size_t groupIndex = 0;
   for (const auto &prepared : instance->config.Groups()) {
+    if (reloadTrace)
+      Log("%s reload-build group=%zu add-component begin model=%p elapsed=%llums",
+          EiemPhysicsRuntimeTag, groupIndex, model,
+          GetTickCount64() - buildStarted);
     void *component = nullptr, *result = nullptr;
     void *addArgs[] = {clothType};
     if (!InvokeChecked(s_eiemPhysicsRuntimeApi.addComponent, host, addArgs,
@@ -930,11 +970,20 @@ static bool EiemPhysicsRuntimeBuild(const EiemPhysicsIntent &intent,
     if (runtime.process)
       runtime.processRef = EiemUnityRef::Capture(runtime.process, false);
     instance->components.push_back(std::move(runtime));
+    if (reloadTrace)
+      Log("%s reload-build group=%zu configured model=%p elapsed=%llums",
+          EiemPhysicsRuntimeTag, groupIndex, model,
+          GetTickCount64() - buildStarted);
+    ++groupIndex;
   }
   if (!EiemPhysicsRuntimeBindColliders(*instance, error)) {
     EiemPhysicsRuntimeBeginRetire(instance, true, error.c_str());
     return false;
   }
+  if (reloadTrace)
+    Log("%s reload-build colliders-ready model=%p count=%zu elapsed=%llums",
+        EiemPhysicsRuntimeTag, model, instance->colliders.size(),
+        GetTickCount64() - buildStarted);
   if (!EiemPhysicsRuntimeActivateColliders(*instance, error)) {
     EiemPhysicsRuntimeBeginRetire(instance, true, error.c_str());
     return false;
@@ -950,6 +999,9 @@ static bool EiemPhysicsRuntimeBuild(const EiemPhysicsIntent &intent,
   for (auto &runtime : instance->components) {
     void *boxed = nullptr;
     bool started = false;
+    if (reloadTrace)
+      Log("%s reload-build build-and-run begin model=%p elapsed=%llums",
+          EiemPhysicsRuntimeTag, model, GetTickCount64() - buildStarted);
     if (!InvokeChecked(s_eiemPhysicsRuntimeApi.buildAndRun, runtime.component,
                        nullptr, &boxed) ||
         !EiemPhysicsUnbox(boxed, started) || !started) {
@@ -961,7 +1013,13 @@ static bool EiemPhysicsRuntimeBuild(const EiemPhysicsIntent &intent,
                          runtime.process);
     if (runtime.process)
       runtime.processRef = EiemUnityRef::Capture(runtime.process, false);
+    if (reloadTrace)
+      Log("%s reload-build build-and-run end model=%p elapsed=%llums",
+          EiemPhysicsRuntimeTag, model, GetTickCount64() - buildStarted);
   }
+  if (reloadTrace)
+    Log("%s reload-build end model=%p elapsed=%llums",
+        EiemPhysicsRuntimeTag, model, GetTickCount64() - buildStarted);
   Log("%s build-started generation=%llu model=%p renderer=%p animator=%p groups=%zu colliders=%zu resource=%s matches=%u stage=%s",
       EiemPhysicsRuntimeTag, (unsigned long long)instance->generation, model,
       renderer, animator, instance->components.size(), instance->colliders.size(), intent.resourceSection,
@@ -973,23 +1031,23 @@ static void EiemReconcileModelPhysics(
     void *model, const std::vector<EiemPhysicsIntent> &intents, bool active,
     const char *stage) {
   if (!model || !EiemOnUnityThread()) return;
-  EiemPhysicsRuntimeCollect();
-  EiemPhysicsRuntimePruneFailures();
   s_eiemPhysicsRuntimeFailures.erase(
       std::remove_if(s_eiemPhysicsRuntimeFailures.begin(),
                      s_eiemPhysicsRuntimeFailures.end(),
                      [&](const EiemPhysicsRuntimeFailure &failure) {
                        if (failure.model != model) return false;
                        for (const auto &intent : intents)
-                         if (failure.asset == intent.asset &&
-                             failure.key == EiemPhysicsRuntimeKey(intent)) return false;
+                         if (failure.assetStamp ==
+                                 EiemPhysicsRuntimeAssetStamp(intent) &&
+                             failure.key == EiemPhysicsRuntimeKey(intent))
+                           return false;
                        return true;
       }),
       s_eiemPhysicsRuntimeFailures.end());
   if (!active) {
     // Visibility is an ownership boundary for UI/NPC model instances. Retire
-    // all native hosts and owned colliders while the model is inactive; the
-    // periodic reconcile will build them again after a visible owner appears.
+    // all native hosts and owned colliders while the model is inactive. A later
+    // owner activation or F10 transaction builds them again.
     for (const auto &instance : s_eiemPhysicsRuntimeInstances)
       if (instance->model == model && !instance->retiring)
         EiemPhysicsRuntimeBeginRetire(instance, true, stage);
@@ -999,7 +1057,7 @@ static void EiemReconcileModelPhysics(
     if (instance->model != model || instance->retiring) continue;
     bool keep = false;
     for (const auto &intent : intents)
-      if (intent.asset == instance->asset &&
+      if (EiemPhysicsRuntimeAssetStamp(intent) == instance->assetStamp &&
           EiemPhysicsRuntimeKey(intent) == instance->key) {
         keep = true;
         break;
@@ -1014,7 +1072,8 @@ static void EiemReconcileModelPhysics(
     bool exists = false;
     for (const auto &instance : s_eiemPhysicsRuntimeInstances)
       if (!instance->retiring && instance->model == model &&
-          instance->asset == intent.asset && instance->key == key) {
+          instance->assetStamp == EiemPhysicsRuntimeAssetStamp(intent) &&
+          instance->key == key) {
         exists = true;
         break;
       }
@@ -1033,6 +1092,25 @@ static void EiemReconcileModelPhysics(
           EiemPhysicsRuntimeTag, model, intent.resourceSection);
     }
   }
+}
+
+// F10 is the only resource-change boundary. Retire instances whose on-disk
+// Physics or Skeleton dependency changed before Renderer restoration starts;
+// unchanged instances continue to share the game's live model generation.
+static size_t EiemPhysicsRuntimeRetireChangedAssets(const char *stage) {
+  if (!EiemOnUnityThread()) return 0;
+  size_t changed = 0;
+  for (const auto &instance : s_eiemPhysicsRuntimeInstances) {
+    if (instance->retiring ||
+        EiemPhysicsRuntimeAssetStamp(instance->asset) == instance->assetStamp)
+      continue;
+    EiemPhysicsRuntimeBeginRetire(instance, true, stage);
+    ++changed;
+  }
+  if (changed)
+    Log("%s reload asset changes retired=%zu stage=%s", EiemPhysicsRuntimeTag,
+        changed, stage ? stage : "unknown");
+  return changed;
 }
 
 static void EiemPhysicsRuntimeReleaseOnUnityThread(void *model,
@@ -1071,90 +1149,35 @@ static void EiemPhysicsRuntimeDrainReleases() {
     EiemPhysicsRuntimeReleaseOnUnityThread(release.model, release.stage.c_str());
 }
 
-static bool EiemPhysicsRuntimeReadLocalPose(void *transform, Vector3 &position,
-                                            Quaternion &rotation) {
-  if (!transform || !g_transform_get_localPosition ||
-      !g_transform_get_localRotation)
-    return false;
-  __try {
-    void *positionBox = Invoke(g_transform_get_localPosition, transform);
-    void *rotationBox = Invoke(g_transform_get_localRotation, transform);
-    if (!positionBox || !rotationBox) return false;
-    position = *(Vector3 *)((char *)positionBox + 16);
-    rotation = *(Quaternion *)((char *)rotationBox + 16);
-    return std::isfinite(position.x) && std::isfinite(position.y) &&
-           std::isfinite(position.z) && std::isfinite(rotation.x) &&
-           std::isfinite(rotation.y) && std::isfinite(rotation.z) &&
-           std::isfinite(rotation.w);
-  } __except (EXCEPTION_EXECUTE_HANDLER) {
-    return false;
-  }
-}
-
-static float EiemPhysicsRuntimePositionDeltaSq(const Vector3 &left,
-                                                const Vector3 &right) {
-  const float x = left.x - right.x, y = left.y - right.y,
-              z = left.z - right.z;
-  return x * x + y * y + z * z;
-}
-
-static float EiemPhysicsRuntimeRotationDeltaSq(const Quaternion &left,
-                                                const Quaternion &right) {
-  const float direct =
-      (left.x - right.x) * (left.x - right.x) +
-      (left.y - right.y) * (left.y - right.y) +
-      (left.z - right.z) * (left.z - right.z) +
-      (left.w - right.w) * (left.w - right.w);
-  // q and -q encode the same rotation.
-  const float negated =
-      (left.x + right.x) * (left.x + right.x) +
-      (left.y + right.y) * (left.y + right.y) +
-      (left.z + right.z) * (left.z + right.z) +
-      (left.w + right.w) * (left.w + right.w);
-  return (std::min)(direct, negated);
-}
-
-static void EiemPhysicsRuntimeBeginMotionObservation(
-    EiemPhysicsRuntimeInstance &instance) {
-  instance.motionNodes.clear();
-  instance.motionBaselinePositions.clear();
-  instance.motionBaselineRotations.clear();
-  for (const auto &group : instance.config.Groups()) {
-    const size_t count = (std::min)(group.transforms.size(),
-                                    group.authorNodes.size());
-    for (size_t index = 0; index < count; ++index) {
-      if (group.authorNodes[index].role != 1) continue;
-      Vector3 position = {};
-      Quaternion rotation = {0, 0, 0, 1};
-      void *transform = group.transforms[index].Target();
-      if (!EiemPhysicsRuntimeReadLocalPose(transform, position, rotation))
-        continue;
-      instance.motionNodes.push_back(group.transforms[index]);
-      instance.motionBaselinePositions.push_back(position);
-      instance.motionBaselineRotations.push_back(rotation);
-    }
-  }
-  instance.motionNextSample = GetTickCount64() + 500;
-  instance.motionSamples = 0;
-  instance.motionMaxPositionDeltaSq = 0;
-  instance.motionMaxRotationDeltaSq = 0;
-}
-
 static void EiemPhysicsRuntimeLogPartnerBinding(
     EiemPhysicsRuntimeInstance &instance) {
-  if (instance.motionBindingLogged) return;
-  instance.motionBindingLogged = true;
+  if (instance.bindingLogged) return;
+  instance.bindingLogged = true;
   std::vector<void *> renderers;
+  void *firstPartnerSkeleton = nullptr;
   AcquireSRWLockShared(&s_eiemPartnerLock);
   for (const auto &partner : s_eiemPartners)
-    if (partner.skeleton == instance.skeleton && partner.partnerRenderer)
+    if (partner.controlVisible && partner.skeleton == instance.skeleton &&
+        partner.partnerRenderer) {
       renderers.push_back(partner.partnerRenderer);
+      if (!firstPartnerSkeleton) firstPartnerSkeleton = partner.skeleton.get();
+    }
   ReleaseSRWLockShared(&s_eiemPartnerLock);
 
   std::set<void *> selected;
+  std::string firstSelectedPath;
+  void *firstSelected = nullptr;
   for (const auto &group : instance.config.Groups())
-    for (const auto &node : group.transforms)
-      if (node.Target()) selected.insert(node.Target());
+    for (size_t index = 0; index < group.transforms.size(); ++index) {
+      const auto &node = group.transforms[index];
+      if (!node.Target()) continue;
+      selected.insert(node.Target());
+      if (!firstSelected) {
+        firstSelected = node.Target();
+        if (index < group.authorNodes.size())
+          firstSelectedPath = group.authorNodes[index].bone;
+      }
+    }
   std::set<void *> hits;
   size_t paletteEntries = 0;
   for (void *renderer : renderers) {
@@ -1169,48 +1192,31 @@ static void EiemPhysicsRuntimeLogPartnerBinding(
     for (size_t index = 0; index < count; ++index)
       if (selected.find(items[index]) != selected.end()) hits.insert(items[index]);
   }
-  Log("%s visible-binding generation=%llu partners=%zu paletteEntries=%zu selected=%zu uniqueHits=%zu",
+  Log("%s visible-binding generation=%llu instance=%p skeleton=%p anchor=%p "
+      "nodes=%zu added=%zu partners=%zu partnerSkeleton=%p paletteEntries=%zu "
+      "selected=%zu uniqueHits=%zu firstSelected=%p firstSelectedPath=%s",
       EiemPhysicsRuntimeTag, (unsigned long long)instance.generation,
-      renderers.size(), paletteEntries, selected.size(), hits.size());
+      &instance, instance.skeleton.get(),
+      instance.skeleton ? instance.skeleton->anchor.Target() : nullptr,
+      instance.skeleton ? instance.skeleton->nodes.size() : 0,
+      instance.skeleton ? instance.skeleton->createdObjects.size() : 0,
+      renderers.size(), firstPartnerSkeleton, paletteEntries, selected.size(),
+      hits.size(), firstSelected, firstSelectedPath.empty()
+          ? "<unknown>" : firstSelectedPath.c_str());
 }
 
-static void EiemPhysicsRuntimeObserveMotion(
-    EiemPhysicsRuntimeInstance &instance, ULONGLONG now) {
-  if (!instance.ready || instance.motionNodes.empty() ||
-      instance.motionSamples >= 16 || now < instance.motionNextSample)
-    return;
-  instance.motionNextSample = now + 500;
-  size_t readable = 0, changed = 0;
-  for (size_t index = 0; index < instance.motionNodes.size(); ++index) {
-    if (instance.motionNodes[index].Status() != 1) continue;
-    Vector3 position = {};
-    Quaternion rotation = {0, 0, 0, 1};
-    if (!EiemPhysicsRuntimeReadLocalPose(instance.motionNodes[index].Target(),
-                                         position, rotation))
+// BuildAndRun is asynchronous. Check its accepted component once at the next
+// explicit lifecycle boundary (initial model attach, owner change, or F10),
+// rather than polling every window message. A false result is diagnostic only;
+// it is never used as a destruction/completion fence.
+static void EiemPhysicsRuntimeCheckReady() {
+  for (size_t index = 0; index < s_eiemPhysicsRuntimePendingReady.size();) {
+    const auto &instance = s_eiemPhysicsRuntimePendingReady[index];
+    if (instance->retiring || instance->ready) {
+      s_eiemPhysicsRuntimePendingReady.erase(
+          s_eiemPhysicsRuntimePendingReady.begin() + index);
       continue;
-    ++readable;
-    const float positionDelta = EiemPhysicsRuntimePositionDeltaSq(
-        position, instance.motionBaselinePositions[index]);
-    const float rotationDelta = EiemPhysicsRuntimeRotationDeltaSq(
-        rotation, instance.motionBaselineRotations[index]);
-    instance.motionMaxPositionDeltaSq =
-        (std::max)(instance.motionMaxPositionDeltaSq, positionDelta);
-    instance.motionMaxRotationDeltaSq =
-        (std::max)(instance.motionMaxRotationDeltaSq, rotationDelta);
-    if (positionDelta > 1e-12f || rotationDelta > 1e-12f) ++changed;
-  }
-  ++instance.motionSamples;
-  if (instance.motionSamples == 4 || instance.motionSamples == 16)
-    Log("%s motion generation=%llu samples=%u moving=%zu readable=%zu changed=%zu maxLocalPositionDeltaSq=%.9g maxLocalRotationDeltaSq=%.9g",
-        EiemPhysicsRuntimeTag, (unsigned long long)instance.generation,
-        instance.motionSamples, instance.motionNodes.size(), readable, changed,
-        instance.motionMaxPositionDeltaSq,
-        instance.motionMaxRotationDeltaSq);
-}
-
-static void EiemPhysicsRuntimePollReady() {
-  for (const auto &instance : s_eiemPhysicsRuntimeInstances) {
-    if (instance->retiring || instance->ready) continue;
+    }
     bool ready = !instance->components.empty();
     for (auto &runtime : instance->components) {
       if (runtime.componentRef.Status() != 1) {
@@ -1247,9 +1253,11 @@ static void EiemPhysicsRuntimePollReady() {
       }
       runtime.teamId = team;
     }
-    if (!ready) continue;
+    if (!ready) {
+      ++index;
+      continue;
+    }
     instance->ready = true;
-    EiemPhysicsRuntimeBeginMotionObservation(*instance);
     EiemPhysicsRuntimeLogPartnerBinding(*instance);
     std::string teams;
     for (const auto &component : instance->components) {
@@ -1260,26 +1268,25 @@ static void EiemPhysicsRuntimePollReady() {
         EiemPhysicsRuntimeTag, (unsigned long long)instance->generation,
         instance->model, instance->animator, teams.c_str(),
         instance->key.c_str());
+    s_eiemPhysicsRuntimePendingReady.erase(
+        s_eiemPhysicsRuntimePendingReady.begin() + index);
   }
 }
 
-static void EiemPhysicsRuntimePeriodic(const char *stage) {
+// This is deliberately event driven. The caller has just crossed a model or
+// configuration lifecycle boundary, so it is safe to drain off-thread release
+// notices, collect objects whose Unity destruction has completed, and perform
+// one readiness observation. No candidate scan or timer is involved.
+static void EiemPhysicsRuntimeBoundary(const char *stage) {
   if (!EiemOnUnityThread()) return;
-  const ULONGLONG now = GetTickCount64();
-  if (now < s_eiemPhysicsRuntimeNextPoll) return;
-  s_eiemPhysicsRuntimeNextPoll = now + 250;
+  const ULONGLONG started = GetTickCount64();
   EiemPhysicsRuntimeDrainReleases();
-  EiemPhysicsRuntimeCollect();
-  EiemPhysicsRuntimePollReady();
-  for (const auto &instance : s_eiemPhysicsRuntimeInstances)
-    if (!instance->retiring)
-      EiemPhysicsRuntimeObserveMotion(*instance, now);
-  std::vector<EiemModelInstanceState> models;
-  AcquireSRWLockShared(&s_eiemModelInstanceLock);
-  models = s_eiemModelInstances;
-  ReleaseSRWLockShared(&s_eiemModelInstanceLock);
-  for (const auto &model : models)
-    if (model.model && model.modelRef.Status() == 1)
-      EiemReconcileModelPhysics(model.model, model.physicsIntents,
-                                EiemModelHasActiveOwner(model), stage);
+  EiemPhysicsRuntimePruneFailures();
+  const size_t retiredCount = EiemPhysicsRuntimeCollect();
+  EiemPhysicsRuntimeCheckReady();
+  const ULONGLONG elapsed = GetTickCount64() - started;
+  if (elapsed >= 4)
+    Log("[PERF] physics-boundary elapsed=%llums retired=%zu runtimes=%zu stage=%s",
+        elapsed, retiredCount, s_eiemPhysicsRuntimeInstances.size(),
+        stage ? stage : "unknown");
 }

@@ -11,6 +11,7 @@ class RuntimeHookContracts(unittest.TestCase):
         cls.trace = (ROOT / "src" / "il2cpp_trace.h").read_text(encoding="utf-8")
         cls.mods = (ROOT / "src" / "eiem_mod_document.h").read_text(encoding="utf-8") + (ROOT / "src" / "eiem_mods.h").read_text(encoding="utf-8")
         cls.api = (ROOT / "src" / "il2cpp_api.h").read_text(encoding="utf-8")
+        cls.trojan = (ROOT / "src" / "trojan.h").read_text(encoding="utf-8")
         cls.backend = (ROOT / "src" / "eiem_resource_backend.h").read_text(
             encoding="utf-8"
         )
@@ -40,6 +41,11 @@ class RuntimeHookContracts(unittest.TestCase):
         self.assertIn('FindMethod(g_lodGroupClass, "GetLODs", 1)', self.init)
         self.assertIn('FindMethod(g_lodGroupClass, "SetLODs", 1)', self.init)
         self.assertNotIn('FindMethod(g_lodGroupClass, "get_lods"', self.init)
+        self.assertIn('"LODGroup.SetLODs observation"', self.init)
+        self.assertIn("TraceLodGroupSetLODs", self.trace)
+        self.assertIn("EiemTraceLodGroupMembers", self.trace)
+        self.assertIn("event=lod-group-member", self.trace)
+        self.assertIn("EiemReconcilePartnerLodGroup", self.trace)
         self.assertIn("bool getPlatformLODs = false", self.trace)
         self.assertIn("EiemCopySkinnedRendererState(sourceMeshOwner, partnerMeshOwner)", self.trace)
         for property_name in (
@@ -51,6 +57,20 @@ class RuntimeHookContracts(unittest.TestCase):
         ):
             self.assertIn(f'"get_{property_name}"', self.init)
             self.assertIn(f'"set_{property_name}"', self.init)
+
+    def test_render_matching_excludes_inactive_lod_siblings(self):
+        start = self.trace.index("static bool EiemApplyRenderRuleSetToRenderer")
+        end = self.trace.index("static bool EiemApplyRenderRuleSet(", start)
+        matcher = self.trace[start:end]
+        self.assertIn("EiemRendererEligibleForRule(meshOwner, drawRenderer)", matcher)
+
+        scan_start = self.trace.index("static bool EiemApplyRenderRuleSet(")
+        scan_end = self.trace.index("static bool EiemApplyStandaloneRenderRules(", scan_start)
+        scan = self.trace[scan_start:scan_end]
+        self.assertIn("bool includeInactive = false", scan)
+        self.assertIn("EiemRegistrationTraceEligibility", self.trace)
+        self.assertIn('"force-off"', self.trace)
+        self.assertIn('"disabled-unowned"', self.trace)
 
     def test_prefab_lifecycle_releases_instance_state(self):
         for method in ("Unload", "Clear", "Dispose"):
@@ -90,12 +110,22 @@ class RuntimeHookContracts(unittest.TestCase):
         self.assertIn("EiemApplyStandaloneRenderRules", body)
         self.assertNotIn("find_objects_of_type", body.lower())
 
-    def test_submesh_hooks_do_not_replace_resources(self):
-        self.assertNotIn("EiemSubMeshOverrideState", self.trace)
-        start = self.trace.index("static void TraceSubMeshInfoSetMesh")
-        body = self.trace[start : start + 2200]
-        self.assertNotIn("EiemApplyResolvedRenderRule", body)
-        self.assertNotIn("EiemRememberSubMeshReplacement", body)
+    def test_historical_submesh_and_hg_observation_hooks_are_removed(self):
+        for obsolete in (
+            "TraceSubMeshInfoSetMesh",
+            "TraceSubMeshInfoGetMesh",
+            "TraceLodGetSubMeshInfo",
+            "TraceGetPartCpuMesh",
+            "TraceHgRendererSetData",
+            "TraceHgRendererGetData",
+            "TraceHgDataGetMeshes",
+            "TraceHgDataSetMaterials",
+            "TraceHgStateInit",
+            "TraceHgStateInvalidate",
+            "TraceHgStateSetVisible",
+            "[TRACE-HG-FLOW]",
+        ):
+            self.assertNotIn(obsolete, self.trace)
 
     def test_vfs_observation_cannot_bypass_render_rules_with_loose_bundles(self):
         for obsolete in ("TraceFindVfsOverride", "TraceTryBundleOverride",
@@ -136,6 +166,26 @@ class RuntimeHookContracts(unittest.TestCase):
             self.trace,
         )
 
+    def test_base_model_completion_observes_partner_skin_cache_membership(self):
+        for field in (
+            "m_renderers",
+            "m_renderersInitState",
+            "m_meshes",
+            "m_meshesInitState",
+            "m_lodGroups",
+        ):
+            self.assertIn(field, self.trace)
+        self.assertIn("[BASEMODEL-SKIN-v108]", self.trace)
+        self.assertIn("PostDealLoadedModel-after", self.trace)
+        self.assertIn("EiemTraceBaseModelPartnerArrays", self.trace)
+
+        finish = self.trace[
+            self.trace.rindex("static void TraceBasePartFinish") :
+        ][:1800]
+        self.assertIn("OnLoadFinish-before-register", finish)
+        self.assertIn("OnLoadFinish-after-register", finish)
+        self.assertNotIn("il2cpp_array_new", finish)
+
     def test_character_ui_owner_can_apply_mesh_rules_without_prefab_identity(self):
         self.assertIn("EiemModelOwnerKind::CharUIModel", self.trace)
         self.assertIn("TraceCharUIModelOnAwake", self.trace)
@@ -159,18 +209,19 @@ class RuntimeHookContracts(unittest.TestCase):
         )
         self.assertIn("EiemModelOwnerKind::NpcAvatar", owner)
         start = owner[
-            owner.index("static void EiemPhysicsOwnerTraceStartNpc") :
-            owner.index("static bool EiemPhysicsOwnerReleaseInfo")
+            owner.index("static void EiemNpcTraceStartNpc") :
+            owner.index("static void EiemNpcTraceReleaseAvatar")
         ]
         self.assertIn("EiemRegisterAndApplyModelInstance", start)
         release = owner[
-            owner.index("static void EiemPhysicsOwnerTraceReleaseAvatar") :
-            owner.index("static bool EiemPhysicsOwnerHookExact")
+            owner.index("static void EiemNpcTraceReleaseAvatar") :
+            owner.index("static void EiemInstallNpcModelOwner")
         ]
         self.assertEqual(
             release.count("EiemForgetModelOwner(EiemModelOwnerKind::NpcAvatar"),
             2,
         )
+        self.assertNotIn("_BuildBeyondCloth", owner)
 
     def test_physics_intents_follow_render_hits_but_are_owned_by_the_model(self):
         match_start = self.trace.index("static bool EiemApplyRenderRuleSetToRenderer")
@@ -228,7 +279,7 @@ class RuntimeHookContracts(unittest.TestCase):
         self.assertIn("TraceRendererInfoTryReplaceSharedMaterials", self.trace)
         self.assertIn("EiemFindBoundRenderRule", self.trace)
 
-    def test_renderer_info_init_covers_npc_direct_mesh_construction(self):
+    def test_renderer_info_init_does_not_create_partners_reentrantly(self):
         start = self.trace.index("static void TraceMaterialInfoInit")
         end = self.trace.index("static bool TraceRendererInfoTrySetSharedMaterial", start)
         body = self.trace[start:end]
@@ -237,8 +288,34 @@ class RuntimeHookContracts(unittest.TestCase):
             body.index("EiemApplyStandaloneRenderRulesToRenderer"),
         )
         self.assertIn('"RendererInfo._Init"', body)
+        self.assertIn('"RendererInfo._Init", false', body)
         self.assertIn("EiemReapplyRendererMaterialsAfterCommit", body)
         self.assertNotIn("EiemApplyPrefabRules", body)
+
+    def test_partner_creation_runs_at_enclosing_model_assembly_boundaries(self):
+        base_start = self.trace.rindex("static void TraceBasePartPostDeal")
+        base_end = self.trace.index("static void TraceComplexPartPostDeal", base_start)
+        base = self.trace[base_start:base_end]
+        self.assertLess(
+            base.index("EiemApplyStandaloneRenderRules"),
+            base.index("original(self, methodInfo)"),
+        )
+        self.assertIn("PostDealLoadedModel-before", base)
+
+        for name in ("TraceCreateSmsGo", "TraceCreateSmsPost"):
+            start = self.trace.index(f"static void {name}")
+            body = self.trace[start : start + 2400]
+            self.assertLess(
+                body.index("EiemApplyStandaloneRenderRulesToSkinArray"),
+                body.index("EiemRegisterPartnersInSkinArrays"),
+            )
+
+    def test_per_renderer_mesh_setters_defer_partner_creation(self):
+        for name in ("TraceSkinnedMeshSetSharedMesh", "TraceMeshFilterSetSharedMesh"):
+            start = self.trace.rindex(f"static void {name}")
+            body = self.trace[start : start + 1800]
+            self.assertIn("EiemApplyStandaloneRenderRulesToRenderer", body)
+            self.assertRegex(body, r"set_sharedMesh\"\s*,\s*false\)")
 
     def test_value_type_asset_handle_is_unboxed_before_instance_methods(self):
         self.assertIn("il2cpp_object_unbox", self.api)
@@ -317,12 +394,70 @@ class RuntimeHookContracts(unittest.TestCase):
         self.assertNotIn("EiemApplyPrefabRules", self.trace)
 
     def test_reload_is_dispatched_only_on_unity_thread(self):
-        body = self.trace[self.trace.index("static void EiemRunModReconcile()") :][:2700]
+        body = self.trace[self.trace.index("static void EiemRunModReconcile()") :][:5200]
         self.assertIn("EiemDispatchModUpdate(requests", body)
+        self.assertIn("Physics remains owned by model generation", body)
+        self.assertIn("EiemPhysicsRuntimeRetireChangedAssets", body)
+        self.assertNotIn("mod reload before renderer restore", body)
         self.assertIn("EiemRestoreRenderOverrides(affected)", body)
         self.assertIn("EiemReloadMods()", body)
         entry = (ROOT / "src" / "eiem.cpp").read_text(encoding="utf-8")
         self.assertNotIn("EiemReloadMods();", entry)
+
+    def test_reconcile_wakeup_is_coalesced_and_physics_is_boundary_driven(self):
+        queue = self.trace[self.trace.index("static bool EiemPostPendingModUpdate") :
+                           self.trace.rindex("static void EiemQueueModReconcile")]
+        self.assertIn("static volatile LONG s_eiemModUpdateMessagePosted", self.trace)
+        self.assertIn("s_eiemModUpdateMessagePosted", queue)
+        self.assertIn("InterlockedCompareExchange(&s_eiemModUpdateMessagePosted, 1, 0)", queue)
+        self.assertIn("InterlockedExchange(&s_eiemModUpdateMessagePosted, 0)", queue)
+        trojan = (ROOT / "src" / "trojan.h").read_text(encoding="utf-8")
+        reconcile_handler = trojan[trojan.index("if (msg == WM_EIEM_MOD_RECONCILE)") :]
+        self.assertIn("InterlockedExchange(&s_eiemModUpdateMessagePosted, 0)", reconcile_handler)
+        physics = (ROOT / "src" / "eiem_native_physics_runtime.h").read_text(encoding="utf-8")
+        self.assertIn("static void EiemPhysicsRuntimeBoundary", physics)
+        self.assertNotIn("EiemPhysicsRuntimePeriodic", physics)
+        self.assertNotIn("PhysicsCandidate", physics)
+        self.assertIn("EiemPhysicsRuntimeCheckReady();", physics)
+        self.assertNotIn("EiemPhysicsRuntimePeriodic", trojan)
+
+    def test_lod_suppression_uses_game_force_rendering_off_state(self):
+        self.assertIn("g_renderer_get_forceRenderingOff", self.trace)
+        self.assertIn("forceRenderingOffRead && forceRenderingOff", self.trace)
+        self.assertIn('"force-off"', self.trace)
+        self.assertIn('"enabled-or-unread"', self.trace)
+
+    def test_legacy_per_frame_ik_detours_are_removed(self):
+        for source in (self.init, self.trace, self.trojan):
+            for obsolete in (
+                "Hooked_MovementComponent_Tick",
+                "s_origMoveTick",
+                "MovementComponent.Tick",
+                "Hooked_IK_UpdateSolver",
+                "s_origUpdateSolver",
+                "BipedIK.UpdateSolver",
+                "Hooked_OnUpdate",
+                "s_origOnUpdate",
+                "IKSolverTrigonometric.OnUpdate",
+            ):
+                self.assertNotIn(obsolete, source)
+
+    def test_key_dispatch_is_recorded_at_generation_boundary(self):
+        self.assertIn("EiemRegistrationTraceInput", self.trace)
+        start = self.trace.index("static void EiemQueueModKey")
+        body = self.trace[start : start + 900]
+        self.assertIn("EiemRegistrationTraceInput", body)
+        self.assertIn("chord.vk", body)
+        self.assertIn("chord.modifiers", body)
+
+    def test_reconcile_begin_and_end_share_the_generation_trace(self):
+        self.assertIn("EiemRegistrationTraceReconcile", self.trace)
+        body = self.trace[self.trace.index("static void EiemRunModReconcile") :]
+        self.assertIn("if (!requests) return;", body[:500])
+        self.assertIn('EiemRegistrationTraceReconcile("begin"', body)
+        self.assertIn('EiemRegistrationTraceReconcile(\n      "end"', body)
+        self.assertIn("inputs.size()", body)
+        self.assertIn("instances.size()", body)
 
 
 class BlenderExportContracts(unittest.TestCase):

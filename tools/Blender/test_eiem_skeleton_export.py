@@ -85,6 +85,31 @@ physics=addon.physics_authoring
 group=physics.create_group(rig,[rig.data.bones['Extra'],rig.data.bones['Tip']],'新增尾链')
 group.eiem_physics.gravity=6.25
 
+# A split source with one shared Rig emits model-level dependencies once on
+# the source Render.  Partner templates keep their own Mesh/material actions,
+# but do not repeat Skeleton/Physics ownership.
+split_partner=second.copy(); split_partner.data=second.data.copy()
+bpy.context.scene.collection.objects.link(split_partner)
+split_partner.name='SplitPartner'
+split_partner.data['eiem_section']='MeshSplitPartner'
+split_partner.data['eiem_source']=first.data['eiem_source']
+split_partner.data['eiem_asset']=first.data['eiem_asset']
+split_partner['eiem_render_section']='RenderSplitPartner'
+split_package=output/'shared-partner'; stats=addon.export_package(
+    split_package,[first,split_partner],[rig])
+assert stats['meshes']==2 and stats['skeletons']==1 and stats['physics']==1,stats
+split_ini=configparser.ConfigParser(interpolation=None)
+split_ini.read(split_package/'mod.ini',encoding='utf-8')
+split_root=split_ini['RenderFirst']
+assert split_root['skeleton']=='SkeletonShared'
+split_physics=next(name for name in split_ini.sections()
+                   if name.startswith('Physics'))
+assert split_root['physics']==split_physics
+split_partner_section=split_root['partner.0']
+assert 'skeleton' not in split_ini[split_partner_section]
+assert 'physics' not in split_ini[split_partner_section]
+bpy.data.objects.remove(split_partner,do_unlink=True)
+
 # A Mesh that has positive weights on an authored Physics group's bones owns
 # that dependency even when the helper Empty was not manually selected. This
 # prevents a normal Mesh re-export from silently deleting its working Physics.

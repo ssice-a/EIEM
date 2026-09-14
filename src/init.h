@@ -573,7 +573,12 @@ static DWORD WINAPI InitThread(LPVOID) {
       CreateFileA("plugin\\eiem_log.txt", GENERIC_WRITE, FILE_SHARE_READ, NULL,
                   CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
   Log("=== EIEM Phase 1: Skeleton Discovery ===");
-  Log("[BUILD] resource-runtime-v80-selective-partner-controls dll=%s %s", __DATE__,
+  Log("[DIAG-LOOP-v113] process=%lu thread=%lu tick=%llu stage=startup "
+      "generation=%ld",
+      (unsigned long)GetCurrentProcessId(), (unsigned long)GetCurrentThreadId(),
+      (unsigned long long)GetTickCount64(),
+      InterlockedCompareExchange(&s_eiemModGeneration, 0, 0));
+  Log("[BUILD] resource-runtime-v119-world-bounds-probe dll=%s %s", __DATE__,
       __TIME__);
 
   if (!Resolve()) {
@@ -954,6 +959,15 @@ static DWORD WINAPI InitThread(LPVOID) {
     Log("[OK] Component.get_transform: %p", g_component_get_transform);
   }
 
+  // BaseModelViewPart stores HGMeshRenderer[] separately from its ordinary
+  // Renderer[]/SkinnedMeshRenderer[] arrays.  Resolve the type once so the
+  // runtime probe can tell whether a source renderer participates in that
+  // parallel registration path.  No HG component is created or modified.
+  g_hgMeshRendererClass =
+      FindClass("UnityEngine", "HGMeshRenderer", asms, ac);
+  Log("[RES-TRACE] UnityEngine.HGMeshRenderer class=%p",
+      g_hgMeshRendererClass);
+
   if (g_gameObjectClass) {
     g_gameObject_GetComponent =
         FindMethod(g_gameObjectClass, "GetComponent", 1);
@@ -1044,11 +1058,18 @@ static DWORD WINAPI InitThread(LPVOID) {
         FindMethodInHierarchy(rendererClass, "set_enabled", 1);
     g_renderer_get_isVisible =
         FindMethodInHierarchy(rendererClass, "get_isVisible", 0);
+    g_renderer_get_forceRenderingOff =
+        FindMethodInHierarchy(rendererClass, "get_forceRenderingOff", 0);
     g_renderer_get_sharedMaterials =
         FindMethodInHierarchy(rendererClass, "get_sharedMaterials", 0);
-    Log("[DUMP] Renderer enabled get/set/isVisible: %p / %p / %p",
+    // World-space AABB. This is the only cheap measurement that can tell a
+    // renderer that is posed correctly from one that has collapsed into its
+    // bind pose somewhere below the model.
+    g_renderer_get_bounds =
+        FindMethodInHierarchy(rendererClass, "get_bounds", 0);
+    Log("[MOD-LOD] Renderer enabled get/set/isVisible/forceRenderingOff: %p / %p / %p / %p",
         g_renderer_get_enabled, g_renderer_set_enabled,
-        g_renderer_get_isVisible);
+        g_renderer_get_isVisible, g_renderer_get_forceRenderingOff);
   }
 
   // LOD membership is optional: older Unity builds or stripped metadata may
@@ -1062,6 +1083,10 @@ static DWORD WINAPI InitThread(LPVOID) {
     g_lodGroup_set_lods = FindMethod(g_lodGroupClass, "SetLODs", 1);
     Log("[MOD] LODGroup get/set lods: %p / %p", g_lodGroup_get_lods,
         g_lodGroup_set_lods);
+    if (g_lodGroup_set_lods &&
+        Hook(g_lodGroup_set_lods, "LODGroup.SetLODs observation",
+             (void *)TraceLodGroupSetLODs, &s_origLodGroupSetLODs))
+      Log("[MOD-LOD] LODGroup.SetLODs observation hook installed");
   } else {
     Log("[MOD] LODGroup class not found; partner LOD membership disabled");
   }
@@ -1196,81 +1221,10 @@ static DWORD WINAPI InitThread(LPVOID) {
         g_origSetPos, g_origSetRot, g_origSetLocalPos, g_origSetLocalRot);
   }
 
-  {
-    uintptr_t gaBase2 = (uintptr_t)GetModuleHandleW(L"GameAssembly.dll");
-
-    void *moveCompClass = FindClass("Beyond.Gameplay.Core", "MovementComponent", asms, ac);
-    if (moveCompClass) {
-      void *tickMethod = FindMethod(moveCompClass, "Tick", 1);
-      if (tickMethod) {
-        if (Hook(tickMethod, "MovementComponent.Tick", 
-                 (void *)Hooked_MovementComponent_Tick, &s_origMoveTick)) {
-          Log("[GF2] MovementComponent.Tick hooked via il2cpp");
-        } else {
-          Log("[GF2] WARN: Hook() failed for MovementComponent.Tick");
-        }
-      } else {
-        Log("[GF2] WARN: MovementComponent.Tick method not found");
-      }
-
-      const char *floorNames[] = {"currentFloor"};
-      const char *matchedName = nullptr;
-      int off = FindFieldInHierarchy(moveCompClass, floorNames, 1, &matchedName);
-      if (off >= 0) {
-        g_offCurrentFloor = off;
-        Log("[GF2] currentFloor offset = 0x%X", off);
-      } else {
-        Log("[GF2] WARN: currentFloor field not found, using default 0x2e8");
-      }
-      
-      g_findFloorMethod = FindMethod(moveCompClass, "FindFloor", 3);
-      Log("[GF2] FindFloor method = %p", g_findFloorMethod);
-      
-      const char *entityNames[] = {"m_entity", "entity"};
-      const char *entMatch = nullptr;
-      int entOff = FindFieldInHierarchy(moveCompClass, entityNames, 2, &entMatch);
-      if (entOff >= 0) {
-        g_offBaseCompEntity = entOff;
-        Log("[GF2] BaseComponent.entity offset = 0x%X (%s)", entOff, entMatch);
-      } else {
-        Log("[GF2] WARN: entity field not found, using default 0x50");
-      }
-    } else {
-      Log("[GF2] WARN: MovementComponent class not found");
-    }
-
-    void *bipedIKClass = FindClass("RootMotion.FinalIK", "BipedIK", asms, ac);
-    void *updateSolverMethod = bipedIKClass ? FindMethod(bipedIKClass, "UpdateSolver", 0) : nullptr;
-    if (updateSolverMethod && Hook(updateSolverMethod, "BipedIK.UpdateSolver",
-                                   (void *)Hooked_IK_UpdateSolver, &s_origUpdateSolver)) {
-      Log("[IK] BipedIK.UpdateSolver hooked dynamically via IL2CPP");
-    } else {
-      void *updateSolverAddr = (void *)(gaBase2 + 0x0326A380);
-      if (MH_CreateHook(updateSolverAddr, (void *)Hooked_IK_UpdateSolver,
-                        &s_origUpdateSolver) == MH_OK) {
-        MH_EnableHook(updateSolverAddr);
-        Log("[IK] BipedIK.UpdateSolver hooked via fallback RVA %p", updateSolverAddr);
-      } else {
-        Log("[IK] WARN: Failed to hook BipedIK.UpdateSolver");
-      }
-    }
-
-    void *ikTrigClass = FindClass("RootMotion.FinalIK", "IKSolverTrigonometric", asms, ac);
-    void *onUpdateMethod = ikTrigClass ? FindMethod(ikTrigClass, "OnUpdate", 0) : nullptr;
-    if (onUpdateMethod && Hook(onUpdateMethod, "IKSolverTrigonometric.OnUpdate",
-                               (void *)Hooked_OnUpdate, &s_origOnUpdate)) {
-      Log("[IK] IKSolverTrigonometric.OnUpdate hooked dynamically via IL2CPP");
-    } else {
-      void *onUpdateAddr = (void *)(gaBase2 + 0x032759E0);
-      if (MH_CreateHook(onUpdateAddr, (void *)Hooked_OnUpdate,
-                        &s_origOnUpdate) == MH_OK) {
-        MH_EnableHook(onUpdateAddr);
-        Log("[IK] IKSolverTrigonometric.OnUpdate hooked via fallback RVA %p", onUpdateAddr);
-      } else {
-        Log("[IK] WARN: Failed to hook IKSolverTrigonometric.OnUpdate");
-      }
-    }
-  }
+  // The former MovementComponent/FinalIK detours belonged to the abandoned
+  // per-frame MMD foot-IK experiment. Do not resolve or install those hooks:
+  // resource lifecycle work must leave the game's animation solver untouched.
+  Log("[LEGACY] Movement and FinalIK detours disabled; game-owned IK remains untouched");
 
   void *pcClass =
       FindClass("Beyond.Gameplay.Core", "PlayerController", asms, ac);

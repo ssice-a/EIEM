@@ -74,7 +74,9 @@ path=meshes/accessory.mesh
 - `handling=skip` 仅禁用命中的原 Renderer，与 `mesh=` 独立。
   同时设置则绑定新 Mesh 后保持原 Renderer 禁用。
 - `partner.N` 显式创建额外 Renderer，跟随原实例生命周期。
-  partner 模板不会自动提升为顶层命中规则。
+  partner 模板不会自动提升为顶层命中规则。对于同一源 Mesh 的拆分导出，
+  如果各部件使用同一 Skeleton/Physics，Blender 会把共享依赖写在源 Render
+  一次，Partner 只保留自己的 Mesh、材质和形态键动作；不同依赖不会被静默合并。
 - `material.N` 是该 Renderer 的材质槽；没指定的槽保留源值。
   Mesh 文件记录 submesh，但不嵌入材质文件身份。
 - `skeleton=` 为该 skinned Render 指定共享骨架依赖；原节点按路径引用，新节点按作者 TRS 创建。

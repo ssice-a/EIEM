@@ -47,6 +47,10 @@ static void *g_transformClass = nullptr;
 static void *g_animatorClass = nullptr;
 static void *g_gameObjectClass = nullptr;
 static void *g_componentClass = nullptr;
+// The game keeps a parallel HGMeshRenderer cache beside its ordinary
+// Renderer/SkinnedMeshRenderer cache.  This is observation-only metadata used
+// by the runtime registration probe; Partners are not created as HG renderers.
+static void *g_hgMeshRendererClass = nullptr;
 
 static void *g_transform_get_localRotation = nullptr;
 static void *g_transform_set_localRotation = nullptr;
@@ -411,6 +415,13 @@ static void *g_smr_set_localBounds = nullptr;
 static void *g_renderer_get_enabled = nullptr;
 static void *g_renderer_set_enabled = nullptr;
 static void *g_renderer_get_isVisible = nullptr;
+// LODGroup can suppress a Renderer without changing Renderer.enabled.  This
+// flag is the draw-time eligibility boundary for Mesh identity matching.
+static void *g_renderer_get_forceRenderingOff = nullptr;
+// World-space AABB of a Renderer. Used to measure whether a replacement or
+// Partner renderer is actually standing where its source is, which no other
+// cheap call can answer.
+static void *g_renderer_get_bounds = nullptr;
 static void *g_rendererClass = nullptr;
 static void *g_lodGroupClass = nullptr;
 static void *g_lodGroup_get_lods = nullptr;

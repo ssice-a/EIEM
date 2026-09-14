@@ -23,6 +23,7 @@ static bool g_shutdownRequested = false, g_guiRunning = true, g_pluginActive = t
 static HWND g_gameHwnd = nullptr, g_guiHwnd = (HWND)2, g_modUiHwnd = (HWND)3;
 static WNDPROC g_origWndProc = nullptr;
 static HWND foreground = (HWND)1;
+static void EiemPostPendingModUpdate(const char *) {}
 static void *il2cpp_domain_get() { return nullptr; }
 static void il2cpp_thread_attach(void *) {}
 static HWND FindGameWindow() { return (HWND)1; }
