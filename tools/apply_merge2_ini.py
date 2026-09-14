@@ -137,29 +137,44 @@ def main() -> int:
     lines, sections = parse("".join(lines))
     by_name = {name: (start, end) for name, start, end in sections}
 
-    # 3. Replace the Partner Renders of a source asset with one merged Render.
-    for source_section, merged_section, merged_mesh, asset, slots in (
+    # 3. Rebuild the cloth Renders.
+    #
+    # cloth_01 merges the eight parts whose palettes resolve entirely against
+    # game-owned bones. The ninth (MeshS_actor_typhoea_cloth_01_lod0_2_5, the
+    # skirt) is left out: it is the only mesh carrying the eighteen
+    # maid_skirt_* bones, which the live skeleton does not have, so including it
+    # fails the whole Mesh assignment with "Skeleton bone path not found" and the
+    # Renderer keeps the original Mesh. Excluding it keeps every merged part
+    # bindable; the game's own skirt mesh is not replaced yet.
+    for source_section, merged_section, merged_mesh, asset, slots, enabled in (
         (
             "RenderS_actor_typhoea_cloth_01_lod0_2",
             "RenderS_actor_typhoea_cloth_01_lod0_2",
             "MeshCloth01Merged",
             "S_actor_typhoea_cloth_01_lod0",
+            # One entry per submesh, in submesh order: parts 0,1,2,3,4,6,7,8.
+            # A part that declared no material takes its source Renderer's own:
+            # that is the typhoea cloth material, not the wulfa one that the
+            # undeclared-slot fallback would otherwise pick.
             ["MaterialM_actor_wulfa_cloth_04__2881474875459822074",
              "MaterialM_actor_lod_typhoea_cloth_01__5993152462152797209",
              "MaterialM_actor_wulfa_cloth_04__2881474875459822074",
              "MaterialM_actor_wulfa_cloth_04__2881474875459822074",
              "MaterialM_actor_lod_typhoea_cloth_01__5993152462152797209",
-             "",
              "MaterialM_actor_lod_pelica_cloth_04_7768265222391454716",
              "MaterialM_actor_wulfa_cloth_04__2881474875459822074",
-             ""],
+             "MaterialM_actor_lod_typhoea_cloth_01__5993152462152797209"],
+            True,
         ),
         (
             "RenderS_actor_typhoea_cloth_02_lod0_3",
             "RenderS_actor_typhoea_cloth_02_lod0_3",
             "MeshCloth02Merged",
             "S_actor_typhoea_cloth_02_lod0",
-            ["", "", ""],
+            ["MaterialM_actor_lod_typhoea_cloth_01__5993152462152797209",
+             "MaterialM_actor_lod_typhoea_cloth_01__5993152462152797209",
+             "MaterialM_actor_lod_typhoea_cloth_01__5993152462152797209"],
+            True,
         ),
     ):
         if source_section not in by_name:
@@ -192,19 +207,35 @@ def main() -> int:
         block = [
             f"[{merged_section}]\n",
             f"asset={asset}\n",
-            f"mesh={merged_mesh}\n",
         ]
-        for index, material in enumerate(slots):
-            if material:
+        if not enabled:
+            # Inert match: the game keeps its own Mesh and material. Commented
+            # rather than deleted so re-enabling is one edit, and so the intended
+            # mapping stays visible next to the reason it is off.
+            block.append(
+                f"{TAG}mesh={merged_mesh}  (cannot bind: the Mesh palette names "
+                f"bones the live skeleton lacks)\n"
+            )
+            for index in range(len(slots)):
+                block.append(f"{TAG}submesh.{index}={index}\n")
+            for index, material in enumerate(slots):
+                block.append(f"{TAG}material.{index}={material}\n")
+        else:
+            block.append(f"mesh={merged_mesh}\n")
+            # State the submesh -> material-slot map explicitly, as the earlier
+            # working merged form did. It is the identity here, but it also pins
+            # submeshCount, which sizes the material array, so the mapping does
+            # not depend on how the undeclared-slot fallback behaves.
+            for index in range(len(slots)):
+                block.append(f"submesh.{index}={index}\n")
+            for index, material in enumerate(slots):
                 block.append(f"material.{index}={material}\n")
-            else:
-                # An undeclared slot inherits slot 0 at runtime; state it here so
-                # the intent is visible rather than implied.
-                block.append(f"; material.{index} undeclared: reuses the source slot\n")
         block.append("\n")
         lines[anchor:anchor] = block
         report.append(
-            f"[{merged_section}]: merged Render with {len(slots)} submeshes"
+            f"[{merged_section}]: "
+            + (f"merged Render with {len(slots)} submeshes"
+               if enabled else "DISABLED (inert match, game Mesh kept)")
         )
         lines, sections = parse("".join(lines))
         by_name = {name: (start, end) for name, start, end in sections}
