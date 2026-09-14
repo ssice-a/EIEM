@@ -16,6 +16,7 @@ static bool EiemOnUnityThread();
 static size_t EiemManagedArrayLength(void *array);
 #include "eiem_skeleton_runtime.h"
 #include "eiem_registration_trace.h"
+#include "eiem_skin_probe.h"
 
 // Resource-loading hooks preserve the game's VFS/decryption pipeline and
 // observe logical identities. Only the Render executor applies declared
@@ -41,6 +42,9 @@ static thread_local bool s_traceReentrant = false;
 static volatile LONG s_traceSetterThreadLogged = 0;
 static volatile LONG s_tracePrefabIdentityCount = 0;
 static volatile LONG s_traceBonesSetterCount = 0;
+// Bounds the skinned-mesh measurements, which transform a sample of vertices
+// and therefore must not run unbounded on the Unity thread.
+static volatile LONG s_traceSkinProbeCount = 0;
 static volatile LONG s_traceMaterialCommitCount = 0;
 
 // The manager often returns the same cached proxy repeatedly. Keep the first
@@ -2071,6 +2075,17 @@ static void TraceSkinnedMeshSetBones(void *self, void *bones,
     return;
   }
 
+  // Measure the skinning result at the one boundary where the bone palette
+  // changes. `localBounds` cannot answer this: it is authored data and does not
+  // move when the binding breaks, whereas the skinned extent does.
+  if (TraceTakeBudget(&s_traceSkinProbeCount, 200)) {
+    const EiemSkinProbe::Result measurement = EiemSkinProbe::Measure(self);
+    EiemSkinProbe::LogResult(
+        EiemIsPartnerRenderer(self) ? "[SKIN-PROBE] phase=setBones partner=1"
+                                    : "[SKIN-PROBE] phase=setBones partner=0",
+        measurement);
+  }
+
   // A Partner is intentionally not treated as a source override.  Observe
   // its game-owned setter calls separately so a later skin/Animator refresh
   // that replaces the extended palette cannot be mistaken for a successful
@@ -3464,6 +3479,19 @@ static void *EiemCreatePartnerRenderer(void *sourceMeshOwner,
       partnerDrawRenderer, partnerEnabled ? 1 : 0,
       EiemReadSharedMesh(partnerMeshOwner, rendererType), partnerMaterials);
 
+  // Measure both sides of the handover at the moment the Partner is complete.
+  // The source Renderer is the control: its skinning is the game's own, so a
+  // Partner whose skinned extent disagrees with this one is the defect.
+  if (EiemModEquals(rendererType, "SkinnedMeshRenderer") &&
+      TraceTakeBudget(&s_traceSkinProbeCount, 200)) {
+    const EiemSkinProbe::Result sourceSide =
+        EiemSkinProbe::Measure(sourceMeshOwner);
+    EiemSkinProbe::LogResult("[SKIN-PROBE] phase=create source=1", sourceSide);
+    const EiemSkinProbe::Result partnerSide =
+        EiemSkinProbe::Measure(partnerDrawRenderer);
+    EiemSkinProbe::LogResult("[SKIN-PROBE] phase=create partner=1", partnerSide);
+  }
+
   size_t expectedBoneCount = 0;
   if (EiemModEquals(rendererType, "SkinnedMeshRenderer")) {
     expectedBoneCount = EiemManagedArrayLength(partnerBones);
@@ -4215,6 +4243,49 @@ static bool TraceLookupLoadedModelPath(void *model, char *out, size_t outSize) {
 
 // PrefabInstantiateProxy is the normal world-model lifecycle adapter. Other
 // lifecycle owners below feed the same instance registry and Render path.
+// Diagnostic only: list the renderers a freshly instantiated character prefab
+// carries, and whether they already hold Mesh references. Every presentation
+// path instantiates its own Prefab for the same character, so the prefab path
+// is what lists them. Kept out of the completion hook itself: that hook has a
+// size-bounded contract, and inlining this scan pushed the model-registration
+// call out of the window that verifies it.
+static void TraceDumpPrefabRenderers(const char *path, void *model) {
+  if (!model || !path || !path[0] || strstr(path, "typhoea") == nullptr ||
+      !g_gameObject_GetComponentsInChildren || !g_skinnedMeshRendererClass ||
+      !il2cpp_class_get_type || !il2cpp_type_get_object)
+    return;
+  void *type = il2cpp_class_get_type(g_skinnedMeshRendererClass);
+  void *typeObject = type ? il2cpp_type_get_object(type) : nullptr;
+  if (!typeObject) return;
+  bool includeInactive = true;
+  void *params[] = {typeObject, &includeInactive};
+  void *array = Invoke(g_gameObject_GetComponentsInChildren, model, params);
+  const size_t count = EiemManagedArrayLength(array);
+  Log("[PREFAB-RENDERERS] path=%s model=%p skinnedRenderers=%zu", path, model,
+      count);
+  if (!array || count > 256) return;
+  void **items = (void **)((char *)array + IL2CPP_ARRAY_DATA);
+  for (size_t index = 0; index < count; ++index) {
+    void *renderer = items[index];
+    if (!renderer) continue;
+    char rendererName[160] = {};
+    TraceReadUnityObjectName(renderer, rendererName, sizeof(rendererName));
+    void *mesh = EiemReadSharedMesh(renderer, "SkinnedMeshRenderer");
+    char meshName[192] = {};
+    if (mesh) TraceReadUnityObjectName(mesh, meshName, sizeof(meshName));
+    void *rootBone =
+        g_smr_get_rootBone ? Invoke(g_smr_get_rootBone, renderer) : nullptr;
+    char rootBoneName[160] = {};
+    if (rootBone)
+      TraceReadUnityObjectName(rootBone, rootBoneName, sizeof(rootBoneName));
+    Log("[PREFAB-RENDERER] path=%s index=%zu name=%s mesh=%p meshName=%s "
+        "rootBoneName=%s",
+        path, index, rendererName[0] ? rendererName : "<unnamed>", mesh,
+        meshName[0] ? meshName : "<empty>",
+        rootBoneName[0] ? rootBoneName : "<empty>");
+  }
+}
+
 static void TracePrefabInstantiateCompleted(void *self, void *methodInfo) {
   // Capture identity before the game completion method is allowed to release
   // or recycle its asset handle. The instantiated GameObject is read after
@@ -4241,6 +4312,13 @@ static void TracePrefabInstantiateCompleted(void *self, void *methodInfo) {
     Log("[TRACE-PREFAB] completed proxy=%p uid=%u path=%s model=%p configured=%d declarations=%zu",
         self, instanceUid, path[0] ? path : "<none>", model,
         configured ? 1 : 0, prefabs.size());
+  // Character prefabs only. Every presentation path instantiates its own Prefab
+  // for the same character, so the prefab path is what lists them, and the
+  // renderers in the freshly instantiated hierarchy are what that prefab
+  // declares. Reporting both here answers two things at once: which prefabs a
+  // character has, and whether a path's renderers carry the Mesh references
+  // before any mod code runs.
+  TraceDumpPrefabRenderers(path, model);
   const bool applied =
       EiemRegisterAndApplyModelInstance(
           EiemModelOwnerKind::PrefabProxy, self, model, path, instanceUid,
@@ -7282,9 +7360,18 @@ static void *TraceAssetProxyHandleGetAssetProxy(void *self, void *methodInfo) {
     const char *name = klass && il2cpp_class_get_name
                            ? il2cpp_class_get_name(klass)
                            : "?";
-    Log("[RES-TRACE] FAssetProxyHandle.GetAssetProxy: handle=%p proxy=%p "
-        "type=%s",
-        self, result, name ? name : "?");
+    // The path is what ties a proxy to a Mesh asset. Every Prefab loads the same
+    // Mesh set, so the path is how the UI, world and NPC chains are told apart;
+    // the handle alone does not identify the asset.
+    char pathText[512] = {};
+    auto pathGetter = (TraceProxyObjectFn)s_origAssetProxyHandlePath;
+    if (pathGetter) {
+      TraceDescribeString(pathGetter(self, nullptr), pathText, sizeof(pathText));
+    }
+    if (pathText[0] && strstr(pathText, "typhoea") != nullptr) {
+      Log("[RES-TRACE] ProxyGet handle=%p proxy=%p type=%s path=\"%s\"", self,
+          result, name ? name : "?", pathText);
+    }
     s_traceReentrant = false;
   }
   return result;
@@ -7770,19 +7857,27 @@ static void *TraceAssetBundleLoadAsset1(void *self, void *path,
 
 static void *TraceAssetBundleLoadAsset2(void *self, void *path, void *type,
                                         void *methodInfo) {
+  // Capture the caller before the original runs; the frame is still ours here.
+  void *caller = _ReturnAddress();
   auto original = (TraceLoadAsset2Fn)s_origAssetBundleLoadAsset2;
   void *result = original ? original(self, path, type, methodInfo) : nullptr;
+  // Only the target character's own parts are reported. Every Prefab loads this
+  // same set of Meshes, so filtering on the asset is what turns the log into a
+  // list of the presentation paths that touch it.
   if (!s_traceReentrant && TraceTakeBudget(&s_traceLoadAssetCount, 300)) {
     s_traceReentrant = true;
     char pathText[512] = {};
-    char typeText[512] = {};
-    char resultText[512] = {};
     TraceDescribeString(path, pathText, sizeof(pathText));
-    TraceDescribeObject(type, typeText, sizeof(typeText));
-    TraceDescribeObject(result, resultText, sizeof(resultText));
-    Log("[RES-TRACE] AssetBundle.LoadAsset(string,Type): path=\"%s\" "
-        "type=%s result=%s",
-        pathText, typeText, resultText);
+    if (pathText[0] && strstr(pathText, "typhoea") != nullptr) {
+      char typeText[512] = {};
+      char resultText[512] = {};
+      TraceDescribeObject(type, typeText, sizeof(typeText));
+      TraceDescribeObject(result, resultText, sizeof(resultText));
+      // The caller address is what identifies the presentation path: matching on
+      // the asset alone cannot tell the UI, world and NPC chains apart.
+      Log("[RES-TRACE] LoadAsset caller=%p path=\"%s\" type=%s result=%s", caller,
+          pathText, typeText, resultText);
+    }
     s_traceReentrant = false;
   }
   return result;
@@ -8068,9 +8163,16 @@ static void *FindMaterialRendererInfoClass(void **assemblies,
 
 #include "eiem_native_physics_runtime.h"
 #include "eiem_npc_model_owner.h"
+#include "eiem_metadata_probe.h"
 
 static void InitIl2CppResourceTrace(void **assemblies, size_t assemblyCount) {
   if (!assemblies || assemblyCount == 0) return;
+  // Read-only metadata reconnaissance. The static route to these names is
+  // blocked (Il2CppDumper cannot resolve this build's registration pointers), and
+  // several earlier hooks were guessed wrong, so the exact class names and field
+  // offsets are enumerated once here instead.
+  EiemDumpMetadataClasses(assemblies, assemblyCount);
+  EiemInstallPartTableTest(assemblies, assemblyCount);
   EiemInitUnityLifetime(assemblies, assemblyCount);
   EiemInstallNpcModelOwner(assemblies, assemblyCount);
 
