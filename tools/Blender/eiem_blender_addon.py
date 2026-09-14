@@ -1625,6 +1625,226 @@ def write_mesh(path, obj):
     path.write_bytes(writer.data)
 
 
+def write_merged_mesh(output, objects):
+    """Write sibling objects as one Mesh with one submesh per material slot.
+
+    The runtime hands a source Renderer exactly one Mesh, so mounting several
+    sibling parts natively means one Mesh carrying all of them. Each part's
+    material slot becomes its own submesh, which is also what makes a single
+    part addressable later: a submesh can be re-materialed without touching the
+    others.
+
+    Geometry is concatenated verbatim. Vertices are never welded and never
+    reordered, so each part keeps its identity and only gains a constant offset.
+    All parts must already agree on their joint palette, because one Mesh has
+    exactly one; write_mesh is what guarantees that for siblings exported from
+    one armature.
+    """
+    if not objects:
+        raise ValueError("没有可合并的网格")
+    path = Path(output)
+    coordinate = objects[0].data.get("eiem_coordinate_space", "unity-y-up-left-handed")
+    for obj in objects:
+        if obj.data.get("eiem_coordinate_space", "unity-y-up-left-handed") != coordinate:
+            raise ValueError("合并的网格坐标系不一致：" + obj.name)
+    to_source = blender_to_unity if is_unity_left_handed(coordinate) else (lambda value: tuple(value))
+
+    parts = []
+    for obj in objects:
+        mesh = obj.data
+        mesh.calc_loop_triangles()
+        source_normals = get_point_attribute(mesh, "EIEM_SourceNormal", "vector")
+        baseline_crc = str(mesh.get("eiem_normal_baseline_crc", ""))
+        preserve_normals = (source_normals is not None and baseline_crc and
+                            (normal_state_crc(mesh) == baseline_crc or
+                             normal_state_matches_source(mesh, source_normals)))
+        normal_corners = [] if preserve_normals else [tuple(c.vector) for c in mesh.corner_normals]
+        uv_channels = mesh_export_uv_channels(mesh)
+        color_domain, color_values = mesh_export_colors(mesh)
+        tangent_points, tangent_corners = mesh_export_tangents(
+            mesh, source_normals, normal_corners, preserve_normals)
+        corner_channels = [channel[1] for channel in uv_channels if channel is not None]
+        if not preserve_normals:
+            corner_channels.append(normal_corners)
+        if color_domain == "CORNER":
+            corner_channels.append(color_values)
+        if tangent_corners:
+            corner_channels.append(tangent_corners)
+        source_vertices, source_loops, loop_vertices = export_corner_map(mesh, corner_channels)
+
+        vertices = [coord for source in source_vertices
+                    for coord in to_source(mesh.vertices[source].co)]
+        normal_values = [source_normals[source] if preserve_normals else
+                         normal_corners[loop] if loop is not None else tuple(mesh.vertices[source].normal)
+                         for source, loop in zip(source_vertices, source_loops)]
+        normals = [coord for value in normal_values for coord in to_source(value)]
+        tangents = []
+        if tangent_points:
+            for source, loop in zip(source_vertices, source_loops):
+                value = tangent_corners[loop] if tangent_corners and loop is not None else tangent_points[source]
+                tangents.extend(to_source(value[:3]))
+                tangents.append(value[3])
+        colors = []
+        if color_values:
+            for source, loop in zip(source_vertices, source_loops):
+                value = color_values[source] if color_domain == "POINT" else (
+                    color_values[loop] if loop is not None else (0.0, 0.0, 0.0, 0.0))
+                colors.extend(value)
+        uv_layers = []
+        for channel in uv_channels:
+            values = []
+            if channel is not None:
+                dimension, xy, zw = channel
+                for source, loop in zip(source_vertices, source_loops):
+                    values.extend(xy[loop] if loop is not None else (0.0, 0.0))
+                    if dimension > 2:
+                        values.extend(zw[source][:dimension - 2])
+            uv_layers.append(values)
+
+        by_slot = {}
+        for tri in mesh.loop_triangles:
+            slot = int(mesh.polygons[tri.polygon_index].material_index)
+            triangle = tuple(loop_vertices[loop] for loop in tri.loops)
+            if is_unity_left_handed(coordinate):
+                triangle = (triangle[0], triangle[2], triangle[1])
+            by_slot.setdefault(slot, []).extend(triangle)
+
+        skin, bindposes, bone_hashes, bone_paths = export_skin_binding(
+            obj, obj.find_armature(), source_vertices)
+        parts.append({
+            "obj": obj,
+            "vertices": vertices, "normals": normals, "tangents": tangents,
+            "colors": colors, "uv_layers": uv_layers,
+            "count": len(source_vertices),
+            "channels": len(uv_layers),
+            "by_slot": by_slot,
+            "slot_count": max(len(obj.data.materials),
+                              (max(by_slot) + 1) if by_slot else 0),
+            "skin": skin, "bindposes": bindposes,
+            "bone_hashes": bone_hashes, "bone_paths": bone_paths,
+        })
+
+    # One Mesh has one joint palette. Sibling parts routinely address different
+    # subsets of the shared skeleton, so the palette is their ordered union and
+    # each part's joint indices are remapped into it. Refusing instead would
+    # reject exactly the sibling groups this exists for.
+    palette_paths = []
+    for part in sorted(parts, key=lambda item: len(item["bone_paths"]), reverse=True):
+        for path in part["bone_paths"]:
+            if path not in palette_paths:
+                palette_paths.append(path)
+    palette_index = {name: index for index, name in enumerate(palette_paths)}
+    for part in parts:
+        # export_skin_binding keeps these three in one order: a skin joint, a
+        # bind pose and a hash are all addressed by the part's own palette slot.
+        if not (len(part["bindposes"]) == len(part["bone_paths"]) ==
+                len(part["bone_hashes"])):
+            raise ValueError(
+                "网格 %s 的骨骼路径/绑定矩阵/哈希数量不一致" % part["obj"].name)
+        part["remap"] = [palette_index[name] for name in part["bone_paths"]]
+    # Bind poses come from the palette order. Parts exported from one skeleton
+    # agree to float precision, so the first part that declares a bone wins and
+    # a materially different matrix means the parts do not share one skin.
+    merged_poses = [None] * len(palette_paths)
+    for part in parts:
+        # enumerate(remap) yields (this part's own slot, its slot in the union).
+        for own_slot, union_slot in enumerate(part["remap"]):
+            pose = list(part["bindposes"][own_slot])[:16]
+            pose += [0.0] * (16 - len(pose))
+            existing = merged_poses[union_slot]
+            if existing is None:
+                merged_poses[union_slot] = pose
+            elif max(abs(a - b) for a, b in zip(existing, pose)) > 1e-4:
+                raise ValueError(
+                    "骨骼 %s 的绑定矩阵在合并的部件之间不一致"
+                    % part["bone_paths"][own_slot])
+    if any(pose is None for pose in merged_poses):
+        raise ValueError("合并的关节调色盘有不存在的绑定矩阵")
+    hashes = [None] * len(palette_paths)
+    for part in parts:
+        for own_slot, union_slot in enumerate(part["remap"]):
+            if hashes[union_slot] is None:
+                hashes[union_slot] = part["bone_hashes"][own_slot]
+    if any(value is None for value in hashes):
+        raise ValueError("合并的关节调色盘有不存在的骨骼哈希")
+    channels = {part["channels"] for part in parts}
+    if len(channels) > 1:
+        raise ValueError(
+            "合并的网格 UV 通道数不一致，无法共用一个顶点布局："
+            + "，".join(part["obj"].name for part in parts))
+    # BoneWeight is per vertex, so every part must contribute one entry per
+    # vertex. A part with no armature has no skin, and letting that shorten the
+    # table would shift every later part's weights onto the wrong vertices.
+    for part in parts:
+        if len(part["skin"]) != part["count"]:
+            raise ValueError(
+                "网格 %s 的蒙皮数量(%d)与顶点数(%d)不一致，无法参与合并"
+                % (part["obj"].name, len(part["skin"]), part["count"]))
+
+    vertices, normals, tangents, colors = [], [], [], []
+    uv_layers = [[] for _ in range(parts[0]["channels"])]
+    indices, submeshes, skin = [], [], []
+    vertex_offset = 0
+    for part in parts:
+        vertices.extend(part["vertices"])
+        normals.extend(part["normals"])
+        tangents.extend(part["tangents"])
+        colors.extend(part["colors"])
+        for channel, values in enumerate(part["uv_layers"]):
+            uv_layers[channel].extend(values)
+        # One submesh per material slot, in slot order, so submesh N is the Nth
+        # slot of this part. Empty slots are kept rather than renumbered.
+        for slot in range(part["slot_count"]):
+            slot_indices = part["by_slot"].get(slot, [])
+            start = len(indices)
+            indices.extend(value + vertex_offset for value in slot_indices)
+            used = set(slot_indices)
+            first_vertex = min(used) + vertex_offset if used else 0
+            vertex_count = (max(used) - min(used) + 1) if used else 0
+            submeshes.append((0, start, len(slot_indices), 0, first_vertex,
+                              vertex_count))
+        for weights_value, bones_value in part["skin"]:
+            skin.append((weights_value,
+                         [part["remap"][int(b)] for b in bones_value]))
+        vertex_offset += part["count"]
+
+    writer = Writer(); writer.raw(MAGIC_MESH); writer.i32(3)
+    writer.string(coordinate)
+    writer.string(parts[0]["obj"].data.get("eiem_source", ""))
+    writer.string(parts[0]["obj"].data.get("eiem_asset", parts[0]["obj"].name))
+    writer.i32(vertex_offset); writer.floats(vertices); writer.floats(normals)
+    writer.floats(tangents); writer.floats(colors)
+    for values in uv_layers: writer.floats(values)
+    writer.i32(len(indices))
+    for value in indices: writer.u32(value)
+    writer.i32(len(submeshes))
+    for topology, start, count, base, first, vertex_count in submeshes:
+        writer.i32(topology); writer.u32(start); writer.u32(count)
+        writer.u32(base); writer.u32(first); writer.u32(vertex_count)
+    writer.i32(len(skin))
+    for weights_value, bones_value in skin:
+        for value in weights_value: writer.f32(value)
+        for value in bones_value: writer.u32(value)
+    writer.i32(len(merged_poses))
+    for pose in merged_poses:
+        for value in pose: writer.f32(value)
+    writer.i32(len(hashes))
+    for value in hashes: writer.u32(value)
+    writer.i32(len(palette_paths))
+    for value in palette_paths: writer.string(value)
+    # Blend shapes keep their part-local vertex indices shifted by that part's
+    # base offset, exactly like the geometry they displace.
+    writer.i32(0); writer.i32(0); writer.i32(0); writer.floats([]); writer.i32(0)
+    # Write through the parameter: the palette loop above rebinds the local.
+    Path(output).write_bytes(writer.data)
+    return {
+        "parts": len(parts),
+        "vertices": vertex_offset,
+        "submeshes": len(submeshes),
+        "slots": [part["slot_count"] for part in parts],
+    }
+
+
 def skeleton_author_nodes(obj):
     """Source nodes are references, new nodes carry actual parent-local TRS.
 
@@ -2156,6 +2376,90 @@ def export_package(root, mesh_objects=None, armatures=None, physics_objects=None
         return stats
 
 
+def build_merged_action(mesh_objects, plan, root, object_actions, shape_bindings,
+                        material_sections, material_payloads, exported_armatures,
+                        physics_sections, seen_mesh_sections, shared_mesh_sections,
+                        resource_lines):
+    """Collapse each source Mesh's sibling parts into one exported Mesh.
+
+    A source Renderer carries exactly one Mesh, so sibling parts mounted on one
+    source Renderer have to travel inside one Mesh. Exporting them separately
+    makes the runtime create extra Renderers and register them after the game has
+    already built its renderer registry, which is where a part could end up
+    outside that registry and render in its bind pose.
+
+    Merging is keyed on the source Mesh identity, which is also what the export
+    plan groups by, so a group can never mix two different source Meshes. The
+    merged Mesh carries one submesh per material slot of each part, and every
+    part is left addressing that one section so the source Render declares a
+    single direct mesh replacement with no Partners.
+    """
+    groups = {}
+    for obj in mesh_objects:
+        if obj in plan["hidden"]:
+            continue
+        key = (str(obj.get("eiem_render_asset", "") or obj.data.get(
+                   "eiem_target_asset", obj.data.get("eiem_asset", ""))).lower(),
+               str(obj.data.get("eiem_target_path", "") or obj.data.get(
+                   "eiem_source", "")).lower(),
+               str(obj.get("eiem_author_package", "")).replace("\\", "/").lower())
+        groups.setdefault(key, []).append(obj)
+
+    for key, members in sorted(groups.items(), key=lambda item: item[0]):
+        members = [member for member in members if member in object_actions]
+        if len(members) < 2 or any(member in plan["bindings"] for member in members):
+            # A single part already declares the source's own Mesh. A part that
+            # a switch owns keeps its Partner, because a Partner is what a
+            # switch toggles.
+            continue
+        first = members[0]
+        # Name the merged resource after the part it replaces, marked as merged,
+        # so a generated mod.ini shows at a glance that one Mesh carries the
+        # whole group.
+        section = unique_export_section(
+            str(first.data["eiem_section"]) + "_MERGED", seen_mesh_sections,
+            "Mesh")
+        filename = "meshes/" + section + ".mesh"
+        stats = write_merged_mesh(root / filename, members)
+        # One submesh per material slot, parts in member order, so a part's first
+        # slot lands after all earlier parts' slots. Material slots must be
+        # numbered in that same merged space or a later part would overwrite an
+        # earlier one's slot.
+        action = ["mesh=" + section]
+        action.extend(shape_bindings.get(first, []))
+        rig = first.find_armature()
+        skeleton = exported_armatures.get(rig)
+        if skeleton:
+            action.append("skeleton=" + skeleton)
+        physics = physics_sections.get(rig)
+        if physics:
+            action.append("physics=" + physics)
+        slot_offset = 0
+        for position, member in enumerate(members):
+            for slot, material in enumerate(member.data.materials):
+                material_section = material_sections.get(material, "")
+                if material_section in material_payloads:
+                    action.append("material.%d=%s"
+                                  % (slot_offset + slot, material_section))
+            slot_offset += stats["slots"][position]
+        for member in members:
+            object_actions[member] = list(action)
+
+        declaration = [
+            "[" + section + "]", "path=" + filename,
+            "source=" + str(first.data.get("eiem_source", "")),
+            "asset=" + str(first.data.get("eiem_asset", first.name)),
+        ]
+        target_path = str(first.data.get("eiem_target_path", "")).strip()
+        if target_path:
+            declaration.extend([
+                "target.path=" + target_path,
+                "target.asset=" + str(first.data.get("eiem_target_asset", "")),
+            ])
+        declaration.append("")
+        resource_lines.extend(declaration)
+
+
 def write_export_package(root, plan, armatures, physics_objects=None):
     # A hidden selection declares skip only: its geometry, materials, textures
     # and shape controls must not become resource dependencies.
@@ -2293,6 +2597,10 @@ def write_export_package(root, plan, armatures, physics_objects=None):
         (root / "meshes").mkdir(exist_ok=True)
     seen_mesh_sections = set()
     shared_mesh_sections = {}
+    build_merged_action(mesh_objects, plan, root, object_actions, shape_bindings,
+                        material_sections, material_payloads,
+                        exported_armatures, physics_sections, seen_mesh_sections,
+                        shared_mesh_sections, resource_lines)
     for obj in mesh_objects:
         # P/duplicate copies source metadata, not geometry identity. Shared
         # datablocks can still share an exported resource when their skin maps
@@ -2307,6 +2615,9 @@ def write_export_package(root, plan, armatures, physics_objects=None):
             section = unique_export_section(obj.data["eiem_section"], seen_mesh_sections, "Mesh")
             shared_mesh_sections[data_identity] = section
             filename = "meshes/" + section + ".mesh"
+            # Merged groups were already written by build_merged_action, which
+            # also re-pointed every member at the shared section. What is left
+            # here is one Mesh per part.
             write_mesh(root / filename, obj)
             declaration = [
                 "[" + section + "]", "path=" + filename,
