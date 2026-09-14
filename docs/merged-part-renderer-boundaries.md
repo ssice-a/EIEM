@@ -25,9 +25,15 @@ Typhoea 的 body_01 / cloth_01 / cloth_02 虽然共用同一套
 
 | 分组 | 部件数 | 合并结果 | 状态 |
 |---|---|---|---|
-| cloth_01 | 9 | `MeshS_actor_typhoea_cloth_01_lod0_2_MERGED.mesh` | 已部署，已确认不再躺地 |
-| cloth_02 | 3 | 待合并 | 仍走 Partner 路径 |
+| cloth_01 | 8（排除 `_5` 裙子） | `MeshCloth01Merged.mesh` | 已部署，palette 122 全为游戏骨骼 |
+| cloth_02 | 3 | `MeshCloth02Merged.mesh` | 已部署，palette 126 全为游戏骨骼 |
 | body_01 | 1 | 无需合并（本来就是就地替换） | 已部署 |
+
+**注意**：本节早先记录 cloth_01 为 9 个部件并"已确认不再躺地"，那是另一次导出的
+结论，**已经失效**。第 9 个部件 `MeshS_actor_typhoea_cloth_01_lod0_2_5` 是唯一
+带 18 根 `maid_skirt_*` 的 mesh，而活体骨架里裙摆叫 `skirt_base_*`；一个解析不到
+的骨骼路径会让整个 mesh 赋值失败，进而使规则里所有材质与子网格映射失效。详见
+[合并实验记录](merged-form-experiments.md)。
 
 ## 跨源 asset 合并会撞上的两个问题
 

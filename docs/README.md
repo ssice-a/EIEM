@@ -47,6 +47,9 @@ Mesh 命中实例的精确模型 owner/Animator。观察 DLL 已构建并部署�
 |---|---|---|
 | 项目术语 | [CONTEXT](../CONTEXT.md) | 核心对象与跨模块约束 |
 | Mod 装配 | [模型替换](model-replacement-design.md) | 资源、Render、实例及恢复 |
+| 装配链路 | [模型创建链路](model-assembly-chain.md) | 三端各自的链、改动点取舍、正确蒙皮的条件 |
+| 合并形态 | [合并实验记录](merged-form-experiments.md) | Hook 结论、各版本实验、已推翻假设、诊断陷阱 |
+| 合并边界 | [合并的边界](merged-part-renderer-boundaries.md) | 源 asset 是分组单位、UV/材质槽/LOD 约束 |
 | 输入与配置 | [条件与按键](conditional-keys.md) | INI、表达式、更新顺序 |
 | Blender 网格工具 | [切换作者流程](blender-switches.md) | 选择、显隐、状态和导出 |
 | 顶点通道 | [顶点数据契约](vertex-data-contract.md) | 原生保留与缺失切线生成 |
