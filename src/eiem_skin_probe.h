@@ -90,6 +90,49 @@ static void ReadObjectName(void *object, char *out, size_t outSize) {
   }
 }
 
+// Renderer.bounds is the engine's own answer for this Renderer, already
+// accounting for skinning and the Transform chain. Comparing it across the
+// source/partner handover is the most direct evidence available, and it does
+// not depend on this file's math being correct.
+struct WorldBounds {
+  bool read = false;
+  float minX = 0, minY = 0, minZ = 0;
+  float maxX = 0, maxY = 0, maxZ = 0;
+  float SizeX() const { return maxX - minX; }
+  float SizeY() const { return maxY - minY; }
+  float SizeZ() const { return maxZ - minZ; }
+  float Longest() const {
+    const float longest = SizeX() > SizeY() ? SizeX() : SizeY();
+    return longest > SizeZ() ? longest : SizeZ();
+  }
+  float CenterX() const { return (minX + maxX) * 0.5f; }
+  float CenterY() const { return (minY + maxY) * 0.5f; }
+  float CenterZ() const { return (minZ + maxZ) * 0.5f; }
+};
+
+static WorldBounds ReadRendererBounds(void *renderer) {
+  WorldBounds out;
+  if (!renderer || !g_renderer_get_bounds) return out;
+  __try {
+    void *boxed = Invoke(g_renderer_get_bounds, renderer);
+    if (!boxed) return out;
+    // Bounds is center(Vector3) then extents(Vector3) at the boxed payload.
+    const float *values = (const float *)((char *)boxed + 16);
+    for (int i = 0; i < 6; ++i)
+      if (!std::isfinite(values[i])) return out;
+    out.minX = values[0] - values[3];
+    out.minY = values[1] - values[4];
+    out.minZ = values[2] - values[5];
+    out.maxX = values[0] + values[3];
+    out.maxY = values[1] + values[4];
+    out.maxZ = values[2] + values[5];
+    out.read = true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    out.read = false;
+  }
+  return out;
+}
+
 // Skinning every vertex of a 15k mesh on the Unity thread would stall a frame.
 // A strided sample separates a collapsed box from a correct one; the stride is
 // reported so the sample is never mistaken for a full measurement.
@@ -113,8 +156,15 @@ struct Result {
   Bounds skinnedBounds;
   float staticLongest = 0.0f;
   float skinnedLongest = 0.0f;
+  // Displacement of the skinned box from where the mesh sits, measured about
+  // the Renderer's own world origin. The raw difference is dominated by the
+  // character's world position (bone matrices are world space, mesh vertices
+  // are model space), which says nothing about correctness.
   float centerShift = 0.0f;
   uint64_t bindposeHash = 0;
+  // The engine's own view of this Renderer, for comparing the two sides of a
+  // handover without relying on this file's math.
+  WorldBounds rendererBounds;
   const char *verdict = "unmeasured";
 };
 
@@ -240,10 +290,23 @@ static Result Measure(void *renderer) {
   result.boneIndexOutOfRange = counters.outOfRange;
   result.unweighted = counters.unweighted;
   result.skinnedLongest = result.skinnedBounds.Longest();
+  result.rendererBounds = ReadRendererBounds(renderer);
+  // Measure displacement in world space. A bone's localToWorldMatrix already
+  // carries the character's position while mesh vertices are model space, so
+  // the raw difference between the two boxes is the character's world origin
+  // and carries no information. Renderer.bounds supplies that origin without a
+  // Transform walk. When it is unavailable, fall back to the local comparison
+  // and let the caller treat the number as approximate.
   if (result.vertexBounds.valid && result.skinnedBounds.valid) {
-    const float dx = result.skinnedBounds.CenterX() - result.vertexBounds.CenterX();
-    const float dy = result.skinnedBounds.CenterY() - result.vertexBounds.CenterY();
-    const float dz = result.skinnedBounds.CenterZ() - result.vertexBounds.CenterZ();
+    const float anchorX = result.rendererBounds.read ? result.rendererBounds.CenterX()
+                                                     : result.vertexBounds.CenterX();
+    const float anchorY = result.rendererBounds.read ? result.rendererBounds.CenterY()
+                                                     : result.vertexBounds.CenterY();
+    const float anchorZ = result.rendererBounds.read ? result.rendererBounds.CenterZ()
+                                                     : result.vertexBounds.CenterZ();
+    const float dx = result.skinnedBounds.CenterX() - anchorX;
+    const float dy = result.skinnedBounds.CenterY() - anchorY;
+    const float dz = result.skinnedBounds.CenterZ() - anchorZ;
     result.centerShift = std::sqrt(dx * dx + dy * dy + dz * dz);
   }
   result.measured = result.skinnedBounds.valid;
@@ -261,11 +324,36 @@ static void LogResult(const char *tag, const Result &result) {
         result.reason[0] ? result.reason : "<none>");
     return;
   }
+  // `rbounds` is Unity's own answer for this Renderer and needs none of this
+  // file's math, so it is the cross-check: a skinned box wildly unlike it means
+  // the bones the engine uses are not the bones this probe read.
+  if (result.rendererBounds.read) {
+    Log("%s measured=1 name=%s mesh=%p bones=%zu nullBones=%zu oob=%zu "
+        "degenPose=%zu verts=%zu sampled=%zu stride=%zu unweighted=%zu "
+        "static=[%.4f %.4f %.4f] staticMax=%.4f "
+        "skinned=[%.4f %.4f %.4f] skinnedMax=%.4f "
+        "rbounds=[%.4f %.4f %.4f] rMax=%.4f rCenter=[%.1f %.1f %.1f] "
+        "centerShift=%.4f poseHash=%016llX verdict=%s",
+        tag, result.rendererName[0] ? result.rendererName : "<unnamed>",
+        result.mesh, result.boneCount, result.nullBones,
+        result.boneIndexOutOfRange, result.degenerateBindposes, result.vertices,
+        result.sampled, result.sampled ? (result.vertices / result.sampled) : 1,
+        result.unweighted, result.vertexBounds.SizeX(), result.vertexBounds.SizeY(),
+        result.vertexBounds.SizeZ(), result.staticLongest,
+        result.skinnedBounds.SizeX(), result.skinnedBounds.SizeY(),
+        result.skinnedBounds.SizeZ(), result.skinnedLongest,
+        result.rendererBounds.SizeX(), result.rendererBounds.SizeY(),
+        result.rendererBounds.SizeZ(), result.rendererBounds.Longest(),
+        result.rendererBounds.CenterX(), result.rendererBounds.CenterY(),
+        result.rendererBounds.CenterZ(), result.centerShift,
+        (unsigned long long)result.bindposeHash, result.verdict);
+    return;
+  }
   Log("%s measured=1 name=%s mesh=%p bones=%zu nullBones=%zu oob=%zu "
       "degenPose=%zu verts=%zu sampled=%zu stride=%zu unweighted=%zu "
       "static=[%.4f %.4f %.4f] staticMax=%.4f "
-      "skinned=[%.4f %.4f %.4f] skinnedMax=%.4f centerShift=%.4f "
-      "poseHash=%016llX verdict=%s",
+      "skinned=[%.4f %.4f %.4f] skinnedMax=%.4f "
+      "rbounds=<unread> centerShift=%.4f poseHash=%016llX verdict=%s",
       tag, result.rendererName[0] ? result.rendererName : "<unnamed>",
       result.mesh, result.boneCount, result.nullBones,
       result.boneIndexOutOfRange, result.degenerateBindposes, result.vertices,

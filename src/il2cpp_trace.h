@@ -45,6 +45,9 @@ static volatile LONG s_traceBonesSetterCount = 0;
 // Bounds the skinned-mesh measurements, which transform a sample of vertices
 // and therefore must not run unbounded on the Unity thread.
 static volatile LONG s_traceSkinProbeCount = 0;
+// Armed where Partners are created, which is above the per-frame driver that
+// consumes it. Defined next to that driver.
+static void EiemArmSkinProbeSweep();
 static volatile LONG s_traceMaterialCommitCount = 0;
 
 // The manager often returns the same cached proxy repeatedly. Keep the first
@@ -3499,6 +3502,9 @@ static void *EiemCreatePartnerRenderer(void *sourceMeshOwner,
     const EiemSkinProbe::Result partnerSide =
         EiemSkinProbe::Measure(partnerDrawRenderer);
     EiemSkinProbe::LogResult("[SKIN-PROBE] phase=create partner=1", partnerSide);
+    // Ask for one sweep of the settled state. Only the first creation arms it,
+    // so the measurement lands after the whole model is assembled.
+    EiemArmSkinProbeSweep();
   }
 
   size_t expectedBoneCount = 0;
@@ -6199,6 +6205,22 @@ static void EiemReapplyShapeControls(const std::vector<std::string> &affected) {
 
 static constexpr UINT_PTR kEiemShapeTransitionTimer = 0xE153;
 static ULONGLONG s_eiemShapeTransitionTick = 0;
+// Partner skinning is measured once at creation, but the reported failure --
+// a mesh lying on the ground -- is a later state: the source Animator assigns
+// bone arrays after the Mod builds the Renderer, and that is what can displace
+// the mesh. Arm a one-shot sweep so the same Renderers are measured again once
+// the character has settled, and trigger the frame timer for it.
+static ULONGLONG s_eiemSkinProbeArmTick = 0;
+static bool s_eiemSkinProbeSweepDone = false;
+static constexpr ULONGLONG kEiemSkinProbeSettleMs = 1500;
+static volatile LONG s_traceSkinProbeSweepCount = 0;
+
+static void EiemArmSkinProbeSweep() {
+  if (s_eiemSkinProbeArmTick) return;
+  s_eiemSkinProbeArmTick = GetTickCount64();
+  if (g_gameHwnd && IsWindow(g_gameHwnd))
+    SetTimer(g_gameHwnd, kEiemShapeTransitionTimer, 16, nullptr);
+}
 
 static bool EiemAnyShapeTransitions() {
   bool active = false;
@@ -6216,7 +6238,8 @@ static bool EiemAnyShapeTransitions() {
 
 static void EiemRefreshShapeTransitionTimer() {
   if (!g_gameHwnd || !IsWindow(g_gameHwnd)) return;
-  if (EiemAnyShapeTransitions()) {
+  // The probe sweep needs the same frame pacing as an animating shape.
+  if (EiemAnyShapeTransitions() || !s_eiemSkinProbeSweepDone) {
     if (!s_eiemShapeTransitionTick) s_eiemShapeTransitionTick = GetTickCount64();
     SetTimer(g_gameHwnd, kEiemShapeTransitionTimer, 16, nullptr);
   } else {
@@ -6225,7 +6248,29 @@ static void EiemRefreshShapeTransitionTimer() {
   }
 }
 
+// Measure every Partner again, after the game's own skin/Animator passes have
+// run. This is the state the player actually sees, and the only point where a
+// mesh that lies on the ground can be compared against one that does not.
+static void EiemRunSkinProbeSweep() {
+  if (s_eiemSkinProbeSweepDone || !s_eiemSkinProbeArmTick) return;
+  if (GetTickCount64() - s_eiemSkinProbeArmTick < kEiemSkinProbeSettleMs) return;
+  s_eiemSkinProbeSweepDone = true;
+  std::vector<void *> partners;
+  AcquireSRWLockShared(&s_eiemPartnerLock);
+  partners.reserve(s_eiemPartners.size());
+  for (const auto &state : s_eiemPartners)
+    if (state.partnerRenderer) partners.push_back(state.partnerRenderer);
+  ReleaseSRWLockShared(&s_eiemPartnerLock);
+  Log("[SKIN-PROBE] phase=settled sweep partners=%zu", partners.size());
+  for (void *partner : partners) {
+    if (!partner || InterlockedIncrement(&s_traceSkinProbeSweepCount) > 400) break;
+    const EiemSkinProbe::Result measurement = EiemSkinProbe::Measure(partner);
+    EiemSkinProbe::LogResult("[SKIN-PROBE] phase=settled partner=1", measurement);
+  }
+}
+
 static void EiemRunShapeTransitions() {
+  EiemRunSkinProbeSweep();
   const ULONGLONG now = GetTickCount64();
   const float elapsed = s_eiemShapeTransitionTick
       ? (float)(now - s_eiemShapeTransitionTick) / 1000.0f : 0.0f;
