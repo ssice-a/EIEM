@@ -52,7 +52,8 @@ static bool simulateMatch = true;
 static bool EiemApplyStandaloneRenderRules(
     void *, const char *, bool *matched=nullptr,
     const std::vector<std::string> * = nullptr,
-    std::vector<EiemPhysicsIntent> * = nullptr) {
+    std::vector<EiemPhysicsIntent> * = nullptr,
+    bool = true) {
   if (matched) *matched = simulateMatch;
   return false; // selector matches, but the conditional body is OFF
 }
@@ -73,6 +74,18 @@ static const char *EiemModelOwnerKindName(EiemModelOwnerKind kind) {
   return "Unknown";
 }
 static void EiemReleaseModelPhysics(void *, const char *) {}
+static bool EiemModelHasActiveOwner(const EiemModelInstanceState &state) {
+  for (uint32_t index = 0; index < state.ownerCount; ++index)
+    if (state.owners[index].active) return true;
+  return false;
+}
+static void EiemRegistrationTraceModel(
+    const char *, void *, void *, const char *, LONG, size_t, bool, bool,
+    int, int, const char *) {}
+static void EiemRegistrationTraceRelease(
+    const char *, void *, void *, const char *, LONG) {}
+static void EiemRegistrationTraceReconcile(
+    const char *, uint32_t, LONG, size_t, size_t, uint32_t, ULONGLONG) {}
 '''
 
 MAIN = r'''
@@ -149,6 +162,29 @@ int main(int argc, char **argv) {
     CHECK(partnerLinksOnly);
     CHECK(next.rules.size() == program.rules.size());
     CHECK(next.rules[0].partnerCount == 1);
+  } else if (scenario == "submesh_visibility_only") {
+    EiemModProgram program;
+    std::istringstream input(
+      "[Constants]\n$show=0\n"
+      "[KeyA]\nkey=F6\ntype=cycle\n$show=0,1\n"
+      "[RenderMain]\nasset=Body\nmesh=MeshBody\n"
+      "if $show == 0\nsubmesh_visible.2=true\n"
+      "else\nsubmesh_visible.2=false\nendif\n"
+      "[MeshBody]\npath=meshes/body.mesh\n");
+    CHECK(EiemModParseStream(input, "a/mod.ini", program, &error));
+    EiemPublishModState(program); s_eiemModGeneration = 10;
+    CHECK(program.rules.size() == 1 && program.rules[0].hiddenSubmeshMask == 0);
+    EiemModProgram next; std::vector<std::string> affected;
+    bool shapesOnly = false, partnerLinksOnly = false;
+    bool submeshVisibilityOnly = false;
+    CHECK(EiemPrepareInputUpdate({{{VK_F6,0},10}}, &next, &affected,
+                                 &shapesOnly, &partnerLinksOnly,
+                                 &submeshVisibilityOnly));
+    CHECK(!shapesOnly);
+    CHECK(!partnerLinksOnly);
+    CHECK(submeshVisibilityOnly);
+    CHECK(next.rules.size() == 1 && next.rules[0].hiddenSubmeshMask == (1u << 2));
+    CHECK(affected.size() == 1 && affected[0] == "a/mod.ini");
   } else if (scenario == "default_off_instances") {
     EiemModProgram program;
     std::istringstream input("[RenderMain]\nasset=Body\n");
@@ -188,8 +224,9 @@ class ModControlsTests(unittest.TestCase):
         source.write_text(PREFIX + implementation + MAIN, encoding="utf-8")
         cls.exe = cls.folder / "controls.exe"
         result = subprocess.run(["cl", "/nologo", "/EHsc", "/std:c++17", "/utf-8",
-                                 f"/I{ROOT / 'src'}", str(source), f"/Fe{cls.exe}"],
+                                f"/I{ROOT / 'src'}", str(source), f"/Fe{cls.exe}"],
                                 cwd=cls.folder, capture_output=True, text=True,
+                                encoding="utf-8",
                                 errors="replace")
         if result.returncode: raise AssertionError(result.stdout + result.stderr)
 
@@ -202,6 +239,7 @@ class ModControlsTests(unittest.TestCase):
     def test_only_owned_slots_restore_and_only_owned_tail_removed(self): self.run_case("slots")
     def test_press_order_stale_generation_and_publish_after_restore(self): self.run_case("events")
     def test_partner_visibility_is_a_lightweight_link_update(self): self.run_case("partner_links_only")
+    def test_submesh_visibility_is_a_lightweight_mesh_update(self): self.run_case("submesh_visibility_only")
     def test_actual_runtime_registers_default_off_multi_instances(self): self.run_case("default_off_instances")
     def test_empty_program_still_registers_instances_without_diagnostic_probe(self): self.run_case("empty_rules_observed")
 

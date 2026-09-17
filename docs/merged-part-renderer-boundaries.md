@@ -33,7 +33,7 @@ Typhoea 的 body_01 / cloth_01 / cloth_02 虽然共用同一套
 结论，**已经失效**。第 9 个部件 `MeshS_actor_typhoea_cloth_01_lod0_2_5` 是唯一
 带 18 根 `maid_skirt_*` 的 mesh，而活体骨架里裙摆叫 `skirt_base_*`；一个解析不到
 的骨骼路径会让整个 mesh 赋值失败，进而使规则里所有材质与子网格映射失效。详见
-[合并实验记录](merged-form-experiments.md)。
+[合并实验记录](archive/merged-form-experiments.md)。
 
 ## 跨源 asset 合并会撞上的两个问题
 

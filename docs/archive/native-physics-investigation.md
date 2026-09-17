@@ -1,4 +1,4 @@
-﻿# 鍘熺敓鐗╃悊鎺ュ叆璋冩煡
+# 鍘熺敓鐗╃悊鎺ュ叆璋冩煡
 
 鐘舵€侊細**authoritative**锛堝師鐢熸帴鍏ヨ瘉鎹€佽瘉鎹檺鍒朵笌褰撳墠楠岃瘉鐘舵€侊級銆備腑闂磋鍒掍笉鑳戒綔涓哄凡楠岃瘉浜嬪疄锛?
 鏈夊啿绐佹椂浠ユ渶鏂板疄娴嬬粨鏋滃強鍏堕€傜敤鑼冨洿涓哄噯銆傚綋鍓嶅伐浣滃尯楠岃瘉璁板綍瑙佺 20.25 鑺傘€?
@@ -201,7 +201,7 @@ F10/鎹㈠浘鏃堕』鏈嶄粠鍘熺敓瀹屾垚/鍙栨秷濂戠害锛屼笉鑳
 
 ### 8.1 鍙栬瘉鏂规硶涓庣粨鏋?
 
-鏂板绂荤嚎鍏ュ彛 [PrefabComponentProbe](../tools/EndfieldVfsProbe/PrefabComponentProbe.cs)锛?
+鏂板绂荤嚎鍏ュ彛 [PrefabComponentProbe](../../tools/EndfieldVfsProbe/PrefabComponentProbe.cs)锛?
 閫氳繃鐜版湁 VFS 绱㈠紩瀹氫綅閫昏緫 Prefab锛屽苟鍔犺浇婧?Bundle 鐨勪緷璧栭棴鍖呫€傚畠鍙鍙栬祫婧愶紝涓嶅姞杞芥垨鎵ц娓告垙 DLL銆?
 鎸?`MonoScript` 璇嗗埆瀹為檯缁勪欢绫伙紝鎸夎祫浜ц嚜甯?TypeTree 璇诲彇瀛楁锛?*娌℃湁灏?IL2CPP 鍐呭瓨鍋忕Щ褰撲綔搴忓垪鍖栧亸绉?*銆?
 寮曠敤韬唤浣跨敤 CAB + PathID锛屽彟淇濆瓨瀹屾暣 Transform 璺緞鍜?local TRS锛涗笉鑳藉崟鐢?PathID 璺?CAB 鍚堝苟銆?
@@ -371,7 +371,7 @@ Blender 鍙垱寤轰竴浠藉叡浜鎾炶緟鍔╀綋锛岀敱澶氫釜
 
 ## 10. DLL 渚ф寜闇€鍘熺敓鐗╃悊璇婃柇锛坴52 鍙婁互鍓嶇殑鍘嗗彶瀹炵幇锛?
 
-鏂板 [eiem_native_physics_probe.h](../src/eiem_native_physics_probe.h)锛岄€氳繃 Dump 椤电殑
+鏂板 [eiem_native_physics_probe.h](../../src/eiem_native_physics_probe.h)锛岄€氳繃 Dump 椤电殑
 **鍘熺敓鐗╃悊璇婃柇** 鎸夐挳鍙戦€佺嫭绔?WM_APP 璇锋眰锛屽湪鏃㈡湁 Unity 绾跨▼閫氶亾鎵ц銆?
 杈撳嚭鍒伴厤缃殑 dump 鐩綍锛屾枃浠跺悕 `physics_runtime_<pid>_<tick>.json`锛屼娇鐢?CREATE_NEW 淇濈暀鍓嶆璇佹嵁銆?
 杩欎笉鏄?Physics 璧勬簮鍖咃紝涓嶆敼鍙?INI銆佹簮閰嶇疆銆丮esh銆侀鏋舵垨鍘熺敓姹傝В鍣ㄣ€?
@@ -443,11 +443,11 @@ GC 寮曠敤閲婃斁鍜岀被鍨嬪悕鍐呭瓨閲婃斁銆備笌 Unity lifetim
 
 ### 11.3 宸插啓鍏ョ殑浠ｇ爜鍙婅竟鐣?
 
-[鍏冩暟鎹?API](../src/eiem_native_physics_api.h) 缁熶竴璇婃柇涓庨€傞厤鍣ㄧ殑绮剧‘鏌ユ壘锛?
+[鍏冩暟鎹?API](../../src/eiem_native_physics_api.h) 缁熶竴璇婃柇涓庨€傞厤鍣ㄧ殑绮剧‘鏌ユ壘锛?
 绋嬪簭闆嗐€佺被銆佸瓧娈电被鍨嬶紝浠ュ強鏂规硶杩斿洖绫诲瀷銆佸弬鏁扮被鍨嬨€侀潤鎬佹€ч兘蹇呴』鐩哥銆?
 鍙屽弬鏁?Import 涓庡崟鍙傛暟閲嶈浇鍒嗗紑鍖归厤锛涗笉鎸夊弬鏁版暟閲忔垨鍥哄畾鍦板潃鍙栫涓€涓€欓€夈€?
 
-[鍙傛暟閫傞厤鍣╙(../src/eiem_native_physics_parameters.h) 鐩墠鍙帴鍙?5 涓凡鍛藉悕鐨勬爣閲忓瓧娈碉細
+[鍙傛暟閫傞厤鍣╙(../../src/eiem_native_physics_parameters.h) 鐩墠鍙帴鍙?5 涓凡鍛藉悕鐨勬爣閲忓瓧娈碉細
 `gravity`銆乣stablizationTimeAfterReset`锛堟湁闄愰潪璐熷€硷級锛?
 `gravityFalloff`銆乣blendWeight`銆乣animationPoseRatio`锛堟湁闄愮殑 0锝? 鍊硷級銆?
 杩欐槸鏈鍙楁敮鎸佺紪杈戣寖鍥达紝涓嶆槸瀹屾暣 Physics schema锛涙嫆缁濆叾浠栧瓧娈点€侀噸澶嶅瓧娈点€佺┖缂栬緫鍜屾棤鏁堟暟鍊硷紝涓嶆埅鏂簮鍙傛暟銆?
@@ -577,7 +577,7 @@ GameAssembly 鐨?CreateClothBindings/Injected 鍖呰鍙В鏋?icall 骞惰�
 
 ### 12.4 鏈疆宸插疄鐜扮殑 DLL 璇婃柇
 
-[鍘熺敓鐗╃悊璇婃柇](../src/eiem_native_physics_probe.h) 鍦ㄥ師鎸夐挳涓婂鍔狅細
+[鍘熺敓鐗╃悊璇婃柇](../../src/eiem_native_physics_probe.h) 鍦ㄥ師鎸夐挳涓婂鍔狅細
 
 - 鍘熺敓绫诲瀷濂戠害鐢?10 涓鑷?14 涓紝骞跺彟澶栬緭鍑?Animator 鍜?AnimationTransformRWBufferHandle 鐨勫瓧娈?鏂规硶濂戠害銆?
 - 姣忎釜 process 鐨?`interlockingAnimatorId`銆?
@@ -617,7 +617,7 @@ python -m unittest test_native_physics_bone_probe test_native_physics_probe test
 ## 13. 2026-09-07锛歅hysics 浣滆€呰祫婧愮嫭绔嬩氦浠?
 
 Blender 0.11 宸插疄鐜版柊澧炵墿鐞嗙粍銆佸叡浜悆/绛夊崐寰勮兌鍥娿€佷簲涓爣閲忓弬鏁板強鐙珛 `.physics`/`.skeleton`
-璇诲啓锛岃鎯呰 [Physics 浣滆€呰祫婧?v1](physics-authoring-v1.md)銆傛柊澧?Python 缂栬В鐮併€丆++ reader/validator
+璇诲啓锛岃鎯呰 [Physics 浣滆€呰祫婧?v1](../physics-authoring-v1.md)銆傛柊澧?Python 缂栬В鐮併€丆++ reader/validator
 鍙婄湡瀹?Blender 缂栬緫/淇濆瓨/寰€杩旀祴璇曪紝杩炲悓鏃㈡湁 Blender 鍥炲綊鍏?14 椤归€氳繃锛屾棤璺宠繃銆?
 
 杩欐槸浣滆€呯涓庤祫婧愭牸寮忕殑浜や粯锛屼笉鍖呭惈 `Render.physics` 鎺ョ嚎锛屼篃涓嶆柊澧炲師鐢熸瀯寤?鍐欏叆璋冪敤銆?
@@ -639,7 +639,7 @@ Blender 0.11 宸插疄鐜版柊澧炵墿鐞嗙粍銆佸叡浜悆/绛夊崐寰
 
 ### 14.1 鏈疆瀹炵幇鍙婇檺鍒?
 
-[璋冪敤璺熻釜](../src/eiem_native_physics_trace.h) 鍦?Dump 椤垫彁渚涒€滃紑濮嬪師鐢熺墿鐞嗚窡韪€濆拰鈥滃仠姝㈠苟瀵煎嚭璺熻釜鈥濄€?
+[璋冪敤璺熻釜](../../src/eiem_native_physics_trace.h) 鍦?Dump 椤垫彁渚涒€滃紑濮嬪師鐢熺墿鐞嗚窡韪€濆拰鈥滃仠姝㈠苟瀵煎嚭璺熻釜鈥濄€?
 浠呮墜鍔ㄥ紑濮嬫椂瀹夎 Hook锛屾寜杩愯鏃?assembly/type銆佸畬鏁村弬鏁般€佽繑鍥炵被鍨嬪拰瀹炰緥鏂规硶灞炴€цВ鏋愪笅鍒楀叆鍙ｏ細
 
 - `BeyondBoneCloth.BuildAndRun`
@@ -653,7 +653,7 @@ Hook 閮ㄥ垎瀹夎澶辫触鏃朵笉鍚姩璁板綍锛屼繚鐣欏凡鍒
 杩欓伩鍏嶅湪鍙兘浠嶆湁璋冪敤缁忚繃鏃跺洖鏀惰浆鍙戜唬鐮侊紝浣嗕笉鎰忓懗鐫€鎻掍欢鏀寔杩愯涓嵏杞?DLL銆?
 
 鍖呰鍣ㄥ師鏍疯浆鍙戝弬鏁般€佽繑鍥炲€煎拰寮傚父锛屽彧璁板綍鏍囬噺锛屼笉瑙ｅ紩鐢ㄥ璞°€佷笉璋冪敤 Unity API銆佷笉鍒嗛厤鍫嗗唴瀛樸€佷笉鍐欐枃浠躲€?
-[璁板綍鍣╙(../src/eiem_native_physics_events.h) 浣跨敤鏈夌晫缂撳啿淇濆瓨杩涘叆銆佹甯歌繑鍥炴垨寮傚父閫€鍑恒€佽皟鐢ㄩ厤瀵圭紪鍙枫€?
+[璁板綍鍣╙(../../src/eiem_native_physics_events.h) 浣跨敤鏈夌晫缂撳啿淇濆瓨杩涘叆銆佹甯歌繑鍥炴垨寮傚父閫€鍑恒€佽皟鐢ㄩ厤瀵圭紪鍙枫€?
 绾跨▼ ID銆乼ick 鍜屽璞″湴鍧€銆傚湴鍧€鍙澶嶇敤锛屼笉鏄ǔ瀹氬疄渚嬭韩浠斤紱`BuildAndRun=true` 浠嶅彧琛ㄧず鎺ュ彈寮€濮嬫瀯寤恒€?
 
 鍋滄鍚庣户缁褰曞凡杩涘叆璋冪敤鐨勮繑鍥烇紝涓嶇瓑寰呭師鐢熷伐浣滃畬鎴愩€傚皻鏈夎皟鐢ㄦ湭杩斿洖鎴栨柊浜嬩欢鏈垚鍔熷鍑烘椂锛?
@@ -709,7 +709,7 @@ MSVC 瀹夸富娴嬭瘯鍏?**56 椤归€氳繃锛屾棤璺宠繃**锛氬師鏈�
 - 澶嶆牳 `eiem_physics_asset.h` 鐨勬枃浠跺揩鐓с€佽矾寰勮В鏋愩€丼keleton 瑙ｇ爜鍙婇楠煎紩鐢ㄦ牎楠岋紝
   浠ュ強 `eiem_mod_document.h` / `eiem_mods.h` 鐨勯厤缃噯澶囧拰鍙戝竷鍒嗘敮銆?
 - 灏嗘祦瑙ｆ瀽涓庢枃浠惰В鏋愮殑 Mod 鍚堝苟缁熶竴鍒?`EiemAppendModDocument`锛屽叡鐢ㄧ姸鎬佺储寮曡皟鏁撮€昏緫銆?
-- 鏂板 [Physics 璧勬簮娴嬭瘯](../tests/test_physics_resources.py)锛岀紪璇戝苟鎵ц瀹為檯 C++ 璇诲彇鍣ㄥ拰 Mod 鍔犺浇鍣ㄣ€?
+- 鏂板 [Physics 璧勬簮娴嬭瘯](../../tests/test_physics_resources.py)锛岀紪璇戝苟鎵ц瀹為檯 C++ 璇诲彇鍣ㄥ拰 Mod 鍔犺浇鍣ㄣ€?
   鏂囦欢鍏ㄩ儴鍦ㄦ祴璇曚复鏃剁洰褰曠敓鎴愶紝涓嶅垱寤?Unity 瀵硅薄锛屼篃涓嶈繍琛屽師鐢熺墿鐞嗐€?
 - 12 椤规柊澧炴祴璇曡鐩栵細Python 浣滆€呮枃浠跺埌 C++ 鐨勮鍙栥€丼keleton v1/v2銆佷竷浣嶉暱搴﹀瓧绗︿覆銆乁TF-8 璺緞銆?
   涓嶅彲鍙樺揩鐓с€佺己澶遍楠笺€佹崯鍧?瓒呴檺璧勬簮銆佽矾寰勭┛瓒婁笌鐩綍 junction銆佽祫婧愬埆鍚嶃€佹湭婵€娲诲垎鏀€?
@@ -759,7 +759,7 @@ completion fence 鎴栧搴旂殑鐪熷疄杩愯鏃惰瘉鎹紱褰撳墠
 鎸夌敤鎴锋渶鏂板喅瀹氾紝鍚庣画浠?DLL 鍘熺敓鏈哄埗鍜屾渶灏忛摼瀹炶瘉涓轰紭鍏堛€傛鍓嶈幏鎺堟潈鍐欏叆鐨?Blender v2 宸ヤ綔淇濈暀涓虹绾夸綔鑰呭疄鐜帮細
 
 - 鏂板婧愬浘銆佸畬鏁村瓧娈?鏇茬嚎/棰勬瀯寤哄瓧鑺備繚鐣欍€佸叡浜鎾炲紩鐢ㄣ€佸彲閫夋簮瀵煎叆銆佺嫭绔嬩綔鑰呭鍑哄拰 C++ v2 鏍戣鍙栥€?
-  瀹屾暣鑼冨洿鍜岄檺鍒惰[婧愭暟鎹綔鑰?v2](physics-authoring-v2.md)銆傜绾挎牱鏈線杩斾笉绛変簬鍘熺敓閰嶇疆瀹炰緥鍖栨垚鍔熴€?
+  瀹屾暣鑼冨洿鍜岄檺鍒惰[婧愭暟鎹綔鑰?v2](../physics-authoring-v2.md)銆傜绾挎牱鏈線杩斾笉绛変簬鍘熺敓閰嶇疆瀹炰緥鍖栨垚鍔熴€?
 - 鍒犻櫎鏈粡楠岃瘉鐨勮兌鍥婄鐐?闀垮害/鏂瑰悜鎺ㄥ锛涘師鐢熺鎾炰綋鏆傚彧鏄剧ず婧愪腑蹇冩爣璁帮紝鍙傛暟浠嶅彲淇濈暀/缂栬緫銆?
 - 鎾ゅ洖缁勫悎 Mesh+Physics Mod 瀵煎嚭 UI 鍜屽姩浣滅敓鎴愩€傞潪绌虹粍鍚堝弬鏁板湪鍐欏叆鍓嶆姤閿欙紱鐙珛 `.physics` 瀵煎嚭鍜?Mesh-only 淇濈暀銆?
   鍥炲綊娴嬭瘯纭鎷掔粷鏃朵笉瑕嗙洊鍘?`mod.ini`銆傛湭鍒犻櫎鐢熶骇鍔犺浇鍣ㄧ殑鎷掔粷鍒嗘敮銆?
@@ -768,7 +768,7 @@ completion fence 鎴栧搴旂殑鐪熷疄杩愯鏃惰瘉鎹紱褰撳墠
 
 ### 17.2 DLL 鏂板鐨勬寜闇€瑙傛祴
 
-[濂戠害璇婃柇](../src/eiem_native_physics_contract_probe.h) 鎺ュ叆鏃㈡湁鈥滃師鐢熺墿鐞嗚瘖鏂€濇寜閽細
+[濂戠害璇婃柇](../../src/eiem_native_physics_contract_probe.h) 鎺ュ叆鏃㈡湁鈥滃師鐢熺墿鐞嗚瘖鏂€濇寜閽細
 
 1. `engineEntryPoints`锛氭鏌?Animator 鍏冩暟鎹‘鏈夊搴?InternalCall 鍚庯紝閫氳繃杩愯鏃?
    `il2cpp_resolve_icall` 瑙ｆ瀽 Create/CreateByName/Enable/Disable/DestroyClothBindings 鐨勫疄闄呭湴鍧€锛?
@@ -845,7 +845,7 @@ python -m unittest test_physics_native_document test_physics_document test_physi
 
 ### 18.2 瀹炵幇鑼冨洿
 
-[鐙珛閰嶇疆鑽夌](../src/eiem_native_physics_config.h) 宸茬撼鍏?DLL 缂栬瘧锛?
+[鐙珛閰嶇疆鑽夌](../../src/eiem_native_physics_config.h) 宸茬撼鍏?DLL 缂栬瘧锛?
 
 - 鎸夌▼搴忛泦銆佺被銆佸畬鏁存柟娉曠鍚嶄笌瀛楁绫诲瀷瑙ｆ瀽鍘熺敓 ClothSerializeData / ClothSerializeData2 鏋勯€犲櫒銆?
   `List<Transform>` 鏋勯€?娣诲姞/璇诲彇鏂规硶銆佷簲涓?Single 瀛楁鍜?Transform 鐖剁骇 getter銆?
@@ -1321,7 +1321,7 @@ v61 浠嶆槸鑷姩鍚姩鐨勮瀵熷瀷娴嬭瘯鏋勫缓銆傜敓浜?
   `Start` 鎵ц Init/AutoBuild锛屽洜姝ゅ姩鎬?AddComponent 鍙互鍦ㄥ悓涓€ Unity 绾跨▼璋冪敤涓厛绂佺敤鑷姩鏋勫缓銆?
   缁戝畾閰嶇疆锛屽啀涓诲姩 `BuildAndRun`銆傝繖浠嶆槸闈欐€佹帹鏂紝闇€瑕佹湰杞帰閽堝疄鏈洪獙璇佽皟鐢ㄩ『搴忎笌缁撴灉銆?
 
-[閰嶇疆鍑嗗](../src/eiem_native_physics_config.h) 宸插鍔犲苟鍥炶 `clothType=1`銆?
+[閰嶇疆鍑嗗](../../src/eiem_native_physics_config.h) 宸插鍔犲苟鍥炶 `clothType=1`銆?
 `connectionMode=0`銆乣rootBones` 鍜?`ignoreFromRootBones`銆侻SVC 瀹夸富娴嬭瘯 11 椤归€氳繃锛岃鐩栧垪琛ㄦ垚鍛樸€佹灇涓俱€?
 澶辫触浜嬪姟銆佽妭鐐瑰瓨娲讳笌鐖跺瓙鍏崇郴銆?
 

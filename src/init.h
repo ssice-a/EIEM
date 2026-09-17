@@ -578,7 +578,7 @@ static DWORD WINAPI InitThread(LPVOID) {
       (unsigned long)GetCurrentProcessId(), (unsigned long)GetCurrentThreadId(),
       (unsigned long long)GetTickCount64(),
       InterlockedCompareExchange(&s_eiemModGeneration, 0, 0));
-  Log("[BUILD] resource-runtime-v125-upstream-mutation-test dll=%s %s", __DATE__,
+  Log("[BUILD] static-resource-baseline-20260917 dll=%s %s", __DATE__,
       __TIME__);
 
   if (!Resolve()) {
@@ -620,12 +620,16 @@ static DWORD WINAPI InitThread(LPVOID) {
   // observed completion cannot commit an unmodified object due to startup
   // ordering. Later reload requests are dispatched on Unity's thread.
   LoadEiemConfig();
-  InitEiemCameraFade(asms, ac);
+  if (!kEiemStaticReplacementBaseline)
+    InitEiemCameraFade(asms, ac);
+  else
+    Log("[VALIDATION] CameraFade hook disabled");
   EiemReloadMods();
 
   Log("[RES-TRACE] Installing startup resource hooks before metadata dump");
   InitIl2CppResourceTrace(asms, ac);
-  DumpIl2CppMetadata(asms, ac);
+  if (!kEiemStaticReplacementBaseline)
+    DumpIl2CppMetadata(asms, ac);
 
 
   g_transformClass = FindClass("UnityEngine", "Transform", asms, ac);
@@ -720,7 +724,7 @@ static DWORD WINAPI InitThread(LPVOID) {
 
   g_humanPoseHandlerClass =
       FindClass("UnityEngine", "HumanPoseHandler", asms, ac);
-  if (g_humanPoseHandlerClass) {
+  if (!kEiemStaticReplacementBaseline && g_humanPoseHandlerClass) {
     void *iter = nullptr;
     void *method;
     Log("[HPH] Enumerating HumanPoseHandler methods:");
@@ -922,8 +926,10 @@ static DWORD WINAPI InitThread(LPVOID) {
         g_humanPoseHandler_ctor, g_humanPoseHandler_GetHumanPose,
         g_icall_SetHumanPose, g_icall_SetInternalAvatarPose,
         g_icall_SetInternalHumanPose);
-  } else {
+  } else if (!kEiemStaticReplacementBaseline) {
     Log("[WARN] HumanPoseHandler NOT found");
+  } else {
+    Log("[VALIDATION] HumanPoseHandler/Trojan hooks disabled");
   }
 
   g_gameObjectClass = FindClass("UnityEngine", "GameObject", asms, ac);
@@ -1184,7 +1190,7 @@ static DWORD WINAPI InitThread(LPVOID) {
     Log("[WARN] Camera class NOT found");
   }
 
-  if (!g_camSetPos) {
+  if (!kEiemStaticReplacementBaseline && !g_camSetPos) {
     g_camSetPos = (void (*)(void *, float *))il2cpp_resolve_icall(
         "UnityEngine.Transform::set_position_Injected(UnityEngine.Vector3&)");
     g_camSetRot = (void (*)(void *, float *))il2cpp_resolve_icall(
@@ -1250,7 +1256,7 @@ static DWORD WINAPI InitThread(LPVOID) {
 
 
     void *setMainChar = FindMethod(pcClass, "SetMainCharacter", 2);
-    if (setMainChar) {
+    if (!kEiemStaticReplacementBaseline && setMainChar) {
       typedef void (*SetMainCharacter_t)(void *self, void *entity, bool flag);
       static SetMainCharacter_t orig_SetMainCharacter = nullptr;
 
@@ -1406,7 +1412,7 @@ static DWORD WINAPI InitThread(LPVOID) {
     smcClass = FindClass("Beyond.Gameplay.View", "SkeletalMorphCore", asms, ac);
   if (!smcClass)
     smcClass = FindClass("Beyond.Gameplay.Core", "SkeletalMorphCore", asms, ac);
-  if (smcClass) {
+  if (!kEiemStaticReplacementBaseline && smcClass) {
     g_skeletalMorphCoreClass = smcClass;
     Log("[FACE] SkeletalMorphCore class found");
 
@@ -1462,27 +1468,30 @@ static DWORD WINAPI InitThread(LPVOID) {
     }
 
     Log("[FACE] ApplyBoneToTransJob hook DISABLED (unstable ABI)");
-  } else {
+  } else if (!kEiemStaticReplacementBaseline) {
     Log("[FACE] SkeletalMorphCore class not found");
+  } else {
+    Log("[VALIDATION] Player/face/IK hooks disabled");
   }
 
 
   Log("\n=== Phase 2 Init Complete ===");
   Log("Hooks installed. Use the GUI Dump tab for resource capture.");
 
-  DumpCursorMethods();
+  if (!kEiemStaticReplacementBaseline) {
+    DumpCursorMethods();
 
-  g_guiRunning = true;
-  // Set the run flag before creating the worker. Otherwise a fast-scheduled
-  // worker can observe the initial false value and exit before polling keys.
-  g_hotkeyThread = CreateThread(NULL, 0, HotkeyThread, NULL, 0, NULL);
-
-  g_animationThread =
-      CreateThread(NULL, 0, AnimationWorkerThread, NULL, 0, NULL);
-
-  g_guiThread = CreateThread(NULL, 0, GuiThread, NULL, 0, NULL);
-
-  g_updateThread = CreateThread(NULL, 0, UpdateCheckThread, NULL, 0, NULL);
+    g_guiRunning = true;
+    // Set the run flag before creating the worker. Otherwise a fast-scheduled
+    // worker can observe the initial false value and exit before polling keys.
+    g_hotkeyThread = CreateThread(NULL, 0, HotkeyThread, NULL, 0, NULL);
+    g_animationThread =
+        CreateThread(NULL, 0, AnimationWorkerThread, NULL, 0, NULL);
+    g_guiThread = CreateThread(NULL, 0, GuiThread, NULL, 0, NULL);
+    g_updateThread = CreateThread(NULL, 0, UpdateCheckThread, NULL, 0, NULL);
+  } else {
+    Log("[VALIDATION] Hotkey/animation/GUI/update workers disabled");
+  }
 
   return 0;
 }

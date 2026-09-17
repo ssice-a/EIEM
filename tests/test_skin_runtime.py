@@ -65,6 +65,13 @@ int main() {
  Node scene{"Scene"},actor{"ActorA",&scene},root{"Root",&actor},chest{"Chest",&root},pelvis{"Pelvis",&root},foot{"Foot",&pelvis};
  scene.children={&actor}; actor.children={&root}; root.children={&chest,&pelvis}; pelvis.children={&foot};
  Array source; source.count=1; source.items[0]=&chest; Renderer renderer{&source};
+ EiemSkinIdentity renamed; renamed.paths={"Root/RenamedChest"}; renamed.hashes={1};
+ void *renamedOut=nullptr; char renamedError[256]{};
+ // NPC/UI may rename an existing Transform while keeping the Mesh palette
+ // slot and bind pose unchanged. The resolver must preserve the game's
+ // already-assembled source array instead of matching by name.
+ assert(EiemResolveMeshBones(renamed,&renderer,&renamedOut,renamedError,sizeof(renamedError)));
+ assert(renamedOut==&source);
  EiemSkinIdentity identity; identity.paths={"Root/Chest","Root/Pelvis/Foot"}; identity.hashes={1,2};
  void *out=nullptr; char error[256]{};
  assert(EiemResolveMeshBones(identity,&renderer,&out,error,sizeof(error)));
@@ -79,6 +86,23 @@ int main() {
  Array otherSource; otherSource.count=1; otherSource.items[0]=&otherChest; Renderer other{&otherSource};
  assert(EiemResolveMeshBones(identity,&other,&out,error,sizeof(error)) && ((Array *)out)->items[1]==&otherFoot);
  assert(((Array *)out)->items[1]!=expanded->items[1]); // never borrow actor A's transforms
+ Node extra{"Extra",&otherPelvis}; otherPelvis.children={&otherFoot,&extra};
+ Array addedSource; addedSource.count=2; addedSource.items[0]=&otherChest; addedSource.items[1]=&otherFoot;
+ Renderer addedRenderer{&addedSource};
+ EiemSkinIdentity renamedWithAddition;
+ renamedWithAddition.paths={"Root/RenamedChest","Root/Pelvis/Foot","Root/Pelvis/Extra"};
+ renamedWithAddition.hashes={1,2,3};
+ void *addedOut=nullptr;
+ assert(EiemResolveMeshBones(renamedWithAddition,&addedRenderer,&addedOut,error,sizeof(error)));
+ auto added=(Array *)addedOut;
+ assert(added->count==3 && added->items[0]==&otherChest &&
+        added->items[1]==&otherFoot && added->items[2]==&extra);
+ EiemSkinIdentity removesSourceSlot;
+ removesSourceSlot.paths={"Root/Chest"};
+ removesSourceSlot.hashes={1};
+ void *removedOut=(void *)1;
+ assert(!EiemResolveMeshBones(removesSourceSlot,&addedRenderer,&removedOut,
+                              error,sizeof(error)) && !removedOut);
  identity.paths[1]="Root/Missing"; out=(void *)1;
  assert(!EiemResolveMeshBones(identity,&renderer,&out,error,sizeof(error)) && !out && renderer.bones==expanded);
  foot.alive=false;

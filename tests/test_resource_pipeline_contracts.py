@@ -72,6 +72,19 @@ class RuntimeHookContracts(unittest.TestCase):
         self.assertIn('"force-off"', self.trace)
         self.assertIn('"disabled-unowned"', self.trace)
 
+    def test_failed_mesh_does_not_commit_dependent_material_state(self):
+        start = self.trace.index("static bool EiemApplyResolvedRenderRule")
+        end = self.trace.index("static void *EiemFindMeshFilterDrawRenderer", start)
+        body = self.trace[start:end]
+        self.assertIn("const bool resourceCommitted = !applyMesh || meshApplied", body)
+        self.assertIn("resource dependent edits skipped after mesh failure", body)
+        self.assertIn("if (resourceCommitted)\n    EiemRememberRuleBinding", body)
+        self.assertLess(
+            body.index("if (resourceCommitted)\n    EiemRememberRuleBinding"),
+            body.index("if ((rule.materialCount || rule.submeshCount) && resourceCommitted"),
+        )
+        self.assertIn("if (resourceCommitted) {", body)
+
     def test_prefab_lifecycle_releases_instance_state(self):
         for method in ("Unload", "Clear", "Dispose"):
             self.assertIn("TracePrefabInstantiate" + method, self.trace)
@@ -305,17 +318,23 @@ class RuntimeHookContracts(unittest.TestCase):
         for name in ("TraceCreateSmsGo", "TraceCreateSmsPost"):
             start = self.trace.index(f"static void {name}")
             body = self.trace[start : start + 2400]
+            self.assertNotIn("EiemApplyStandaloneRenderRulesToSkinArray", body)
+            self.assertIn("AssignSkin", body)
+
+        for name in ("TraceAssignSkinGo", "TraceAssignSkinPost"):
+            start = self.trace.index(f"static void {name}")
+            body = self.trace[start : start + 2200]
             self.assertLess(
+                body.index("original(lod, renderers"),
                 body.index("EiemApplyStandaloneRenderRulesToSkinArray"),
-                body.index("EiemRegisterPartnersInSkinArrays"),
             )
 
     def test_per_renderer_mesh_setters_defer_partner_creation(self):
         for name in ("TraceSkinnedMeshSetSharedMesh", "TraceMeshFilterSetSharedMesh"):
             start = self.trace.rindex(f"static void {name}")
             body = self.trace[start : start + 1800]
-            self.assertIn("EiemApplyStandaloneRenderRulesToRenderer", body)
-            self.assertRegex(body, r"set_sharedMesh\"\s*,\s*false\)")
+            self.assertNotIn("EiemApplyStandaloneRenderRulesToRenderer", body)
+            self.assertIn("completed assembly boundaries", body)
 
     def test_value_type_asset_handle_is_unboxed_before_instance_methods(self):
         self.assertIn("il2cpp_object_unbox", self.api)
@@ -359,7 +378,7 @@ class RuntimeHookContracts(unittest.TestCase):
     def test_mesh_setter_matches_even_when_resource_origin_was_not_observed(self):
         start = self.trace.rindex("static void TraceSkinnedMeshSetSharedMesh")
         body = self.trace[start : start + 1800]
-        self.assertIn("EiemApplyStandaloneRenderRulesToRenderer", body)
+        self.assertNotIn("EiemApplyStandaloneRenderRulesToRenderer", body)
         self.assertNotIn("TraceTryGlobalResourceRedirect", body)
 
     def test_material_clones_its_declared_source_asset(self):
@@ -394,13 +413,18 @@ class RuntimeHookContracts(unittest.TestCase):
         self.assertNotIn("EiemApplyPrefabRules", self.trace)
 
     def test_reload_is_dispatched_only_on_unity_thread(self):
-        body = self.trace[self.trace.index("static void EiemRunModReconcile()") :][:5200]
+        start = self.trace.index("static void EiemRunModReconcile()")
+        end = self.trace.index("static void *s_origAssetBundleLoadAsset1", start)
+        body = self.trace[start:end]
         self.assertIn("EiemDispatchModUpdate(requests", body)
         self.assertIn("Physics remains owned by model generation", body)
         self.assertIn("EiemPhysicsRuntimeRetireChangedAssets", body)
         self.assertNotIn("mod reload before renderer restore", body)
         self.assertIn("EiemRestoreRenderOverrides(affected)", body)
         self.assertIn("EiemReloadMods()", body)
+        visibility = body.index("if (submeshVisibilityOnly")
+        boundary = body.index('EiemPhysicsRuntimeBoundary("mod reconcile begin")')
+        self.assertLess(visibility, boundary)
         entry = (ROOT / "src" / "eiem.cpp").read_text(encoding="utf-8")
         self.assertNotIn("EiemReloadMods();", entry)
 

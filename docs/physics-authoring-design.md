@@ -1,7 +1,7 @@
 # 物理骨骼与碰撞体：三端设计契约
 
 状态：目标设计。当前实现范围以[文档索引](README.md)、[Physics 作者 v1/v3/v4/v5](physics-authoring-v1.md)及[源作者 v2](physics-authoring-v2.md)为准。
-原生研究证据统一放在[原生物理调查](native-physics-investigation.md)。
+原生研究证据统一放在[原生物理调查归档](archive/native-physics-investigation.md)。
 本文描述完整链路要求，不把设计目标、源码草稿或宿主测试当作游戏能力。
 沿用[模型替换职责](model-replacement-design.md)、[共享骨架绑定](shared-skeleton-binding.md)和[作者状态](author-state-materials.md)。
 
@@ -25,7 +25,7 @@
 ## 2. 实现与证据入口
 
 当前实现状态见[文档索引](README.md)。原生方法、序列化样本、索引空间和生命周期证据
-集中在[原生物理调查](native-physics-investigation.md)。新增作者 v1/v3/v4 的实际读写范围见[格式契约](physics-authoring-v1.md)。
+集中在[原生物理调查归档](archive/native-physics-investigation.md)。新增作者 v1/v3/v4 的实际读写范围见[格式契约](physics-authoring-v1.md)。
 
 ## 3. chain2 / RE 编辑器：参考什么，不参考什么
 
@@ -357,7 +357,7 @@ v67 已把上述计划层接到按模型实例持有的原生适配器，实机�
 2026-09-07 本机指令复查：初始化受全局模式影响，可能在 Awake 或 Start 中发生，Start 还会触发 AutoBuild。
 新组件工厂必须解决“配置前禁止自动构建”，不能在 AddComponent 返回后才假定初始化尚未发生。
 BuildAndRun 的通知可同步早于返回；异步取消分支还可能完全不通知，详见
-[初始化与完成证据](native-physics-investigation.md#9-2026-09-07-追加初始化完成和延迟释放)。
+[初始化与完成证据](archive/native-physics-investigation.md#9-2026-09-07-追加初始化完成和延迟释放)。
 
 原组件参数修改必须作用于该实例拥有的数据；若配置被多个实例共享，先建立实例配置副本。
 新建组件只复制已理解的序列化参数，并重绑引用；**不得 memcpy 一个运行中的组件或连带克隆人物整棵 GameObject**。
@@ -404,7 +404,7 @@ LOD、屏外剔除、传送/换图恢复遵循原生重置与时间步策略，�
 先取得真实原生组件的构建、取消与销毁记录，并确认 Task/Job/动画写回的退出边界；
 再用不依赖 Blender 的 DLL 最小新增链实验验证 Animator 接纳、模拟位姿、网格驱动和安全注销。
 v67～v71 已按这一顺序完成 v1 无碰撞体范围，并接通对应 `Render.physics` 与作者端组合导出；原生 v2 与碰撞体
-仍须分别满足同样的证据要求，依据见[原生调查](native-physics-investigation.md)。
+仍须分别满足同样的证据要求，依据见[原生调查归档](archive/native-physics-investigation.md)。
 普通函数返回、跟踪计数归零和日志无丢失，单独或组合都不是任务退出凭证。
 这些前置条件限制依赖原生构建、绑定与对象释放结论的操作；不阻塞离线格式、Blender 编辑工具、
 资源读取、编译、静态分析和宿主测试。缺少证据时记录具体的“尚未验证”项，不将整个项目停工。

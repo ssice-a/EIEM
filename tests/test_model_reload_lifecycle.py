@@ -30,11 +30,6 @@ static void EiemCollectSkeletonInstances() {}
 static void EiemPhysicsRuntimeBoundary(const char *) {}
 static size_t EiemPhysicsRuntimeRetireChangedAssets(const char *) { return 0; }
 static thread_local bool s_eiemPhysicsLifecycleTransaction = false;
-static bool EiemModelHasActiveOwner(const EiemModelInstanceState &state) {
-  for (uint32_t i = 0; i < state.ownerCount; ++i)
-    if (state.owners[i].active) return true;
-  return false;
-}
 static void EiemReconcileModelPhysics(
     void *, const std::vector<EiemPhysicsIntent> &, bool, const char *) {}
 static void EiemRestoreRenderOverrides(const std::vector<std::string> *) { appliedModels.clear(); }
@@ -43,7 +38,8 @@ SINK=r'''
 static std::vector<void *> appliedModels;
 static bool EiemApplyStandaloneRenderRules(void *model,const char *,bool *matched=nullptr,
                                          const std::vector<std::string> * = nullptr,
-                                         std::vector<EiemPhysicsIntent> * = nullptr) {
+                                         std::vector<EiemPhysicsIntent> * = nullptr,
+                                         bool = true) {
   std::vector<EiemModRule> rules; EiemFindStandaloneRenderRules(&rules);
   const bool hit=simulateMatch && !rules.empty();
   if(matched) *matched=hit;
@@ -117,7 +113,7 @@ class ModelReloadLifecycle(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='eiem-model-reload-') as tmp:
             folder=Path(tmp); source=folder/'test.cpp'; exe=folder/'test.exe'
             source.write_text(prefix+EXTRA+code+MAIN,encoding='utf-8')
-            build=subprocess.run(['cl','/nologo','/EHsc','/std:c++17','/utf-8',f'/I{ROOT/"src"}',str(source),f'/Fe{exe}','user32.lib'],cwd=folder,capture_output=True,text=True,errors='replace')
+            build=subprocess.run(['cl','/nologo','/EHsc','/std:c++17','/utf-8',f'/I{ROOT/"src"}',str(source),f'/Fe{exe}','user32.lib'],cwd=folder,capture_output=True,text=True,encoding='utf-8',errors='replace')
             self.assertEqual(build.returncode,0,build.stdout+build.stderr)
             result=subprocess.run([str(exe)],cwd=folder,capture_output=True,text=True,errors='replace')
             self.assertEqual(result.returncode,0,result.stdout+result.stderr)

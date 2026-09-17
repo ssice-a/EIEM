@@ -719,10 +719,13 @@ static void EiemResolveResourceBackend(void **assemblies, size_t assemblyCount) 
 
 template <typename T>
 static void *EiemMakeValueArray(void *klass, const std::vector<T> &values) {
-  if (!klass || values.empty()) return nullptr;
+  // Unity accepts zero-length arrays for an empty submesh index buffer. Keep
+  // the class check, but do not treat an empty vector as an allocation error.
+  if (!klass) return nullptr;
   void *array = il2cpp_array_new(klass, values.size());
-  if (array) memcpy((char *)array + IL2CPP_ARRAY_DATA, values.data(),
-                    values.size() * sizeof(T));
+  if (array && !values.empty())
+    memcpy((char *)array + IL2CPP_ARRAY_DATA, values.data(),
+           values.size() * sizeof(T));
   return array;
 }
 
@@ -1060,9 +1063,15 @@ static bool EiemWriteMeshShapes(void *mesh, const EiemNativeMeshDocument &docume
 
 static void *EiemBuildNativeMesh(const char *path, void *templateMesh,
                                  char *error, size_t errorSize,
-                                 std::shared_ptr<const EiemSkinIdentity> *skin = nullptr) {
+                                 std::shared_ptr<const EiemSkinIdentity> *skin = nullptr,
+                                 uint32_t hiddenSubmeshMask = 0) {
   EiemNativeMeshDocument document;
   if (!EiemReadNativeMesh(path, &document, error, errorSize)) return nullptr;
+  if (hiddenSubmeshMask) {
+    for (size_t index = 0; index < document.subMeshes.size() && index < 32; ++index)
+      if (hiddenSubmeshMask & (1u << (uint32_t)index))
+        document.subMeshes[index].indexCount = 0;
+  }
   if (skin) {
     skin->reset();
     if (!document.skin.empty()) {
@@ -1160,8 +1169,10 @@ static void *EiemBuildNativeMesh(const char *path, void *templateMesh,
   int32_t subMeshCount = (int32_t)document.subMeshes.size();
   void *subMeshParams[] = {&subMeshCount};
   Invoke(s_eiemMeshSetSubMeshCount, mesh, subMeshParams);
+  size_t expectedIndexCount = 0;
   for (int32_t index = 0; index < subMeshCount; ++index) {
     const auto &subMesh = document.subMeshes[(size_t)index];
+    expectedIndexCount += subMesh.indexCount;
     std::vector<int32_t> triangles;
     triangles.reserve(subMesh.indexCount);
     for (uint32_t offset = 0; offset < subMesh.indexCount; ++offset) {
@@ -1222,14 +1233,14 @@ static void *EiemBuildNativeMesh(const char *path, void *templateMesh,
     const bool readbackOk =
         actualVertices == document.vertexCount &&
         actualSubMeshes == (int32_t)document.subMeshes.size() &&
-        actualIndices == (int64_t)document.indices.size();
+        actualIndices == (int64_t)expectedIndexCount;
     if (!readbackOk) {
       if (error) strncpy_s(error, errorSize,
                            "Unity Mesh read-back does not match EIEM payload",
                            _TRUNCATE);
       Log("[MOD] Mesh construction rejected: payload vertices=%d submeshes=%zu indices=%zu; "
           "readback vertices=%d submeshes=%d indices=%lld",
-          document.vertexCount, document.subMeshes.size(), document.indices.size(),
+          document.vertexCount, document.subMeshes.size(), expectedIndexCount,
           actualVertices, actualSubMeshes, (long long)actualIndices);
       return nullptr;
     }
@@ -1284,6 +1295,22 @@ static uint64_t EiemMeshResourceFileStamp(const char *path) {
   return time.QuadPart ^ ((uint64_t)data.nFileSizeHigh << 32) ^ data.nFileSizeLow;
 }
 
+static uint64_t EiemMeshCacheStamp(uint64_t fileStamp) {
+  // F10 advances the published Mod generation. Include it in the Mesh cache
+  // key so an atomic replacement with identical size/timestamp still gets a
+  // fresh Unity Mesh; ordinary repeated lookups within one generation remain
+  // cached.
+  const uint64_t generation = (uint64_t)(uint32_t)InterlockedCompareExchange(
+      &s_eiemModGeneration, 0, 0);
+  uint64_t stamp = fileStamp ^
+      (generation + 0x9E3779B97F4A7C15ULL + (fileStamp << 6) + (fileStamp >> 2));
+  stamp ^= stamp >> 30;
+  stamp *= 0xBF58476D1CE4E5B9ULL;
+  stamp ^= stamp >> 27;
+  stamp *= 0x94D049BB133111EBULL;
+  return stamp ^ (stamp >> 31);
+}
+
 static void EiemClearObjectResourceCache(
     std::vector<EiemObjectResourceCacheEntry> &cache, SRWLOCK *lock) {
   if (!lock) return;
@@ -1330,7 +1357,10 @@ static bool EiemBuildMeshResource(const EiemModRule &rule, void **outMesh,
   char fullPath[MAX_PATH] = {};
   if (!GetFullPathNameA(path, _countof(fullPath), fullPath, nullptr))
     strncpy_s(fullPath, sizeof(fullPath), path, _TRUNCATE);
-  const uint64_t fileStamp = EiemMeshResourceFileStamp(fullPath);
+  uint64_t fileStamp = EiemMeshCacheStamp(EiemMeshResourceFileStamp(fullPath));
+  // Visibility variants share the source payload but must not share a Unity
+  // Mesh cache entry: each mask has a different per-submesh index buffer.
+  fileStamp ^= (uint64_t)rule.hiddenSubmeshMask * 1099511628211ull;
   void *cachedMesh = nullptr;
   if (!EiemFindCachedObject(s_eiemMeshResourceCache, &s_eiemMeshResourceCacheLock,
                            resource.modPath, resource.section, fileStamp,
@@ -1344,7 +1374,8 @@ static bool EiemBuildMeshResource(const EiemModRule &rule, void **outMesh,
   }
 
   std::shared_ptr<const EiemSkinIdentity> identity;
-  void *mesh = EiemBuildNativeMesh(fullPath, templateMesh, error, errorSize, &identity);
+  void *mesh = EiemBuildNativeMesh(fullPath, templateMesh, error, errorSize, &identity,
+                                   rule.hiddenSubmeshMask);
   if (!mesh) return false;
   if (!EiemCacheObject(s_eiemMeshResourceCache, &s_eiemMeshResourceCacheLock,
                        resource.modPath, resource.section, fileStamp, mesh,

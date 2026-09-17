@@ -57,7 +57,7 @@ static void ReleaseSRWLockExclusive(SRWLOCK *lock) {
 static void AcquireSRWLockShared(SRWLOCK *lock) { AcquireSRWLockExclusive(lock); }
 static void ReleaseSRWLockShared(SRWLOCK *lock) { ReleaseSRWLockExclusive(lock); }
 struct EiemModRule { bool hasMesh = true; char modPath[MAX_PATH] = "mod.ini";
-    char mesh[96] = "MeshA"; };
+    char mesh[96] = "MeshA"; uint32_t hiddenSubmeshMask = 0; };
 struct EiemModResource { char modPath[MAX_PATH] = "mod.ini";
     char section[96] = "MeshA"; char path[MAX_PATH] = "mesh.mesh"; };
 static SRWLOCK s_eiemMeshResourceCacheLock;
@@ -66,6 +66,7 @@ static std::map<uint32_t, void *> targets;
 static std::vector<uint32_t> freed;
 static int tokens[32];
 static int buildCalls = 0;
+static uint32_t lastHiddenSubmeshMask = 0;
 static uint32_t nextHandle = 100;
 static bool failBuild = false;
 static void *deadNative = nullptr;
@@ -87,6 +88,18 @@ static auto il2cpp_gchandle_get_target = &GetTarget;
 static auto il2cpp_gchandle_free = &FreeHandle;
 static uint32_t (*s_eiemNewWeakHandle)(void *, bool) = nullptr;
 static void Log(const char *, ...) {}
+static LONG InterlockedCompareExchange(volatile LONG *value, LONG, LONG) { return *value; }
+static uint64_t EiemMeshCacheStamp(uint64_t fileStamp) {
+    const uint64_t generation = (uint64_t)(uint32_t)InterlockedCompareExchange(
+        &s_eiemModGeneration, 0, 0);
+    uint64_t stamp = fileStamp ^
+        (generation + 0x9E3779B97F4A7C15ULL + (fileStamp << 6) + (fileStamp >> 2));
+    stamp ^= stamp >> 30;
+    stamp *= 0xBF58476D1CE4E5B9ULL;
+    stamp ^= stamp >> 27;
+    stamp *= 0x94D049BB133111EBULL;
+    return stamp ^ (stamp >> 31);
+}
 // PRODUCTION_CACHE
 static std::vector<EiemObjectResourceCacheEntry> s_eiemMeshResourceCache;
 static bool EiemFindModResource(const char *, const char *, const char *,
@@ -95,12 +108,12 @@ static unsigned GetFullPathNameA(const char *path, size_t size, char *out, void 
     strncpy_s(out, size, path, _TRUNCATE); return (unsigned)std::strlen(out);
 }
 static uint64_t EiemMeshResourceFileStamp(const char *) { return 10; }
-static void *EiemBuildNativeMesh(const char *, void *, char *, size_t, std::shared_ptr<const EiemSkinIdentity> *identity) {
+static void *EiemBuildNativeMesh(const char *, void *, char *, size_t, std::shared_ptr<const EiemSkinIdentity> *identity, uint32_t hiddenMask) {
     if (s_eiemMeshResourceCacheLock.held) std::abort();
     if(identity) { auto value=std::make_shared<EiemSkinIdentity>(); value->paths={"Root/Foot"}; *identity=value; }
+    lastHiddenSubmeshMask = hiddenMask;
     ++buildCalls; return failBuild ? nullptr : &tokens[6 + buildCalls];
 }
-static LONG InterlockedCompareExchange(volatile LONG *value, LONG, LONG) { return *value; }
 // PRODUCTION_BUILDER
 #define CHECK(condition) do { if (!(condition)) { \
     std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #condition); return 1; \
@@ -110,7 +123,7 @@ static void Add(uint32_t handle, void *object, uint64_t stamp = 10,
     EiemObjectResourceCacheEntry entry;
     nextHandle = handle - 1;
     entry.object = EiemUnityRef::Capture(object ? object : &tokens[6], false);
-    entry.fileStamp = stamp;
+    entry.fileStamp = EiemMeshCacheStamp(stamp);
     auto identity=std::make_shared<EiemSkinIdentity>(); identity->paths={"Root/Foot"}; entry.skin=identity;
     strcpy_s(entry.modPath, "mod.ini");
     strncpy_s(entry.section, section, _TRUNCATE);
@@ -134,8 +147,10 @@ int main(int argc, char **argv) {
     if (nativeDead) { Add(1, &tokens[0]); deadNative = &tokens[0]; }
     if (nativeUnknown) { Add(1, &tokens[0]); unknownNative = &tokens[0]; }
     if (unrelated) { Add(3, &tokens[2], 10, "MeshC"); Add(4, &tokens[3], 10, "MeshB"); }
+    EiemModRule rule = {};
+    rule.hiddenSubmeshMask = std::strcmp(scenario, "hidden") == 0 ? (1u << 2) : 0;
     void *mesh = &tokens[6]; char error[256] = {};
-    const bool result = EiemBuildMeshResource(EiemModRule{}, &mesh, error, sizeof(error));
+    const bool result = EiemBuildMeshResource(rule, &mesh, error, sizeof(error));
     CHECK(!s_eiemMeshResourceCacheLock.held);
     CHECK(s_eiemMeshResourceCacheLock.acquired == s_eiemMeshResourceCacheLock.released);
     if (!unityThread) {
@@ -160,10 +175,11 @@ int main(int argc, char **argv) {
         // Reusing the same resource must not build another Unity Mesh.
         void *again = nullptr;
         std::shared_ptr<const EiemSkinIdentity> identity;
-        CHECK(EiemBuildMeshResource(EiemModRule{}, &again, error, sizeof(error), nullptr, &identity));
+        CHECK(EiemBuildMeshResource(rule, &again, error, sizeof(error), nullptr, &identity));
         CHECK(identity && identity->paths==std::vector<std::string>{"Root/Foot"});
         CHECK(again == mesh);
         CHECK(buildCalls == (hit || deadThenHit ? 0 : 1));
+        CHECK(lastHiddenSubmeshMask == rule.hiddenSubmeshMask);
         CHECK(s_eiemMeshResourceCacheLock.acquired == s_eiemMeshResourceCacheLock.released);
     }
     if (std::strcmp(scenario, "cycles") == 0) {
@@ -178,6 +194,15 @@ int main(int argc, char **argv) {
             CHECK(shared == mesh && buildCalls == cycle + 2);
         }
         CHECK(freed.size() == 3);
+    }
+    if (std::strcmp(scenario, "generation") == 0) {
+        void *before = mesh;
+        ++s_eiemModGeneration;
+        CHECK(EiemBuildMeshResource(rule, &mesh, error, sizeof(error)));
+        CHECK(mesh != before && buildCalls == 2);
+        void *again = nullptr;
+        CHECK(EiemBuildMeshResource(rule, &again, error, sizeof(error)));
+        CHECK(again == mesh && buildCalls == 2);
     }
     return 0;
 }
@@ -198,14 +223,15 @@ class MeshResourceCache(unittest.TestCase):
         cls.executable = folder / "mesh_cache_fixture.exe"
         build = subprocess.run(
             ["cl", "/nologo", "/EHsc", "/std:c++17", f"/I{ROOT / 'src'}", str(source), f"/Fe{cls.executable}"],
-            cwd=folder, capture_output=True, text=True,
+            cwd=folder, capture_output=True, text=True, encoding="utf-8",
+            errors="replace",
         )
         if build.returncode:
             raise AssertionError(build.stdout + build.stderr)
 
     def test_hit_miss_eviction_and_rebuild_keep_lock_and_handle_ownership(self):
         for scenario in ("empty", "hit", "dead", "dead_then_hit", "expired",
-                         "unrelated", "build_failure", "native_dead", "native_unknown", "wrong_thread", "cycles"):
+                         "unrelated", "build_failure", "native_dead", "native_unknown", "wrong_thread", "cycles", "generation", "hidden"):
             with self.subTest(scenario=scenario):
                 result = subprocess.run([str(self.executable), scenario],
                                         capture_output=True, text=True)

@@ -139,6 +139,7 @@ static void EiemRegistrationTraceRendererOwner(
 static void EiemRegistrationTraceArrayBoundary(
     const char *boundary, void *owner, void *array, size_t count,
     LONG generation, int32_t lod) {
+  if (!kEiemValidationIdentityProbe) return;
   if (!EiemRegistrationTraceFirst("array-boundary", boundary, owner, array,
                                   nullptr, generation))
     return;
@@ -157,6 +158,7 @@ static void EiemRegistrationTraceParallelArrays(
     size_t primaryCount, void *parallel, const char *parallelType,
     size_t parallelCount, size_t sourceIndex, const char *sourceSection,
     LONG generation) {
+  if (!kEiemValidationIdentityProbe) return;
   if (!EiemRegistrationTraceFirst("parallel-arrays", boundary, primary,
                                   parallel, nullptr, generation))
     return;
@@ -196,6 +198,7 @@ static void EiemRegistrationTraceArrayMembers(
     const char *boundary, void *owner, void *array, size_t count,
     LONG generation, const EiemRegistrationTracePartnerEntry *entries,
     size_t entryCount) {
+  if (!kEiemValidationIdentityProbe) return;
   if (!array || !entries || entryCount == 0 || count > 8192) return;
   size_t sourceHits = 0, partnerHits = 0, visibleHits = 0;
   size_t sourceRefs = 0, partnerRefs = 0, visibleRefs = 0;
@@ -351,6 +354,7 @@ static void EiemRegistrationTracePartner(
     uint64_t sourceBoneHash = 0, uint64_t partnerBoneHash = 0,
     size_t sourceBindposes = 0, size_t partnerBindposes = 0,
     uint64_t sourceBindposeHash = 0, uint64_t partnerBindposeHash = 0) {
+  if (!kEiemValidationIdentityProbe) return;
   if (!EiemRegistrationTraceFirst("partner", boundary, source, partner,
                                   nullptr, generation))
     return;
@@ -380,6 +384,7 @@ static void EiemRegistrationTracePartnerPose(
     bool sourceRootPositionRead, float sourceRootX, float sourceRootY,
     float sourceRootZ, bool partnerRootPositionRead, float partnerRootX,
     float partnerRootY, float partnerRootZ) {
+  if (!kEiemValidationIdentityProbe) return;
   char stateKey[192] = {};
   _snprintf_s(stateKey, _countof(stateKey), _TRUNCATE,
               "pose|boundary=%s|src=%p|dst=%p|srcRead=%d|dstRead=%d|srcRootRead=%d|"
@@ -419,6 +424,7 @@ static void EiemRegistrationTraceLod(void *source, void *partner, bool add,
                                      bool partnerEnabled = true,
                                      bool sourceForceOff = false,
                                      bool partnerForceOff = false) {
+  if (!kEiemValidationIdentityProbe) return;
   const char *operation = add ? "add" : "remove";
   char stateKey[256] = {};
   _snprintf_s(stateKey, _countof(stateKey), _TRUNCATE,
@@ -447,6 +453,7 @@ static void EiemRegistrationTraceLod(void *source, void *partner, bool add,
 
 static void EiemRegistrationTraceLodGroupSet(
     void *group, void *lods, size_t lodCount, bool fromEiem, LONG generation) {
+  if (!kEiemValidationIdentityProbe) return;
   char stateKey[128] = {};
   _snprintf_s(stateKey, _countof(stateKey), _TRUNCATE,
               "SetLODs|count=%zu|origin=%d", lodCount, fromEiem ? 1 : 0);
@@ -469,6 +476,7 @@ static void EiemRegistrationTraceLodGroupMember(
     bool knownPartner, bool active, bool activeRead, bool enabled,
     bool enabledRead, bool forceRenderingOff, bool forceRenderingOffRead,
     LONG generation) {
+  if (!kEiemValidationIdentityProbe) return;
   char stateKey[256] = {};
   _snprintf_s(
       stateKey, _countof(stateKey), _TRUNCATE,
@@ -495,6 +503,7 @@ static void EiemRegistrationTraceEligibility(
     void *renderer, void *drawRenderer, LONG generation, bool active,
     bool enabled, bool enabledRead, bool forceRenderingOff,
     bool forceRenderingOffRead, bool accepted, const char *reason) {
+  if (!kEiemValidationIdentityProbe) return;
   if (!EiemRegistrationTraceFirst("eligibility", reason, renderer,
                                   drawRenderer, nullptr, generation))
     return;

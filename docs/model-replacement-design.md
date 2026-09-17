@@ -11,7 +11,7 @@ Physics Mod，并由普通 Render 的 Mesh 命中按模型实例消费无碰撞�
 验证四节点 `fixed/move/move/move` 链驱动替换 Mesh 可见变形；同版 DLL 又把精确 `NPCAvatar.StartNPC` owner
 接入相同模型执行器。实机已确认两个 NPC 分别进入原生 Team 48/49并产生可见拇指效果，两个释放入口也注销了
 owner；本次关闭前尚未观察到延迟销毁后的最终 `retired`。证据与限制见
-[原生调查第 20.23～20.24 节](native-physics-investigation.md)。碰撞体和 v2 原生图仍不属于当前可执行范围。
+[原生调查归档](archive/native-physics-investigation.md)。碰撞体和 v2 原生图仍不属于当前可执行范围。
 
 ## 1. 核心职责
 
@@ -84,6 +84,9 @@ path=meshes/accessory.mesh
   原骨骼绑定姿态修改和整套 Avatar 替换仍不在现行执行范围内。
 - `submesh.N=M` 可将 submesh N 映射到材质槽 M。槽号是资源布局，
   删除槽 0 的全部面不能把槽 1 自动重编号为 0。
+- `submesh_visible.N=true|false` 控制合并 Mesh 中第 N 个 submesh 的显隐。
+  隐藏状态使用同一 Mesh 的空索引变体，保持原 Renderer、骨骼数组和 LOD
+  成员不变，适合由 `[Key...]` 条件分支切换。
 - `match.vertices/indices/submeshes` 是可选附加条件，不是必须写的身份。
 - 同一规则集合按配置顺序采用第一条命中的规则。文件夹按不区分大小写排序，
   根 `plugin/mods/mod.ini` 最后读取；不要依赖操作系统枚举顺序。

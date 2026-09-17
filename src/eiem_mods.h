@@ -86,17 +86,27 @@ static bool EiemSameRenderAssembly(EiemModRule a, EiemModRule b) {
 }
 
 static bool EiemSameRenderWithoutPartnerLinks(EiemModRule a,
-                                              EiemModRule b) {
+                                               EiemModRule b) {
   memset(a.partners, 0, sizeof(a.partners));
   memset(b.partners, 0, sizeof(b.partners));
   a.partnerCount = b.partnerCount = 0;
   return memcmp(&a, &b, sizeof(a)) == 0;
 }
 
+static bool EiemSameRenderWithoutSubmeshVisibility(EiemModRule a,
+                                                   EiemModRule b) {
+  // A submesh visibility key changes only the generated index buffer. Keep
+  // this separate from partner-link updates so the source Renderer is
+  // refreshed without destroying any model-owned objects.
+  a.hiddenSubmeshMask = b.hiddenSubmeshMask = 0;
+  return memcmp(&a, &b, sizeof(a)) == 0;
+}
+
 static bool EiemPrepareInputUpdate(const std::vector<EiemModInputEvent> &events,
-                                  EiemModProgram *next, std::vector<std::string> *affected,
-                                  bool *shapesOnly = nullptr,
-                                  bool *partnerLinksOnly = nullptr) {
+                                   EiemModProgram *next, std::vector<std::string> *affected,
+                                   bool *shapesOnly = nullptr,
+                                   bool *partnerLinksOnly = nullptr,
+                                   bool *submeshVisibilityOnly = nullptr) {
   AcquireSRWLockShared(&s_eiemModLock);
   *next = s_eiemModProgram;
   const LONG generation = s_eiemModGeneration;
@@ -134,7 +144,13 @@ static bool EiemPrepareInputUpdate(const std::vector<EiemModInputEvent> &events,
     *partnerLinksOnly = before.size() == next->rules.size();
     for (size_t i = 0; *partnerLinksOnly && i < before.size(); ++i)
       *partnerLinksOnly =
-          EiemSameRenderWithoutPartnerLinks(before[i], next->rules[i]);
+           EiemSameRenderWithoutPartnerLinks(before[i], next->rules[i]);
+  }
+  if (submeshVisibilityOnly) {
+    *submeshVisibilityOnly = before.size() == next->rules.size();
+    for (size_t i = 0; *submeshVisibilityOnly && i < before.size(); ++i)
+      *submeshVisibilityOnly =
+          EiemSameRenderWithoutSubmeshVisibility(before[i], next->rules[i]);
   }
   return !affected->empty();
 }

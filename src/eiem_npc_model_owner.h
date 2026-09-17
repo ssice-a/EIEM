@@ -1,9 +1,7 @@
 #pragma once
 
 // NPC model lifecycle adapter. StartNPC is the registration boundary and
-// ReleaseAvatar/OnRelease are the two owner boundaries. The former cloth-build
-// observer was a research hook: it did not own a model, did
-// not feed the Render/Physics executor, and has been removed.
+// ReleaseAvatar/OnRelease are the two owner boundaries.
 
 using EiemNpcLifecycleVoid0 = void(__fastcall *)(void *, void *);
 using EiemNpcLifecycleVoid1 = void(__fastcall *)(void *, void *, void *);
@@ -33,8 +31,8 @@ static void EiemNpcTraceStartNpc(void *avatar, void *component,
   if (!EiemOnUnityThread()) return;
 
   void *model = s_eiemNpcGetModelGo && avatar
-                   ? Invoke(s_eiemNpcGetModelGo, avatar)
-                   : nullptr;
+                    ? Invoke(s_eiemNpcGetModelGo, avatar)
+                    : nullptr;
   const LONG generation =
       InterlockedCompareExchange(&s_eiemModGeneration, 0, 0);
   EiemRegistrationTraceOwnerState(

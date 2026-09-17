@@ -200,7 +200,7 @@ class RestoreLifecycle(unittest.TestCase):
                     'static void EiemForgetRenderOverrides(']
         funcs='\n'.join(function(trace,s) for s in signatures)
         start=trace.index('  bool meshApplied = false;', trace.index('static bool EiemApplyResolvedRenderRule('))
-        end=trace.index('  // Material edits remain',start)
+        end=trace.index('  // A mesh rule is a transaction boundary.',start)
         source=folder/'restore.cpp'
         source.write_text(FIXTURE.replace('// STATE',state).replace('// FUNCTIONS',funcs).replace('// WRITE_BLOCK',trace[start:end]),encoding='utf-8')
         cls.exe=folder/'restore.exe'

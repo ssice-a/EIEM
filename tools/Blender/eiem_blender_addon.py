@@ -2126,6 +2126,27 @@ def prepare_export_root(root):
     return root
 
 
+def visible_eiem_resources(context=None):
+    """Return only the EIEM meshes visible in the current Blender view.
+
+    Every visible EIEM mesh is part of this temporary validation export,
+    including a source mesh that the user edited in place.  Hidden meshes are
+    intentionally omitted. Armatures and physics are deliberately excluded;
+    this entry point is for the current mesh-only validation export.
+    """
+    context = context or bpy.context
+    return sorted([
+        obj for obj in context.scene.objects
+        if obj.type == "MESH"
+        and obj.data.get("eiem_section")
+        and obj.visible_get(view_layer=context.view_layer)
+        and not obj.hide_viewport
+        and not obj.hide_get(view_layer=context.view_layer)
+        and not obj.hide_render
+    ], key=lambda obj: (
+        str(obj.data.get("eiem_section", "")), obj.name))
+
+
 def selected_eiem_resources(context=None):
     context = context or bpy.context
     selected_objects = list(context.selected_objects)
@@ -2269,6 +2290,11 @@ def package_physics_dependencies(plan, armatures, physics_objects):
     This keeps Mesh-only export optional while preventing a physical Mesh export
     from silently dropping the Physics resource that drives those bones.
     """
+    if not rig_export_enabled():
+        # Mesh serialization still reads the Blender Armature for its skin
+        # palette, but this export deliberately emits no Skeleton/Physics
+        # resource declarations.
+        return [], {}
     result_armatures = []
     seen_armatures = set()
     for rig in armatures or []:
@@ -2337,7 +2363,8 @@ def package_physics_dependencies(plan, armatures, physics_objects):
     return result_armatures, by_rig
 
 
-def export_package(root, mesh_objects=None, armatures=None, physics_objects=None):
+def export_package(root, mesh_objects=None, armatures=None, physics_objects=None,
+                   apply_static_switches=True):
     if mesh_objects is None:
         if physics_objects is None:
             physics_objects = selected_eiem_physics()
@@ -2345,6 +2372,8 @@ def export_package(root, mesh_objects=None, armatures=None, physics_objects=None
         if armatures is None:
             armatures = selected_armatures
     mesh_objects = list(mesh_objects or [])
+    if apply_static_switches and not switch_export_enabled():
+        mesh_objects = static_switch_selection(mesh_objects)
     armatures = list(armatures or [])
     if not mesh_objects:
         raise ValueError("No EIEM mesh objects selected")
@@ -2352,11 +2381,12 @@ def export_package(root, mesh_objects=None, armatures=None, physics_objects=None
         raise ValueError("请回到物体模式后导出")
     plan = plan_switch_export(mesh_objects)
     armatures, _ = package_physics_dependencies(plan, armatures, physics_objects)
-    for obj in plan["objects"]:
-        rig = obj.find_armature()
-        if rig and not obj.hide_render:
-            if any(not source for bone, record, source in skeleton_author_nodes(rig)) and rig not in armatures:
-                raise ValueError("%s 使用了新增骨架；请同时选择共享骨架后导出" % obj.name)
+    if rig_export_enabled():
+        for obj in plan["objects"]:
+            rig = obj.find_armature()
+            if rig and not obj.hide_render:
+                if any(not source for bone, record, source in skeleton_author_nodes(rig)) and rig not in armatures:
+                    raise ValueError("%s 使用了新增骨架；请同时选择共享骨架后导出" % obj.name)
     # Stage all validation and binary writes first. Invalid author data must
     # not remove a previously working package.
     destination = Path(root).resolve()
@@ -2374,6 +2404,34 @@ def export_package(root, mesh_objects=None, armatures=None, physics_objects=None
                 shutil.copy2(item, root / item.name)
         shutil.copy2(staging / "mod.ini", root / "mod.ini")
         return stats
+
+
+def export_visible_package(root, context=None):
+    """Export the current visible mesh view without rig, physics or switches."""
+    meshes = visible_eiem_resources(context)
+    if not meshes:
+        raise ValueError("No visible EIEM mesh objects found")
+    previous_rig = os.environ.get("EIEM_DISABLE_RIG_EXPORT")
+    previous_switch = os.environ.get("EIEM_DISABLE_SWITCH_EXPORT")
+    os.environ["EIEM_DISABLE_RIG_EXPORT"] = "1"
+    os.environ["EIEM_DISABLE_SWITCH_EXPORT"] = "1"
+    try:
+        return export_package(
+            root,
+            mesh_objects=meshes,
+            armatures=[],
+            physics_objects=[],
+            apply_static_switches=False,
+        )
+    finally:
+        if previous_rig is None:
+            os.environ.pop("EIEM_DISABLE_RIG_EXPORT", None)
+        else:
+            os.environ["EIEM_DISABLE_RIG_EXPORT"] = previous_rig
+        if previous_switch is None:
+            os.environ.pop("EIEM_DISABLE_SWITCH_EXPORT", None)
+        else:
+            os.environ["EIEM_DISABLE_SWITCH_EXPORT"] = previous_switch
 
 
 def merging_enabled():
@@ -2398,6 +2456,60 @@ def merging_enabled():
     return os.environ.get("EIEM_DISABLE_MERGE", "").strip() not in ("1", "true", "yes")
 
 
+def merged_source_keys(mesh_objects, plan):
+    """Return source identities whose selected parts will share one Mesh.
+
+    A merged Mesh has a new, global submesh/material-slot layout.  Its Render
+    therefore has to declare every material slot, including slots whose source
+    material was unchanged.  Ordinary single Mesh exports can still omit those
+    unchanged declarations and inherit the game's original material array.
+    """
+    if not merging_enabled():
+        return set()
+    groups = {}
+    for obj in mesh_objects:
+        if obj in plan["hidden"]:
+            continue
+        groups.setdefault(mesh_source_identity(obj), 0)
+        groups[mesh_source_identity(obj)] += 1
+    return {key for key, count in groups.items() if count >= 2}
+
+
+def switch_export_enabled():
+    """Whether switch groups should be emitted into the generated package.
+
+    The authoring data remains in the .blend either way.  This export-only
+    switch lets the static assembly path be tested without changing the
+    runtime state machine or hand-editing the generated INI.
+    """
+    return os.environ.get("EIEM_DISABLE_SWITCH_EXPORT", "").strip() not in (
+        "1", "true", "yes")
+
+
+def rig_export_enabled():
+    """Whether Skeleton/Physics resource files are emitted by this export."""
+    return os.environ.get("EIEM_DISABLE_RIG_EXPORT", "").strip() not in (
+        "1", "true", "yes")
+
+
+def static_switch_selection(mesh_objects):
+    """Keep only each switch group's authored default state for a static export."""
+    selected = set(mesh_objects)
+    grouped = set()
+    defaults = set()
+    for group in switch_groups():
+        states = switch_states(group)
+        default = next((state for state in states
+                        if state.get("eiem_default")), None)
+        if default is None:
+            raise ValueError("切换组%s没有默认状态" % group.name)
+        members = set(switch_members(group))
+        grouped.update(members)
+        defaults.update(obj for obj in switch_meshes(default) if obj in selected)
+    return [obj for obj in mesh_objects
+            if obj not in grouped or obj in defaults]
+
+
 def build_merged_action(mesh_objects, plan, root, object_actions, shape_bindings,
                         material_sections, material_payloads, exported_armatures,
                         physics_sections, seen_mesh_sections, shared_mesh_sections,
@@ -2416,27 +2528,23 @@ def build_merged_action(mesh_objects, plan, root, object_actions, shape_bindings
     part is left addressing that one section so the source Render declares a
     single direct mesh replacement with no Partners.
     """
-    groups = {}
+    merged_groups = {}
     if not merging_enabled():
         # Partner form requested: leave every part as its own Mesh resource so
         # the partner declarations below describe all of them.
-        return
+        return merged_groups
     for obj in mesh_objects:
         if obj in plan["hidden"]:
             continue
-        key = (str(obj.get("eiem_render_asset", "") or obj.data.get(
-                   "eiem_target_asset", obj.data.get("eiem_asset", ""))).lower(),
-               str(obj.data.get("eiem_target_path", "") or obj.data.get(
-                   "eiem_source", "")).lower(),
-               str(obj.get("eiem_author_package", "")).replace("\\", "/").lower())
-        groups.setdefault(key, []).append(obj)
+        key = mesh_source_identity(obj)
+        groups = merged_groups.setdefault(key, {"members": []})
+        groups["members"].append(obj)
 
-    for key, members in sorted(groups.items(), key=lambda item: item[0]):
-        members = [member for member in members if member in object_actions]
-        if len(members) < 2 or any(member in plan["bindings"] for member in members):
-            # A single part already declares the source's own Mesh. A part that
-            # a switch owns keeps its Partner, because a Partner is what a
-            # switch toggles.
+    for key, group in sorted(merged_groups.items(), key=lambda item: item[0]):
+        members = group["members"]
+        if len(members) < 2:
+            # A single part already declares the source's own Mesh.
+            del merged_groups[key]
             continue
         first = members[0]
         # Name the merged resource after the part it replaces, marked as merged,
@@ -2461,15 +2569,19 @@ def build_merged_action(mesh_objects, plan, root, object_actions, shape_bindings
         if physics:
             action.append("physics=" + physics)
         slot_offset = 0
+        slot_ranges = {}
         for position, member in enumerate(members):
+            slot_count = stats["slots"][position]
+            slot_ranges[member] = (slot_offset, slot_offset + slot_count)
             for slot, material in enumerate(member.data.materials):
                 material_section = material_sections.get(material, "")
                 if material_section in material_payloads:
                     action.append("material.%d=%s"
                                   % (slot_offset + slot, material_section))
-            slot_offset += stats["slots"][position]
+            slot_offset += slot_count
         for member in members:
             object_actions[member] = list(action)
+        group["slot_ranges"] = slot_ranges
 
         declaration = [
             "[" + section + "]", "path=" + filename,
@@ -2484,6 +2596,7 @@ def build_merged_action(mesh_objects, plan, root, object_actions, shape_bindings
             ])
         declaration.append("")
         resource_lines.extend(declaration)
+    return merged_groups
 
 
 def write_export_package(root, plan, armatures, physics_objects=None):
@@ -2499,6 +2612,7 @@ def write_export_package(root, plan, armatures, physics_objects=None):
     force_materials = set()
     material_sections = {}
     used_material_sections = set()
+    merged_keys = merged_source_keys(mesh_objects, plan)
     for obj in mesh_objects:
         original_slots = parse_json_property(
             obj, "eiem_original_material_sections_json", {})
@@ -2515,7 +2629,8 @@ def write_export_package(root, plan, armatures, physics_objects=None):
                     original_section, used_material_sections, "Material")
             section = material_sections[material]
             referenced_materials[section] = material
-            if str(original_slots.get(str(slot), "")) != original_section:
+            if (mesh_source_identity(obj) in merged_keys or
+                    str(original_slots.get(str(slot), "")) != original_section):
                 force_materials.add(section)
 
     images_by_section = {
@@ -2537,24 +2652,29 @@ def write_export_package(root, plan, armatures, physics_objects=None):
     seen_render_sections = set()
     object_actions = {}
     shape_controls, shape_bindings, shape_hotkeys = plan_shape_controls(mesh_objects)
-    used_hotkeys = {group[3] for group in plan["groups"]}
+    switches_enabled = switch_export_enabled()
+    switch_groups = plan["groups"] if switches_enabled else []
+    switch_bindings = plan["bindings"] if switches_enabled else {}
+    if not switches_enabled:
+        shape_hotkeys = []
+    used_hotkeys = {group[3] for group in switch_groups}
     for control in shape_hotkeys:
         if control["key"] in used_hotkeys:
             raise ValueError("多个控制使用同一快捷键：" + control["key"])
         used_hotkeys.add(control["key"])
     ui_payload = generate_mod_ui(
-        plan["groups"], shape_controls, shape_hotkeys
+        switch_groups, shape_controls, shape_hotkeys
     ) if bpy.context.scene.eiem_ui_template else None
-    if plan["groups"] or shape_controls or ui_payload:
+    if switch_groups or shape_controls or ui_payload:
         resource_lines.append("[Constants]")
         if ui_payload and ui_payload[0]:
             resource_lines.append("$ui_open=0")
-        for group, states, default, key, variable in plan["groups"]:
+        for group, states, default, key, variable in switch_groups:
             resource_lines.append("persist %s=%d" % (variable, default))
         for variable, label, default, minimum, maximum in shape_controls:
             resource_lines.append("persist %s=%.9g" % (variable, default))
         resource_lines.append("")
-        for index, (group, states, default, key, variable) in enumerate(plan["groups"], 1):
+        for index, (group, states, default, key, variable) in enumerate(switch_groups, 1):
             key_lines = [
                 "; " + group.name.replace("\n", " ").replace("\r", " "),
                 "[KeySwitch%d]" % index, "key=" + key, "type=cycle",
@@ -2623,11 +2743,16 @@ def write_export_package(root, plan, armatures, physics_objects=None):
         (root / "meshes").mkdir(exist_ok=True)
     seen_mesh_sections = set()
     shared_mesh_sections = {}
-    build_merged_action(mesh_objects, plan, root, object_actions, shape_bindings,
-                        material_sections, material_payloads,
-                        exported_armatures, physics_sections, seen_mesh_sections,
-                        shared_mesh_sections, resource_lines)
+    merged_groups = build_merged_action(
+        mesh_objects, plan, root, object_actions, shape_bindings,
+        material_sections, material_payloads, exported_armatures, physics_sections,
+        seen_mesh_sections, shared_mesh_sections, resource_lines)
+    merged_objects = {
+        obj for group in merged_groups.values() for obj in group["members"]
+    }
     for obj in mesh_objects:
+        if obj in merged_objects:
+            continue
         # P/duplicate copies source metadata, not geometry identity. Shared
         # datablocks can still share an exported resource when their skin maps
         # agree; independent split datablocks get unique files automatically.
@@ -2680,8 +2805,37 @@ def write_export_package(root, plan, armatures, physics_objects=None):
             seen_render_sections, "Render")
         asset = str(first.get("eiem_render_asset", "") or first.data.get(
             "eiem_target_asset", first.data.get("eiem_asset", "")))
+
+        merged = merged_groups.get(mesh_source_identity(first))
+        if merged:
+            # All active members share one source Renderer and one generated
+            # Mesh. A switch changes only the corresponding submesh index
+            # buffers, preserving the game's skeleton/LOD/physics ownership.
+            render_lines.extend(["[" + root_render + "]", "asset=" + asset])
+            render_lines.extend(object_actions[first])
+            for member in merged["members"]:
+                binding = switch_bindings.get(member)
+                if not binding:
+                    continue
+                variable, visible = binding
+                start, end = merged["slot_ranges"][member]
+                condition = " || ".join(
+                    "%s == %d" % (variable, value) for value in visible)
+                for submesh in range(start, end):
+                    if not condition:
+                        render_lines.append("submesh_visible.%d=false" % submesh)
+                    else:
+                        render_lines.extend([
+                            "if " + condition,
+                            "    submesh_visible.%d=true" % submesh,
+                            "else",
+                            "    submesh_visible.%d=false" % submesh,
+                            "endif",
+                        ])
+            render_lines.append("")
+            continue
         render_lines.extend(["[" + root_render + "]", "asset=" + asset])
-        if len(objects) == 1 and first in object_actions and first not in plan["bindings"]:
+        if len(objects) == 1 and first in object_actions and first not in switch_bindings:
             render_lines.extend(object_actions[first] + [""])
             continue
 
@@ -2715,7 +2869,7 @@ def write_export_package(root, plan, armatures, physics_objects=None):
         templates = []
         for slot, obj in enumerate(o for o in objects if o in object_actions):
             partner = unique_export_section(root_render + "Part%d" % slot, seen_render_sections, "Render")
-            binding = plan["bindings"].get(obj)
+            binding = switch_bindings.get(obj)
             if binding:
                 variable, values = binding
                 if values:
@@ -2790,7 +2944,8 @@ def write_export_package(root, plan, armatures, physics_objects=None):
     (root / "mod.ini").write_text(
         "\n".join(resource_lines + render_lines), encoding="utf-8")
     return {
-        "meshes": len(shared_mesh_sections), "skeletons": len(exported_armatures),
+        "meshes": len(shared_mesh_sections) + len(merged_groups),
+        "skeletons": len(exported_armatures),
         "physics": len(physics_sections),
         "materials": len(material_payloads), "textures": len(referenced_images),
         "prefabs": 0,

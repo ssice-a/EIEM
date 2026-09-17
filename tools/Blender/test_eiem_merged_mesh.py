@@ -87,7 +87,17 @@ first = part('PartA', ['Root', 'Root/Pelvis'], [mat_a, mat_b],
 first.data.polygons[1].material_index = 1
 # Part B: a different subset of the same skeleton, one slot.
 second = part('PartB', ['Root', 'Root/Cloth'], [mat_c],
-              [(2, 0, 0), (3, 0, 0), (2, 1, 0)], [(0, 1, 2)])
+             [(2, 0, 0), (3, 0, 0), (2, 1, 0)], [(0, 1, 2)])
+
+# These slots are unchanged from the source Render.  They still need explicit
+# material resources once the parts are folded into one new global slot layout.
+first['eiem_original_material_sections_json'] = json.dumps(
+    {'0': 'MaterialA', '1': 'MaterialB'})
+second['eiem_original_material_sections_json'] = json.dumps({'0': 'MaterialC'})
+identity = addon.mesh_source_identity(first)
+assert addon.merged_source_keys([first, second], {'hidden': set()}) == {identity}
+assert addon.material_override_payload(mat_a, {}, False)[0] is None
+assert addon.material_override_payload(mat_a, {}, True)[0] is not None
 
 file = output / 'merged.mesh'
 stats = addon.write_merged_mesh(file, [first, second])

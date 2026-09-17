@@ -2,7 +2,7 @@
 
 状态：工作区实验格式，Blender 插件源码 0.30.2。新增组使用作者 v5，原生源图仍使用独立的 v2 格式，
 用于原始 Prefab 物理数据的保留和编辑；整份原生 v2 图不是可直接加载的游戏 Physics Mod。
-当前 DLL 状态和验证记录见[文档索引](README.md)及[原生调查第 17 节](native-physics-investigation.md#17-2026-09-07审查纠正与-v51-诊断构建)。
+当前 DLL 状态见[文档索引](README.md)；历史验证见[原生调查归档](archive/native-physics-investigation.md)。
 
 ## 输入与编辑
 

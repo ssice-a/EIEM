@@ -43,6 +43,10 @@ struct EiemModRule {
   uint32_t materialCount = 0;
   int32_t submeshSlots[32] = {};
   uint32_t submeshCount = 0;
+  // A hidden submesh keeps its slot and material, but receives an empty index
+  // buffer in the generated Mesh variant. The Renderer and its skinning stay
+  // unchanged, so visibility changes do not create or destroy Unity objects.
+  uint32_t hiddenSubmeshMask = 0;
   char partners[16][96] = {};
   uint32_t partnerCount = 0;
   char shapeNames[64][192] = {};
@@ -287,6 +291,19 @@ static bool EiemSetRenderField(EiemModRule &rule, const std::string &key,
         (!value.empty() && !EiemModInteger(value, &slot, 0, _countof(rule.materialSlots) - 1))) return fail();
     rule.submeshSlots[index] = slot;
     rule.submeshCount = (std::max)(rule.submeshCount, (uint32_t)index + 1);
+    return true;
+  }
+  if (key.compare(0, 16, "submesh_visible.") == 0) {
+    if (!EiemModInteger(key.substr(16), &index, 0, 31)) return fail();
+    if (value.empty()) {
+      rule.hiddenSubmeshMask &= ~(1u << (uint32_t)index);
+      return true;
+    }
+    const bool visible = EiemModEquals(value.c_str(), "true") || value == "1";
+    const bool hidden = EiemModEquals(value.c_str(), "false") || value == "0";
+    if (!visible && !hidden) return fail();
+    if (hidden) rule.hiddenSubmeshMask |= 1u << (uint32_t)index;
+    else rule.hiddenSubmeshMask &= ~(1u << (uint32_t)index);
     return true;
   }
   return fail();

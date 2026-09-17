@@ -29,6 +29,8 @@ static volatile LONG s_traceMeshFilterCount = 0;
 static volatile LONG s_traceBundleLoadCount = 0;
 static volatile LONG s_traceHashLoadCount = 0;
 static volatile LONG s_traceHashSubAssetCount = 0;
+static volatile LONG s_traceAssetLoaderTryLoadCount = 0;
+static volatile LONG s_traceCachedLoaderCount = 0;
 static volatile LONG s_tracePathHashCount = 0;
 static volatile LONG s_tracePreloadCount = 0;
 static volatile LONG s_traceAssetNameCount = 0;
@@ -45,6 +47,10 @@ static volatile LONG s_traceBonesSetterCount = 0;
 // Bounds the skinned-mesh measurements, which transform a sample of vertices
 // and therefore must not run unbounded on the Unity thread.
 static volatile LONG s_traceSkinProbeCount = 0;
+// Short diagnostic pass for resource replacements. It compares the game's
+// source skin with the generated Mesh only for the first few cloth instances,
+// so a bad bind/weight result is visible without reintroducing periodic work.
+static volatile LONG s_traceResourceSkinProbeCount = 0;
 // Armed where Partners are created, which is above the per-frame driver that
 // consumes it. Defined next to that driver.
 static void EiemArmSkinProbeSweep();
@@ -106,6 +112,10 @@ static void TraceRememberPendingBundleRequest(void *request, void *path);
 static void TraceResolvePendingBundleRequest(void *request, void *bundle);
 static void TraceDescribeObject(void *object, char *out, int outSize);
 static void TraceDescribeString(void *stringObject, char *out, int outSize);
+static bool TraceIdentityTextMatchesTyphoea(const char *text);
+static bool TraceTakeTargetBudget(volatile LONG *counter, LONG limit,
+                                  const char *primary,
+                                  const char *secondary = nullptr);
 static void TraceRememberAssetOrigin(void *asset, int64_t pathHash,
                                      const char *path);
 static bool TraceTakeBudget(volatile LONG *counter, LONG limit);
@@ -273,6 +283,8 @@ static void TraceSkinnedMeshSetBones(void *self, void *bones,
                                      void *methodInfo);
 static void TraceMeshFilterSetSharedMesh(void *self, void *mesh,
                                           void *methodInfo);
+static size_t EiemApplyStandaloneRenderRulesToSkinArray(
+    void *renderers, const char *stage);
 static void *EiemReadSharedMesh(void *renderer, const char *rendererType);
 static void TraceModelManagerGameObjectAllocate(void *self, void *model,
                                                  void *methodInfo);
@@ -344,11 +356,12 @@ static bool EiemReapplyRegisteredModelInstance(void *model,
 static bool EiemApplyStandaloneRenderRules(void *model, const char *stage,
                                            bool *matched = nullptr,
                                            const std::vector<std::string> *affected = nullptr,
-                                           std::vector<EiemPhysicsIntent> *physicsIntents = nullptr);
+                                           std::vector<EiemPhysicsIntent> *physicsIntents = nullptr,
+                                           bool allowPartnerCreation = false);
 static bool EiemApplyStandaloneRenderRulesToRenderer(
     void *meshOwner, void *drawRenderer, void *mesh,
     const char *rendererType, void *methodInfo, const char *stage,
-    bool allowPartnerCreation = true);
+    bool allowPartnerCreation = false);
 static bool EiemBuildRelativeRendererPath(void *rootTransform, void *renderer,
                                           char *out, size_t outSize);
 static bool EiemRenderRuleMatches(const EiemModRule &rule,
@@ -374,6 +387,20 @@ static bool EiemOnUnityThread() {
   InterlockedCompareExchange((volatile LONG *)&s_eiemUnityThreadId,
                              (LONG)current, 0);
   return true;
+}
+
+// These assembly callbacks execute on the game's Unity thread before the
+// window-procedure path necessarily observes its first message.  Pin the
+// thread from the callback that is about to invoke Unity setters; otherwise
+// the startup resource pass is rejected as `unityThread=0` and no replacement
+// can be built until a later F10 reconcile.
+static void EiemAdoptUnityThreadFromAssemblyHook(const char *hook) {
+  const DWORD current = GetCurrentThreadId();
+  const LONG previous = InterlockedCompareExchange(
+      (volatile LONG *)&s_eiemUnityThreadId, (LONG)current, 0);
+  if (!previous)
+    Log("[MOD-THREAD] Unity thread adopted from %s: %lu",
+        hook ? hook : "assembly hook", (unsigned long)current);
 }
 
 static int32_t EiemTraceUnboxInt(void *boxed) {
@@ -1809,29 +1836,38 @@ static bool EiemResolveMeshBones(const EiemSkinIdentity &identity, void *rendere
     if (error) strncpy_s(error, errorSize, reason.c_str(), _TRUNCATE);
     return false;
   };
-  if (!EiemOnUnityThread() || !g_smr_get_bones || !g_transform_get_parent ||
-      !g_object_get_name || !il2cpp_array_new || !g_transformClass)
+  if (!EiemOnUnityThread() || !g_smr_get_bones)
     return reject("Shared skeleton APIs are unavailable");
   void *current = EiemBackendInvokeNoThrow(g_smr_get_bones, renderer);
   const size_t count = EiemManagedArrayLength(current);
   if (!current || !count || count > 4096) return reject("Source renderer has no valid bone palette");
   void **items = (void **)((char *)current + IL2CPP_ARRAY_DATA);
-  std::vector<void *> resolved;
-  if (identity.paths.empty()) {
-    // Pathless source packages retain hash identity. No count equality or
-    // index-order guess: each slot must resolve uniquely within this palette.
-    for (uint32_t hash : identity.hashes) {
-      void *found = nullptr;
-      for (size_t i=0; i<count; ++i) {
-        std::vector<uint32_t> hashes; EiemCollectBonePathHashes(items[i], &hashes);
-        if (std::find(hashes.begin(), hashes.end(), hash) == hashes.end()) continue;
-        if (found && found != items[i]) return reject("Ambiguous source bone hash");
-        found=items[i];
-      }
-      if (!found) return reject("Source bone hash not found; re-export with bone paths");
-      resolved.push_back(found);
-    }
-  } else {
+  // Blender preserves the source palette as an ordered prefix and appends
+  // genuinely new slots.  The source Renderer already owns the correct
+  // Transform references for that prefix.  Do not resolve those entries by
+  // name: NPC/UI/world prefabs can rename one Transform while retaining the
+  // same slot and bind-pose semantics.
+  const size_t pathSlots = identity.paths.size();
+  const size_t hashSlots = identity.hashes.size();
+  if (pathSlots && hashSlots && pathSlots != hashSlots)
+    return reject("Replacement bone path/hash counts differ");
+  const size_t payloadSlots = pathSlots ? pathSlots : hashSlots;
+  if (!payloadSlots) return reject("Replacement mesh has no bone palette identity");
+  if (payloadSlots < count)
+    return reject("Replacement bone palette removes source slots");
+  if (payloadSlots == count) {
+    Log("[MOD-SKIN] renderer=%p binding=source-index slots=%zu reason=source-prefix", renderer, count);
+    if (out) *out = current;
+    return true;
+  }
+  if (identity.paths.empty())
+    return reject("Added bone slots require authored bone paths");
+  if (!g_transform_get_parent || !g_object_get_name || !il2cpp_array_new ||
+      !g_transformClass)
+    return reject("Shared skeleton traversal APIs are unavailable");
+
+  std::vector<void *> resolved(items, items + count);
+  {
     if (!g_transform_get_childCount || !g_transform_GetChild)
       return reject("Shared skeleton traversal APIs are unavailable");
     std::vector<std::string> sourcePaths;
@@ -1857,9 +1893,18 @@ static bool EiemResolveMeshBones(const EiemSkinIdentity &identity, void *rendere
       sourcePaths.push_back(full);
     }
     std::string root, why;
-    if (!EiemSkinRootPath(sourcePaths,identity.paths,root,why)) return reject(why);
+    // Only the source-prefix paths are needed to anchor the live skeleton.
+    // A renamed source slot is therefore harmless as long as another source
+    // slot establishes the same root.  The appended paths are resolved below.
+    std::vector<std::string> sourcePrefixPaths;
+    sourcePrefixPaths.reserve((std::min)(count, identity.paths.size()));
+    for (size_t index = 0; index < count && index < identity.paths.size(); ++index)
+      sourcePrefixPaths.push_back(identity.paths[index]);
+    if (!EiemSkinRootPath(sourcePaths,sourcePrefixPaths,root,why))
+      return reject(why.c_str());
     auto ancestor=ancestors.find(root);
-    if (ancestor==ancestors.end()) return reject("Shared skeleton root is absent");
+    if (ancestor==ancestors.end())
+      return reject("Shared skeleton root is absent");
     std::vector<void *> nodes{ancestor->second};
     std::vector<std::string> paths{root.substr(root.find_last_of('/')+1)};
     for (size_t index=0; index<nodes.size(); ++index) {
@@ -1878,14 +1923,17 @@ static bool EiemResolveMeshBones(const EiemSkinIdentity &identity, void *rendere
         paths.push_back(paths[index]+"/"+name); nodes.push_back(node);
       }
     }
+    std::vector<std::string> addedPaths;
+    addedPaths.reserve(identity.paths.size() - count);
+    for (size_t index = count; index < identity.paths.size(); ++index)
+      addedPaths.push_back(identity.paths[index]);
     std::vector<size_t> slots;
-    if (!EiemResolveSkinPathIndices(identity.paths,paths,slots,why)) return reject(why);
+    if (!EiemResolveSkinPathIndices(addedPaths,paths,slots,why))
+      return reject(why.c_str());
     for (size_t index:slots) resolved.push_back(nodes[index]);
   }
-  if (resolved.empty()) return reject("Replacement mesh has no resolved bones");
-  bool same=count==resolved.size();
-  for (size_t i=0; same && i<count; ++i) same=items[i]==resolved[i];
-  if (same) { if (out) *out=current; return true; }
+  if (resolved.size() != payloadSlots)
+    return reject("Replacement bone palette size is inconsistent");
   void *array=il2cpp_array_new(g_transformClass,resolved.size());
   if (!array) return reject("Cannot allocate expanded bone palette");
   memcpy((char *)array+IL2CPP_ARRAY_DATA,resolved.data(),resolved.size()*sizeof(void *));
@@ -3893,6 +3941,7 @@ struct EiemBaseModelPartnerArrayProbe {
 // This probe never changes a game-owned array.
 static void EiemTraceBaseModelPartnerArrays(void *part,
                                             const char *boundary) {
+  if (!kEiemValidationIdentityProbe) return;
   if (!part) return;
   void *renderers =
       TraceReadObjectField(part, s_basePartRenderersOffset);
@@ -4265,6 +4314,7 @@ static bool TraceLookupLoadedModelPath(void *model, char *out, size_t outSize) {
 // size-bounded contract, and inlining this scan pushed the model-registration
 // call out of the window that verifies it.
 static void TraceDumpPrefabRenderers(const char *path, void *model) {
+  if (!kEiemValidationIdentityProbe) return;
   if (!model || !path || !path[0] || strstr(path, "typhoea") == nullptr ||
       !g_gameObject_GetComponentsInChildren || !g_skinnedMeshRendererClass ||
       !il2cpp_class_get_type || !il2cpp_type_get_object)
@@ -4498,6 +4548,7 @@ static void *TraceModelManagerLoadFromPersistentPool(void *self,
 // per-model loop, so it cannot repeat the v117 ring-buffer load-time regression.
 static void EiemTracePartnerWorldBounds(void *part, const char *stage,
                                         LONG generation) {
+  if (!kEiemValidationIdentityProbe) return;
   if (!part || !g_renderer_get_bounds || !EiemOnUnityThread()) return;
   if (s_basePartRenderersOffset < 0) return;
   void *renderers = TraceReadObjectField(part, s_basePartRenderersOffset);
@@ -4581,6 +4632,7 @@ static void TraceBasePartFinish(void *self, bool success, void *methodInfo) {
 // must not grow the hierarchy while the game is already walking it.
 static void TraceBasePartPostDeal(void *self, void *methodInfo) {
   void *model = TraceReadObjectField(self, s_basePartModelOffset);
+  EiemAdoptUnityThreadFromAssemblyHook("BaseModelViewPart.PostDealLoadedModel");
   if (model)
     EiemApplyStandaloneRenderRules(
         model, "BaseModelViewPart.PostDealLoadedModel-before");
@@ -4597,6 +4649,7 @@ static void TraceBasePartPostDeal(void *self, void *methodInfo) {
 // and label to make dispatch visible in the runtime log.
 static void TraceComplexPartPostDeal(void *self, void *methodInfo) {
   void *model = TraceReadObjectField(self, s_basePartModelOffset);
+  EiemAdoptUnityThreadFromAssemblyHook("ComplexModelViewPart.PostDealLoadedModel");
   if (model)
     EiemApplyStandaloneRenderRules(
         model, "ComplexModelViewPart.PostDealLoadedModel-before");
@@ -4676,7 +4729,7 @@ static bool EiemApplyResolvedRenderRule(void *renderer, void *drawRenderer,
                                         void *methodInfo,
                                         const EiemResolvedRenderRule &resolved,
                                         bool allowMeshReplacement = true,
-                                        bool allowPartnerCreation = true) {
+                                        bool allowPartnerCreation = false) {
   (void)methodInfo;
   if (!renderer || !mesh) return false;
   if (!drawRenderer) drawRenderer = renderer;
@@ -4694,7 +4747,6 @@ static bool EiemApplyResolvedRenderRule(void *renderer, void *drawRenderer,
     return false;
 
   if (!EiemCaptureOriginal(renderer, drawRenderer, mesh, rendererType, applyMesh, nullptr, rule.shapeCount != 0)) return false;
-  EiemRememberRuleBinding(renderer, rule);
 
   std::shared_ptr<EiemSkeletonInstance> skeleton;
   bool skeletonReady=true;
@@ -4742,12 +4794,39 @@ static bool EiemApplyResolvedRenderRule(void *renderer, void *drawRenderer,
     void *assignedBones = nullptr;
     std::shared_ptr<const EiemSkinIdentity> skin;
     EiemUnityRef assignedBonesRoot;
+    const bool probeResourceSkin =
+        EiemModEquals(rendererType, "SkinnedMeshRenderer") &&
+        (strstr(asset, "cloth_01") || strstr(asset, "cloth_02")) &&
+        InterlockedIncrement(&s_traceResourceSkinProbeCount) <= 12;
+    EiemSkinProbe::Result sourceSkinProbe;
+    if (probeResourceSkin)
+      sourceSkinProbe = EiemSkinProbe::Measure(drawRenderer);
     char meshError[256] = {};
+    bool skinPaletteReady = false;
     if (EiemBuildMeshResource(rule, &assignedMesh, meshError,
-                              sizeof(meshError), mesh, &skin) && assignedMesh &&
-        (!skin || (EiemModEquals(rendererType,"SkinnedMeshRenderer") &&
-                   (skeleton ? EiemSkeletonMeshBones(*skin,*skeleton,&assignedBones,meshError,sizeof(meshError))
-                             : EiemResolveMeshBones(*skin,renderer,&assignedBones,meshError,sizeof(meshError))))) &&
+                              sizeof(meshError), mesh, &skin) && assignedMesh) {
+      skinPaletteReady = true;
+      if (skin) {
+        // A generated SkinnedMesh carries its own local bone palette.  Unity
+        // requires that palette to agree with the Renderer.bones array at the
+        // moment sharedMesh is assigned.  Mesh-only replacement still keeps
+        // animation and bone ownership in the game: resolve every authored
+        // path against this instance's existing Transform hierarchy and assign
+        // only that managed Transform[]; no Transform or skeleton is created.
+        if (!EiemModEquals(rendererType, "SkinnedMeshRenderer")) {
+          skinPaletteReady = false;
+          strncpy_s(meshError, sizeof(meshError),
+                    "Skinned replacement requires SkinnedMeshRenderer", _TRUNCATE);
+        } else {
+          skinPaletteReady = skeleton
+              ? EiemSkeletonMeshBones(*skin, *skeleton, &assignedBones,
+                                      meshError, sizeof(meshError))
+              : EiemResolveMeshBones(*skin, renderer, &assignedBones,
+                                     meshError, sizeof(meshError));
+        }
+      }
+    }
+    if (assignedMesh && skinPaletteReady &&
         (!assignedBones || (assignedBonesRoot=EiemUnityRef::Capture(assignedBones,false))) &&
         EiemPrepareRendererShapeBinding(renderer,assignedMesh,rendererType,meshError,sizeof(meshError))) {
       // A failed native setter can already have cleared the field. Own the
@@ -4769,13 +4848,32 @@ static bool EiemApplyResolvedRenderRule(void *renderer, void *drawRenderer,
           EiemReadSharedMesh(renderer, rendererType));
       EiemSetReplacementDrawBounds(renderer, rendererType, assignedMesh,
                                    hasSourceBounds ? &sourceBounds : nullptr);
+      if (probeResourceSkin) {
+        EiemSkinProbe::LogResult("[MOD-SKIN-PROBE] stage=source-before",
+                                 sourceSkinProbe);
+        const EiemSkinProbe::Result replacementSkinProbe =
+            EiemSkinProbe::Measure(drawRenderer);
+        EiemSkinProbe::LogResult("[MOD-SKIN-PROBE] stage=replacement-after",
+                                 replacementSkinProbe);
+      }
     }
   }
 
-  // Material edits remain source-Renderer edits and are likewise independent
-  // of skip/mesh. They are applied after the two resource actions above.
+  // A mesh rule is a transaction boundary. Material/submesh and shape edits
+  // describe the replacement Mesh's slot layout; committing them to the
+  // source Renderer after mesh construction failed would corrupt the source
+  // asset and leave a rule that can never be restored consistently. Rules
+  // without mesh= remain ordinary source material edits.
+  const bool resourceCommitted = !applyMesh || meshApplied;
+  if (resourceCommitted)
+    EiemRememberRuleBinding(renderer, rule);
+  else
+    Log("[MOD] %s resource rule not bound after mesh failure: source=%s "
+        "asset=%s mesh=%s",
+        rendererType, source, asset, rule.mesh);
   char error[256] = {};
-  if ((rule.materialCount || rule.submeshCount) && !EiemMaterialSourceInitActive(drawRenderer)) {
+  if ((rule.materialCount || rule.submeshCount) && resourceCommitted &&
+      !EiemMaterialSourceInitActive(drawRenderer)) {
     void *materials = nullptr;
     if (!EiemBuildRendererMaterialsForSource(rule, drawRenderer, &materials,
                                              error,
@@ -4783,15 +4881,28 @@ static bool EiemApplyResolvedRenderRule(void *renderer, void *drawRenderer,
       Log("[MOD] %s material resource failed: source=%s asset=%s section=%s error=%s",
           rendererType, source, asset, rule.section,
           error[0] ? error : "unknown");
-    } else if (materials &&
-               (!EiemCaptureOriginal(renderer, drawRenderer, mesh, rendererType, false, &rule) ||
-                !EiemAssignRendererMaterials(drawRenderer, materials, error, sizeof(error)))) {
-      Log("[MOD] %s material assignment failed: source=%s asset=%s section=%s error=%s",
-          rendererType, source, asset, rule.section,
-          error[0] ? error : "unknown");
+    } else if (materials) {
+      const bool captured = EiemCaptureOriginal(
+          renderer, drawRenderer, mesh, rendererType, false, &rule);
+      const bool assigned = captured && EiemAssignRendererMaterials(
+          drawRenderer, materials, error, sizeof(error));
+      if (!assigned) {
+        Log("[MOD] %s material assignment failed: source=%s asset=%s section=%s error=%s",
+            rendererType, source, asset, rule.section,
+            error[0] ? error : (captured ? "assignment failed" : "capture failed"));
+      } else {
+        Log("[MOD-MATERIAL] applied renderer=%p source=%s asset=%s section=%s slots=%u array=%p stage=resource-rule",
+            drawRenderer, source, asset, rule.section, rule.materialCount,
+            materials);
+      }
     }
+  } else if ((rule.materialCount || rule.submeshCount) && !resourceCommitted) {
+    Log("[MOD] %s resource dependent edits skipped after mesh failure: "
+        "source=%s asset=%s mesh=%s materials=%u submeshes=%u",
+        rendererType, source, asset, rule.mesh, rule.materialCount,
+        rule.submeshCount);
   }
-  if (!applyMesh || meshApplied) {
+  if (resourceCommitted) {
     AcquireSRWLockExclusive(&s_eiemOverrideLock);
     const size_t index = EiemFindOverrideLocked(renderer);
     if (index != SIZE_MAX) EiemUpdateRendererShapes(renderer, rendererType, rule, s_eiemOverrides[index].shapes);
@@ -4848,7 +4959,7 @@ static bool EiemApplyRenderRuleSetToRenderer(
     bool *referenced = nullptr, bool *matched = nullptr,
     const std::vector<std::string> *affected = nullptr,
     std::vector<EiemPhysicsIntent> *physicsIntents = nullptr,
-    bool allowPartnerCreation = true) {
+    bool allowPartnerCreation = false) {
   if (!meshOwner || !drawRenderer || !mesh || !rendererType) return false;
   if (s_eiemCreatingPartner || EiemIsPartnerRenderer(drawRenderer)) return false;
   if (!EiemRendererEligibleForRule(meshOwner, drawRenderer)) return false;
@@ -4907,7 +5018,8 @@ static bool EiemApplyRenderRuleSet(void *model,
                                     const char *stage, bool *referenced = nullptr,
                                     bool *matched = nullptr,
                                     const std::vector<std::string> *affected = nullptr,
-                                    std::vector<EiemPhysicsIntent> *physicsIntents = nullptr) {
+                                    std::vector<EiemPhysicsIntent> *physicsIntents = nullptr,
+                                    bool allowPartnerCreation = false) {
   if (!model || rules.empty() || !EiemOnUnityThread() ||
       !g_gameObject_GetComponentsInChildren || !il2cpp_class_get_type ||
       !il2cpp_type_get_object)
@@ -4947,7 +5059,7 @@ static bool EiemApplyRenderRuleSet(void *model,
       if (mesh && EiemApplyRenderRuleSetToRenderer(
                       root, meshOwner, drawRenderer, mesh, rendererType,
                       nullptr, rules, sourceLabel, referenced, matched, affected,
-                      physicsIntents))
+                      physicsIntents, allowPartnerCreation))
         ++applied;
     }
   };
@@ -4963,11 +5075,13 @@ static bool EiemApplyRenderRuleSet(void *model,
 
 static bool EiemApplyStandaloneRenderRules(void *model, const char *stage,
                                            bool *matched, const std::vector<std::string> *affected,
-                                           std::vector<EiemPhysicsIntent> *physicsIntents) {
+                                           std::vector<EiemPhysicsIntent> *physicsIntents,
+                                           bool allowPartnerCreation) {
   std::vector<EiemModRule> rules;
   EiemFindStandaloneRenderRules(&rules);
   return EiemApplyRenderRuleSet(model, rules, "<mesh identity>", stage, nullptr,
-                                matched, affected, physicsIntents);
+                                matched, affected, physicsIntents,
+                                allowPartnerCreation);
 }
 
 // EntityRenderHelper is the common game-owned assembly boundary for the
@@ -4991,24 +5105,30 @@ static void TraceEntityRenderHelperInitRenderAndMaterial(void *self,
   }
 
   s_eiemEntityRenderHelperInitGuard = true;
+  EiemAdoptUnityThreadFromAssemblyHook(
+      "EntityRenderHelper._InitRenderAndMaterial");
   void *model = nullptr;
   if (g_component_get_gameObject)
     model = Invoke(g_component_get_gameObject, self);
+  if (original) original(self, methodInfo);
+  // The game's implementation must finish RendererInfo/material/visibility
+  // setup before a generated SkinnedMesh is committed.  Applying before the
+  // original call observes a partial bone palette and can produce Unity's
+  // bindpose mismatch error.
   bool applied = false;
   if (model)
     applied = EiemApplyStandaloneRenderRules(
-        model, "EntityRenderHelper._InitRenderAndMaterial-before", nullptr,
+        model, "EntityRenderHelper._InitRenderAndMaterial-after", nullptr,
         nullptr, nullptr);
   if (applied ||
-      EiemRegistrationTraceFirst("entity-helper-init", "before", self,
+      kEiemValidationIdentityProbe &&
+      EiemRegistrationTraceFirst("entity-helper-init", "after", self,
                                  model, nullptr,
                                  InterlockedCompareExchange(
                                      &s_eiemModGeneration, 0, 0)))
     Log("[MOD-ASSEMBLY-v113] boundary=EntityRenderHelper._InitRenderAndMaterial "
-        "helper=%p model=%p partnersApplied=%d", self, model,
+        "helper=%p model=%p resourcesApplied=%d", self, model,
         applied ? 1 : 0);
-
-  if (original) original(self, methodInfo);
   s_eiemEntityRenderHelperInitGuard = false;
 }
 
@@ -5379,8 +5499,9 @@ static bool EiemRegisterBaseModelViewPartInstance(void *part,
   // is what creates the Partners; the surrounding completion hook retries it
   // after the game has populated its arrays.
   EiemRegisterPartnersInBaseModelArrays(part, stage);
-  Log("[MOD-MODEL-PART] completed part=%p path=%s model=%p applied=%d stage=%s",
-      part, path, model, applied ? 1 : 0, stage ? stage : "unknown");
+  if (applied || kEiemValidationIdentityProbe)
+    Log("[MOD-MODEL-PART] completed part=%p path=%s model=%p applied=%d stage=%s",
+        part, path, model, applied ? 1 : 0, stage ? stage : "unknown");
   return applied;
 }
 
@@ -5394,8 +5515,9 @@ static bool EiemRegisterCharUIModelInstance(void *component,
   void *model = Invoke(g_component_get_gameObject, component);
   const bool applied = EiemRegisterAndApplyModelInstance(
       EiemModelOwnerKind::CharUIModel, component, model, nullptr, 0, stage);
-  Log("[MOD-CHAR-UI] completed component=%p model=%p applied=%d stage=%s",
-      component, model, applied ? 1 : 0, stage ? stage : "unknown");
+  if (applied || kEiemValidationIdentityProbe)
+    Log("[MOD-CHAR-UI] completed component=%p model=%p applied=%d stage=%s",
+        component, model, applied ? 1 : 0, stage ? stage : "unknown");
   return applied;
 }
 
@@ -5629,6 +5751,7 @@ static void EiemTraceLodGroupMembers(void *group, void *lods,
 
 static bool EiemReapplyRendererMaterialsAfterCommit(void *renderer,
                                                      const char *stage) {
+  if (!kEiemEnableMaterialLifecycle) return false;
   if (!renderer || EiemMaterialSourceInitActive(renderer) ||
       !EiemOnUnityThread() || !EiemIsSkinnedRenderer(renderer))
     return false;
@@ -5687,6 +5810,10 @@ static void *EiemReadRendererFromMaterialInfo(void *rendererInfo) {
 static void TraceMaterialInfoInit(void *self, void *renderer, void *configs, void *methodInfo) {
   using InitFn = void (*)(void *, void *, void *, void *);
   auto original = (InitFn)s_origMaterialInfoInit;
+  if (!kEiemEnableMaterialLifecycle) {
+    if (original) original(self, renderer, configs, methodInfo);
+    return;
+  }
   bool sourceReady = false;
   {
     EiemMaterialSourceInitScope scope(renderer);
@@ -5779,6 +5906,7 @@ static void TraceLodGroupSetLODs(void *self, void *lods, void *methodInfo) {
 static void EiemTraceSkinArrayItems(const char *boundary, void *owner,
                                     void *array, int32_t lod,
                                     LONG generation) {
+  if (!kEiemValidationIdentityProbe) return;
   const size_t count = EiemManagedArrayLength(array);
   if (!array || count < 2 || count > 64) return;
   const void *lodKey = (const void *)(intptr_t)lod;
@@ -5846,6 +5974,11 @@ static void TraceAssignSkinGo(int32_t lod, void *renderers,
   auto original = (TraceAssignSkinPostFn)s_origAssignSkinGo;
   if (original)
     original(lod, renderers, rootBones, closure, methodInfo);
+  // At this point the game's own AssignSkin has populated the Renderer bone
+  // palette.  Commit resource rules only now, using that completed array.
+  const size_t resourcesApplied =
+      EiemApplyStandaloneRenderRulesToSkinArray(
+          renderers, "NPCAvatarCreatorUtils.AssignSkinGoPost");
   const LONG afterGeneration =
       InterlockedCompareExchange(&s_eiemModGeneration, 0, 0);
   EiemRegistrationTraceArrayBoundary(
@@ -5856,6 +5989,9 @@ static void TraceAssignSkinGo(int32_t lod, void *renderers,
   EiemTraceKnownPartnerArrayMembers(
       "AssignSkinGoPost", nullptr, renderers,
       EiemManagedArrayLength(renderers), afterGeneration);
+  if (resourcesApplied)
+    Log("[MOD-ASSEMBLY-v114] boundary=AssignSkinGoPost resourcesApplied=%zu",
+        resourcesApplied);
 }
 
 static void TraceAssignSkinPost(int32_t lod, void *renderers,
@@ -5868,6 +6004,9 @@ static void TraceAssignSkinPost(int32_t lod, void *renderers,
   auto original = (TraceAssignSkinPostFn)s_origAssignSkinPost;
   if (original)
     original(lod, renderers, rootBones, closure, methodInfo);
+  const size_t resourcesApplied =
+      EiemApplyStandaloneRenderRulesToSkinArray(
+          renderers, "NPCAvatarCreatorUtils.AssignSkinPost");
   EiemRegistrationTraceArrayBoundary(
       "AssignSkinPost", nullptr, renderers, EiemManagedArrayLength(renderers),
       InterlockedCompareExchange(&s_eiemModGeneration, 0, 0), lod);
@@ -5878,6 +6017,9 @@ static void TraceAssignSkinPost(int32_t lod, void *renderers,
       renderers, true, true, "AssignSkinPost");
   EiemSyncPartnerRootBonesFromArray(renderers);
   EiemProbePartnerBoneBindings(nullptr, "assign-skin");
+  if (resourcesApplied)
+    Log("[MOD-ASSEMBLY-v114] boundary=AssignSkinPost resourcesApplied=%zu",
+        resourcesApplied);
 }
 
 static void TraceSetSmrRootBone(void *animator, void *renderers,
@@ -5917,7 +6059,7 @@ static size_t EiemApplyStandaloneRenderRulesToSkinArray(
     void *mesh = EiemReadSharedMesh(renderer, "SkinnedMeshRenderer");
     if (mesh && EiemApplyStandaloneRenderRulesToRenderer(
                     renderer, renderer, mesh, "SkinnedMeshRenderer", nullptr,
-                    stage, true))
+                    stage, false))
       ++applied;
   }
   if (applied)
@@ -5931,14 +6073,16 @@ static void TraceCreateSmsGo(void *assetLoader, void *meshAssets, int32_t lod,
                              void *intList, void **renderers,
                              void **rootBones, bool flag, void *handleMap,
                              bool deferred, void *methodInfo) {
+  EiemAdoptUnityThreadFromAssemblyHook("NPCAvatarCreatorUtils.CreateSMSGO");
   auto original = (TraceCreateSmsGoFn)s_origCreateSmsGo;
   if (original)
     original(assetLoader, meshAssets, lod, goPool, parent, stringList,
              intList, renderers, rootBones, flag, handleMap, deferred,
              methodInfo);
   void *array = renderers ? *renderers : nullptr;
-  EiemApplyStandaloneRenderRulesToSkinArray(
-      array, "NPCAvatarCreatorUtils.CreateSMSGO");
+  // CreateSMS has produced the Renderer objects, but AssignSkin has not yet
+  // supplied their final bones/root state.  Keep this boundary observational;
+  // the resource transaction runs after AssignSkin returns.
   EiemRegisterPartnersInSkinArrays(
       renderers, rootBones,
       InterlockedCompareExchange(&s_eiemModGeneration, 0, 0),
@@ -5962,13 +6106,14 @@ static void TraceCreateSmsPost(void *meshAssets, int32_t lod, void *goPool,
                                void *parent, void *stringList, void *intList,
                                void **renderers, void **rootBones, bool flag,
                                void *methodInfo) {
+  EiemAdoptUnityThreadFromAssemblyHook(
+      "NPCAvatarCreatorUtils.CreateSMSInfoForPostModel");
   auto original = (TraceCreateSmsPostFn)s_origCreateSmsPost;
   if (original)
     original(meshAssets, lod, goPool, parent, stringList, intList, renderers,
              rootBones, flag, methodInfo);
   void *array = renderers ? *renderers : nullptr;
-  EiemApplyStandaloneRenderRulesToSkinArray(
-      array, "NPCAvatarCreatorUtils.CreateSMSInfoForPostModel");
+  // Defer resource writes until the game's AssignSkin boundary completes.
   EiemRegisterPartnersInSkinArrays(
       renderers, rootBones,
       InterlockedCompareExchange(&s_eiemModGeneration, 0, 0),
@@ -6394,9 +6539,6 @@ static void EiemRunModReconcile() {
     Log("[MOD] Reconcile skipped: renderer APIs are not ready");
     return;
   }
-  // Native Physics teardown/collection belongs to this same Unity-thread
-  // transaction. There is no background candidate scan.
-  EiemPhysicsRuntimeBoundary("mod reconcile begin");
   std::vector<EiemModInputEvent> inputs;
   AcquireSRWLockExclusive(&s_eiemInputLock);
   inputs.swap(s_eiemPendingInputs);
@@ -6413,10 +6555,11 @@ static void EiemRunModReconcile() {
   std::vector<std::string> affectedMods;
   const std::vector<std::string> *affected = nullptr;
   bool partnerLinksOnly = false;
+  bool submeshVisibilityOnly = false;
   if (!reload && !inputs.empty()) {
     bool shapesOnly = false;
     if (EiemPrepareInputUpdate(inputs, &next, &affectedMods, &shapesOnly,
-                               &partnerLinksOnly)) {
+                               &partnerLinksOnly, &submeshVisibilityOnly)) {
       if (shapesOnly && !(requests & (uint32_t)EiemModUpdate::Reconcile)) {
         EiemPublishModState(std::move(next));
         EiemReapplyShapeControls(affectedMods);
@@ -6424,6 +6567,33 @@ static void EiemRunModReconcile() {
         EiemRegistrationTraceReconcile(
             "end", requests, generation, inputs.size(), 0, 0,
             GetTickCount64() - reconcileStarted);
+        return;
+      }
+      if (submeshVisibilityOnly &&
+          !(requests & (uint32_t)EiemModUpdate::Reconcile)) {
+        // The source Renderer and its skinning already own the current Mesh.
+        // Rebuild only the visibility variant; do not restore/destroy model
+        // objects or replay Physics just because a key changed a submesh mask.
+        EiemPublishModState(std::move(next));
+        EiemPruneModelInstances();
+        std::vector<EiemModelInstanceState> instances;
+        AcquireSRWLockShared(&s_eiemModelInstanceLock);
+        instances = s_eiemModelInstances;
+        ReleaseSRWLockShared(&s_eiemModelInstanceLock);
+        uint32_t matched = 0;
+        for (const auto &instance : instances) {
+          if (!instance.model || instance.modelRef.Status() != 1) continue;
+          if (EiemApplyStandaloneRenderRules(
+                  instance.model, "submesh visibility key", nullptr,
+                  &affectedMods, nullptr, false))
+            ++matched;
+        }
+        Log("[MOD] Submesh visibility reconcile: models=%zu matched=%u",
+            instances.size(), matched);
+        EiemRefreshShapeTransitionTimer();
+        EiemRegistrationTraceReconcile(
+            "end", requests, generation, inputs.size(), instances.size(),
+            matched, GetTickCount64() - reconcileStarted);
         return;
       }
       affected = &affectedMods;
@@ -6434,6 +6604,11 @@ static void EiemRunModReconcile() {
       return;
     }
   }
+  // Native Physics teardown/collection belongs to this same Unity-thread
+  // transaction. There is no background candidate scan. Lightweight shape
+  // or submesh visibility keys have already returned above and must not enter
+  // this boundary at all.
+  EiemPhysicsRuntimeBoundary("mod reconcile begin");
   s_eiemPhysicsLifecycleTransaction = true;
   EiemDispatchModUpdate(requests, [&] {
     const ULONGLONG phaseStarted = GetTickCount64();
@@ -6550,10 +6725,24 @@ static void *s_origGetAssetPathHash = nullptr;
 static void *s_origGetAssetPathHashWithoutBurst = nullptr;
 static void *s_origResourceLoadAssetInternalHash = nullptr;
 static void *s_origResourceLoadSubAssetInternalHash = nullptr;
+static void *s_origResourceLoadAsyncString = nullptr;
+static void *s_origResourceLoadSubAssetAsyncString = nullptr;
+static void *s_origResourceLoadAsyncHash = nullptr;
+static void *s_origResourceLoadSubAssetAsyncHash = nullptr;
+static void *s_origSimpleAssetLoaderLoadAsync = nullptr;
+static void *s_origMonoEntitySimpleAssetLoaderLoadAsync = nullptr;
+static void *s_origSimpleAssetLoaderTryLoad = nullptr;
+static void *s_origMonoEntitySimpleAssetLoaderTryLoad = nullptr;
+static void *s_origCachedPathAssetLoaderLoadDirect = nullptr;
+static void *s_origCachedPathAssetLoaderTryLoad = nullptr;
 static void *s_origPreloadAutoHash = nullptr;
 static void *s_origAssetProxyHandlePath = nullptr;
 static void *s_origAssetProxyHandleGet = nullptr;
 static void *s_origAssetProxyHandleGetAssetProxy = nullptr;
+static void *s_origAssetProxyLoaderHandlePath = nullptr;
+static void *s_origAssetProxyLoaderHandleGet = nullptr;
+static void *s_origAssetProxyLoaderHandleLoadImmediate = nullptr;
+static void *s_origAssetProxyLoaderHandleAddOnProxyCompleted = nullptr;
 static void *s_origAssetProxyUntrackedPath = nullptr;
 static void *s_origAssetProxyUntrackedGet = nullptr;
 static void *s_assetProxyUntrackedGetAssetProxy = nullptr;
@@ -6575,6 +6764,11 @@ static int64_t s_traceHashPaths[1024] = {};
 static char s_traceHashPathText[1024][768] = {};
 static size_t s_traceHashPathCount = 0;
 static void *s_origStringPathHashGetMapping = nullptr;
+static void *s_origSubMeshInfoGetMesh = nullptr;
+static void *s_origSubMeshInfoSetMesh = nullptr;
+static void *s_origLodMeshAssetsGetSubMeshInfo = nullptr;
+static void *s_origMeshAssetsGetAvatarSlotMeshAssets = nullptr;
+static void *s_origMeshAssetsGetAllAvatarSlotMeshAssets = nullptr;
 
 static bool TraceTakeBudget(volatile LONG *counter, LONG limit) {
   (void)counter;
@@ -7106,6 +7300,7 @@ static int TraceVfsFileRead(void *self, void *buffer, int offset, int count,
                             void *methodInfo) {
   auto original = (TraceVfsReadFn)s_origVfsFileRead;
   int result = original ? original(self, buffer, offset, count, methodInfo) : 0;
+  if (!kEiemValidationVfsCapture) return result;
   if (result <= 0 || !buffer || !TraceMarkStreamFirstRead(self)) return result;
 
   LONG slot = InterlockedIncrement(&s_traceStreamCaptureCount);
@@ -7195,6 +7390,7 @@ typedef int (__fastcall *TraceVfsReadSpanFn)(void *self, void *span,
 static int TraceVfsFileReadSpan(void *self, void *span, void *methodInfo) {
   auto original = (TraceVfsReadSpanFn)s_origVfsFileReadSpan;
   int result = original ? original(self, span, methodInfo) : 0;
+  if (!kEiemValidationVfsCapture) return result;
   if (result <= 0 || !span) return result;
 
   void *data = nullptr;
@@ -7261,9 +7457,46 @@ typedef void *(__fastcall *TraceResourceLoadAssetHashFn)(
 typedef void *(__fastcall *TraceResourceLoadSubAssetHashFn)(
     void *self, int64_t pathHash, void *subAsset, void *type, int category,
     bool immediate, int priority, void *methodInfo);
+// The callback overloads return void and are therefore safe observation
+// boundaries even when FAssetProxyHandle is an IL2CPP value type.  Keep the
+// callback opaque: invoking or wrapping it would change the game's loader
+// ordering, so these probes only record the request and pass through.
+typedef void (__fastcall *TraceResourceLoadAsyncStringFn)(
+    void *self, int32_t logChannel, void *path, void *type, int category,
+    void *callback, int priority, void *methodInfo);
+typedef void (__fastcall *TraceResourceLoadSubAssetAsyncStringFn)(
+    void *self, int32_t logChannel, void *path, void *subAsset, void *type,
+    int category, void *callback, int priority, void *methodInfo);
+typedef void (__fastcall *TraceResourceLoadAsyncHashFn)(
+    void *self, int32_t logChannel, int64_t pathHash, void *type, int category,
+    void *callback, int priority, void *methodInfo);
+typedef void (__fastcall *TraceResourceLoadSubAssetAsyncHashFn)(
+    void *self, int32_t logChannel, int64_t pathHash, void *subAsset,
+    void *type, int category, void *callback, int priority, void *methodInfo);
+typedef void (__fastcall *TraceAssetLoaderAsyncHashFn)(
+    void *self, int64_t pathHash, void *type, void *callback, int priority,
+    void *methodInfo);
+// TryLoad writes the value-type handle through an explicit out pointer and
+// returns bool, so it is safe to observe without guessing the value-return ABI
+// used by Load(...)->FAssetProxyLoaderHandle.
+typedef bool (__fastcall *TraceAssetLoaderTryLoadHashFn)(
+    void *self, int64_t pathHash, void *type, void *outHandle,
+    void *methodInfo);
+typedef void *(__fastcall *TraceCachedLoaderLoadDirectFn)(
+    void *self, void *path, void *type, void *methodInfo);
+typedef bool (__fastcall *TraceCachedLoaderTryLoadStringFn)(
+    void *self, void *path, void *type, void *outHandle, void *methodInfo);
 typedef void (__fastcall *TracePreloadAutoHashFn)(void *self, int64_t pathHash,
                                                    void *methodInfo);
 typedef void *(__fastcall *TraceProxyObjectFn)(void *self, void *methodInfo);
+typedef void (__fastcall *TraceProxyLoaderAddCompletedFn)(
+    void *self, int32_t logChannel, void *callback, void *methodInfo);
+typedef void *(__fastcall *TraceV11DescriptorGetMeshFn)(void *self,
+                                                         void *methodInfo);
+typedef void (__fastcall *TraceV11DescriptorSetMeshFn)(void *self, void *mesh,
+                                                         void *methodInfo);
+typedef void *(__fastcall *TraceLodMeshAssetsGetSubMeshInfoFn)(
+    void *self, int32_t lod, bool gpu, void *methodInfo);
 typedef void *(__fastcall *TraceVfsPathFn)(void *self, void *path,
                                            void *methodInfo);
 typedef void *(__fastcall *TraceVfsPathPosFn)(void *self, void *path,
@@ -7429,6 +7662,176 @@ static void *TraceAssetProxyHandleGetAssetProxy(void *self, void *methodInfo) {
     s_traceReentrant = false;
   }
   return result;
+}
+
+static bool TraceIdentityTextMatchesTyphoea(const char *text) {
+  return text && (strstr(text, "typhoea") || strstr(text, "Typhoea"));
+}
+
+static bool TraceTakeTargetBudget(volatile LONG *counter, LONG limit,
+                                  const char *primary,
+                                  const char *secondary) {
+  if (!kEiemValidationIdentityProbe ||
+      (!TraceIdentityTextMatchesTyphoea(primary) &&
+       !TraceIdentityTextMatchesTyphoea(secondary)))
+    return false;
+  return InterlockedIncrement(counter) <= limit;
+}
+
+static void TraceSubMeshInfoIdentity(void *info, const char *event,
+                                     void *meshOverride) {
+  if (!info || !kEiemValidationIdentityProbe) return;
+  __try {
+    void *nameObject = *(void **)((char *)info + 0x30);
+    char name[192] = {};
+    if (nameObject) ReadStrUtf8(nameObject, name, sizeof(name));
+    if (!TraceIdentityTextMatchesTyphoea(name)) return;
+    void *mesh = meshOverride ? meshOverride
+                              : *(void **)((char *)info + 0x10);
+    const int64_t pathHash = *(int64_t *)((char *)info + 0x28);
+    const int active = *(bool *)((char *)info + 0x58) ? 1 : 0;
+    const int disabled = *(bool *)((char *)info + 0x6D) ? 1 : 0;
+    const int32_t rootBoneId = *(int32_t *)((char *)info + 0x68);
+    Log("[V1.1-DESCRIPTOR] event=%s info=%p name=%s mesh=%p "
+        "meshPathHash=%lld active=%d rendererDisabled=%d rootBoneID=%d",
+        event ? event : "unknown", info, name[0] ? name : "<empty>", mesh,
+        (long long)pathHash, active, disabled, rootBoneId);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+}
+
+static void *TraceV11DescriptorGetMesh(void *self, void *methodInfo) {
+  auto original = (TraceV11DescriptorGetMeshFn)s_origSubMeshInfoGetMesh;
+  void *result = original ? original(self, methodInfo) : nullptr;
+  TraceSubMeshInfoIdentity(self, "SubMeshInfo.get_mesh", result);
+  return result;
+}
+
+static void TraceV11DescriptorSetMesh(void *self, void *mesh, void *methodInfo) {
+  auto original = (TraceV11DescriptorSetMeshFn)s_origSubMeshInfoSetMesh;
+  if (original) original(self, mesh, methodInfo);
+  TraceSubMeshInfoIdentity(self, "SubMeshInfo.set_mesh", mesh);
+}
+
+static void *TraceLodMeshAssetsGetSubMeshInfo(void *self, int32_t lod, bool gpu,
+                                              void *methodInfo) {
+  auto original = (TraceLodMeshAssetsGetSubMeshInfoFn)
+      s_origLodMeshAssetsGetSubMeshInfo;
+  void *result = original ? original(self, lod, gpu, methodInfo) : nullptr;
+  if (!self || !kEiemValidationIdentityProbe) return result;
+  __try {
+    void *nameObject = *(void **)((char *)self + 0x10);
+    char ownerName[192] = {};
+    if (nameObject) ReadStrUtf8(nameObject, ownerName, sizeof(ownerName));
+    if (!TraceIdentityTextMatchesTyphoea(ownerName)) return result;
+    const size_t count = EiemManagedArrayLength(result);
+    Log("[V1.1-DESCRIPTOR] event=NPCAvatarLodMeshAssets.GetSubMeshInfo "
+        "owner=%p ownerName=%s lod=%d gpu=%d array=%p count=%zu",
+        self, ownerName[0] ? ownerName : "<empty>", lod, gpu ? 1 : 0,
+        result, count);
+    if (!result || count > 128) return result;
+    void **items = (void **)((char *)result + IL2CPP_ARRAY_DATA);
+    for (size_t index = 0; index < count; ++index)
+      TraceSubMeshInfoIdentity(items[index], "GetSubMeshInfo.item", nullptr);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+  return result;
+}
+
+static int TraceManagedListCount(void *list) {
+  if (!list) return 0;
+  __try { return *(int *)((char *)list + 0x18); }
+  __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+static void *TraceMeshAssetsListGetter(void *self, void *methodInfo,
+                                       void *originalPtr,
+                                       const char *event) {
+  auto original = (TraceProxyObjectFn)originalPtr;
+  void *result = original ? original(self, methodInfo) : nullptr;
+  if (!self || !kEiemValidationIdentityProbe) return result;
+  __try {
+    void *pathObject = *(void **)((char *)self + 0x20);
+    char path[768] = {};
+    if (pathObject) ReadStrUtf8(pathObject, path, sizeof(path));
+    if (!TraceIdentityTextMatchesTyphoea(path)) {
+      void *nameObject = *(void **)((char *)self + 0x50);
+      if (nameObject) ReadStrUtf8(nameObject, path, sizeof(path));
+    }
+    if (TraceIdentityTextMatchesTyphoea(path))
+      Log("[V1.1-DESCRIPTOR] event=%s assets=%p identity=%s list=%p count=%d",
+          event ? event : "mesh-assets", self, path[0] ? path : "<empty>",
+          result, TraceManagedListCount(result));
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+  return result;
+}
+
+static void *TraceMeshAssetsGetAvatarSlotMeshAssets(void *self,
+                                                    void *methodInfo) {
+  return TraceMeshAssetsListGetter(self, methodInfo,
+      s_origMeshAssetsGetAvatarSlotMeshAssets,
+      "NPCAvatarMeshAssetsSO.GetAvatarSlotMeshAssets");
+}
+
+static void *TraceMeshAssetsGetAllAvatarSlotMeshAssets(void *self,
+                                                       void *methodInfo) {
+  return TraceMeshAssetsListGetter(self, methodInfo,
+      s_origMeshAssetsGetAllAvatarSlotMeshAssets,
+      "NPCAvatarMeshAssetsSO.GetAllAvatarSlotMeshAssets");
+}
+
+static void *TraceAssetProxyLoaderHandlePath(void *self, void *methodInfo) {
+  auto original = (TraceProxyObjectFn)s_origAssetProxyLoaderHandlePath;
+  return original ? original(self, methodInfo) : nullptr;
+}
+
+static void *TraceAssetProxyLoaderHandleGet(void *self, void *methodInfo) {
+  auto original = (TraceProxyObjectFn)s_origAssetProxyLoaderHandleGet;
+  void *result = original ? original(self, methodInfo) : nullptr;
+  if (!kEiemValidationIdentityProbe) return result;
+  char path[768] = {};
+  auto pathGetter = (TraceProxyObjectFn)s_origAssetProxyLoaderHandlePath;
+  if (pathGetter) TraceDescribeString(pathGetter(self, nullptr), path,
+                                       sizeof(path));
+  char objectName[192] = {};
+  TraceReadUnityObjectName(result, objectName, sizeof(objectName));
+  if (TraceIdentityTextMatchesTyphoea(path) ||
+      TraceIdentityTextMatchesTyphoea(objectName))
+    Log("[V1.1-LOADER] event=FAssetProxyLoaderHandle.Get handle=%p "
+        "path=%s object=%p objectName=%s",
+        self, path[0] ? path : "<none>", result,
+        objectName[0] ? objectName : "<empty>");
+  return result;
+}
+
+static void TraceAssetProxyLoaderHandleLoadImmediate(void *self,
+                                                     void *methodInfo) {
+  auto original = (TraceVoidMethodFn)s_origAssetProxyLoaderHandleLoadImmediate;
+  if (original) original(self, methodInfo);
+  if (!kEiemValidationIdentityProbe) return;
+  auto pathGetter = (TraceProxyObjectFn)s_origAssetProxyLoaderHandlePath;
+  char path[768] = {};
+  if (pathGetter) TraceDescribeString(pathGetter(self, nullptr), path,
+                                      sizeof(path));
+  if (TraceIdentityTextMatchesTyphoea(path))
+    Log("[V1.1-LOADER] event=FAssetProxyLoaderHandle.LoadImmediate "
+        "handle=%p path=%s", self, path);
+}
+
+static void TraceAssetProxyLoaderHandleAddOnProxyCompleted(
+    void *self, int32_t logChannel, void *callback, void *methodInfo) {
+  auto original = (TraceProxyLoaderAddCompletedFn)
+      s_origAssetProxyLoaderHandleAddOnProxyCompleted;
+  if (original) original(self, logChannel, callback, methodInfo);
+  if (!kEiemValidationIdentityProbe) return;
+  auto pathGetter = (TraceProxyObjectFn)s_origAssetProxyLoaderHandlePath;
+  char path[768] = {};
+  if (pathGetter) TraceDescribeString(pathGetter(self, nullptr), path,
+                                      sizeof(path));
+  if (TraceIdentityTextMatchesTyphoea(path))
+    Log("[V1.1-LOADER] event=FAssetProxyLoaderHandle.AddOnProxyCompleted "
+        "handle=%p path=%s callback=%p", self, path, callback);
 }
 
 static void *TraceAssetProxyUntrackedGet(void *self, void *methodInfo) {
@@ -7602,20 +8005,23 @@ static void *TraceResourceLoadAssetInternalHash(
                      ? original(self, pathHash, type, category, immediate,
                                 priority, methodInfo)
                      : nullptr;
+  char pathText[768] = {};
+  TraceLookupHashPath(pathHash, pathText, sizeof(pathText));
+  if (!pathText[0] && EiemOnUnityThread())
+    TraceResolveStringPathHashPath(pathHash, pathText, sizeof(pathText));
   if (result) {
-    char pathText[768] = {};
-    TraceLookupHashPath(pathHash, pathText, sizeof(pathText));
     TraceRememberProxyOrigin(result, pathHash, pathText);
   }
   if (!s_traceReentrant && TraceMarkHashFirstSeen(pathHash) &&
-      TraceTakeBudget(&s_traceHashLoadCount, 600)) {
+      TraceTakeTargetBudget(&s_traceHashLoadCount, 120, pathText)) {
     s_traceReentrant = true;
     char typeText[512] = {};
     TraceDescribeObject(type, typeText, sizeof(typeText));
     Log("[RES-TRACE] BundleResourceManager._LoadAssetInternal(hash): "
-        "hash=%lld type=%s category=%d immediate=%d priority=%d result=%p",
-        (long long)pathHash, typeText, category, immediate ? 1 : 0, priority,
-        result);
+        "hash=%lld path=\"%s\" type=%s category=%d immediate=%d "
+        "priority=%d result=%p",
+        (long long)pathHash, pathText[0] ? pathText : "?", typeText,
+        category, immediate ? 1 : 0, priority, result);
     s_traceReentrant = false;
   }
   return result;
@@ -7630,21 +8036,26 @@ static void *TraceResourceLoadSubAssetInternalHash(
                      ? original(self, pathHash, subAsset, type, category,
                                 immediate, priority, methodInfo)
                      : nullptr;
+  char pathText[768] = {};
+  char subAssetText[512] = {};
+  TraceLookupHashPath(pathHash, pathText, sizeof(pathText));
+  if (!pathText[0] && EiemOnUnityThread())
+    TraceResolveStringPathHashPath(pathHash, pathText, sizeof(pathText));
+  TraceDescribeString(subAsset, subAssetText, sizeof(subAssetText));
   if (result) {
-    char pathText[768] = {};
-    TraceLookupHashPath(pathHash, pathText, sizeof(pathText));
     TraceRememberProxyOrigin(result, pathHash, pathText);
   }
-  if (!s_traceReentrant && TraceTakeBudget(&s_traceHashSubAssetCount, 300)) {
+  if (!s_traceReentrant &&
+      TraceTakeTargetBudget(&s_traceHashSubAssetCount, 120, pathText,
+                            subAssetText)) {
     s_traceReentrant = true;
-    char subAssetText[512] = {};
     char typeText[512] = {};
-    TraceDescribeString(subAsset, subAssetText, sizeof(subAssetText));
     TraceDescribeObject(type, typeText, sizeof(typeText));
     Log("[RES-TRACE] BundleResourceManager._LoadSubAssetInternal(hash): "
-        "hash=%lld subAsset=\"%s\" type=%s category=%d immediate=%d "
-        "priority=%d result=%p",
-        (long long)pathHash, subAssetText, typeText, category,
+        "hash=%lld path=\"%s\" subAsset=\"%s\" type=%s category=%d "
+        "immediate=%d priority=%d result=%p",
+        (long long)pathHash, pathText[0] ? pathText : "?", subAssetText,
+        typeText, category,
         immediate ? 1 : 0, priority, result);
     s_traceReentrant = false;
   }
@@ -7785,12 +8196,13 @@ static void TraceAssetFinishWithAsset(void *self, void *asset,
   // replace cached Unity objects; Render rules own all live mutations.
   if (original) original(self, asset, methodInfo);
 
+  char assetName[768] = {};
+  TraceReadAssetName(self, assetName, sizeof(assetName));
   if (!s_traceReentrant &&
-      TraceTakeBudget(&s_traceAssetCompleteCount, 600)) {
+      TraceTakeTargetBudget(&s_traceAssetCompleteCount, 160, logicalPath,
+                            assetName)) {
     s_traceReentrant = true;
     char sourceText[512] = {};
-    char assetName[768] = {};
-    TraceReadAssetName(self, assetName, sizeof(assetName));
     TraceDescribeObject(asset, sourceText, sizeof(sourceText));
     Log("[RES-TRACE] Asset._FinishWithAsset: hash=%lld loader=%p "
         "path=\"%s\" assetName=\"%s\" asset=%s",
@@ -7806,24 +8218,21 @@ static void TraceAssetOnComplete(void *self, void *methodInfo) {
   void *completedAsset = nullptr;
   __try { completedAsset = *(void **)((char *)self + 0xA0); }
   __except (1) { completedAsset = nullptr; }
+  char assetName[768] = {};
+  const int64_t pathHash = TraceReadLoadableHash(self);
+  if (pathHash)
+    TraceLookupHashPath(pathHash, assetName, sizeof(assetName));
+  if (!assetName[0]) TraceReadAssetName(self, assetName, sizeof(assetName));
   if (completedAsset) {
-    char assetName[768] = {};
-    const int64_t pathHash = TraceReadLoadableHash(self);
-    if (pathHash)
-      TraceLookupHashPath(pathHash, assetName, sizeof(assetName));
-    if (!assetName[0]) TraceReadAssetName(self, assetName, sizeof(assetName));
     TraceRememberAssetOrigin(completedAsset, pathHash, assetName);
   }
   if (!s_traceReentrant &&
-      TraceTakeBudget(&s_traceAssetCompleteCount, 600)) {
+      TraceTakeTargetBudget(&s_traceAssetCompleteCount, 160, assetName)) {
     s_traceReentrant = true;
     void *asset = nullptr;
     __try { asset = *(void **)((char *)self + 0xA0); }
     __except (1) { asset = nullptr; }
     char assetText[512] = {};
-    char assetName[768] = {};
-    int64_t pathHash = TraceReadLoadableHash(self);
-    TraceReadAssetName(self, assetName, sizeof(assetName));
     TraceDescribeObject(asset, assetText, sizeof(assetText));
     Log("[RES-TRACE] Asset.OnComplete: hash=%lld loader=%p assetName=\"%s\" "
         "asset=%s",
@@ -7841,16 +8250,15 @@ static void *TraceResourceLoadAssetInternal(
                      ? original(self, path, type, category, immediate,
                                 priority, methodInfo)
                      : nullptr;
+  char pathText[768] = {};
+  TraceDescribeString(path, pathText, sizeof(pathText));
   if (result) {
-    char pathText[768] = {};
-    TraceDescribeString(path, pathText, sizeof(pathText));
     TraceRememberProxyOrigin(result, 0, pathText);
   }
-  if (!s_traceReentrant && TraceTakeBudget(&s_tracePathHashCount, 300)) {
+  if (!s_traceReentrant &&
+      TraceTakeTargetBudget(&s_tracePathHashCount, 120, pathText)) {
     s_traceReentrant = true;
-    char pathText[768] = {};
     char typeText[512] = {};
-    TraceDescribeString(path, pathText, sizeof(pathText));
     TraceDescribeObject(type, typeText, sizeof(typeText));
     Log("[RES-TRACE] BundleResourceManager._LoadAssetInternal: path=\"%s\" "
         "type=%s category=%d immediate=%d priority=%d result=%p",
@@ -7869,18 +8277,18 @@ static void *TraceResourceLoadSubAssetInternal(
                      ? original(self, path, subAsset, type, category,
                                 immediate, priority, methodInfo)
                      : nullptr;
+  char pathText[768] = {};
+  char subAssetText[512] = {};
+  TraceDescribeString(path, pathText, sizeof(pathText));
+  TraceDescribeString(subAsset, subAssetText, sizeof(subAssetText));
   if (result) {
-    char pathText[768] = {};
-    TraceDescribeString(path, pathText, sizeof(pathText));
     TraceRememberProxyOrigin(result, 0, pathText);
   }
-  if (!s_traceReentrant && TraceTakeBudget(&s_tracePathHashCount, 300)) {
+  if (!s_traceReentrant &&
+      TraceTakeTargetBudget(&s_tracePathHashCount, 120, pathText,
+                            subAssetText)) {
     s_traceReentrant = true;
-    char pathText[768] = {};
-    char subAssetText[512] = {};
     char typeText[512] = {};
-    TraceDescribeString(path, pathText, sizeof(pathText));
-    TraceDescribeString(subAsset, subAssetText, sizeof(subAssetText));
     TraceDescribeObject(type, typeText, sizeof(typeText));
     Log("[RES-TRACE] BundleResourceManager._LoadSubAssetInternal: path=\"%s\" "
         "subAsset=\"%s\" type=%s category=%d immediate=%d priority=%d "
@@ -7892,8 +8300,272 @@ static void *TraceResourceLoadSubAssetInternal(
   return result;
 }
 
+static void TraceResourceLoadAsyncString(
+    void *self, int32_t logChannel, void *path, void *type, int category,
+    void *callback, int priority, void *methodInfo) {
+  auto original =
+      (TraceResourceLoadAsyncStringFn)s_origResourceLoadAsyncString;
+  char pathText[768] = {};
+  TraceDescribeString(path, pathText, sizeof(pathText));
+  if (!s_traceReentrant &&
+      TraceTakeTargetBudget(&s_tracePathHashCount, 120, pathText)) {
+    s_traceReentrant = true;
+    char typeText[512] = {};
+    TraceDescribeObject(type, typeText, sizeof(typeText));
+    Log("[RES-TRACE] BundleResourceManager.LoadAsync(string callback): "
+        "channel=%d path=\"%s\" type=%s category=%d priority=%d "
+        "callback=%p", logChannel, pathText[0] ? pathText : "?", typeText,
+        category, priority, callback);
+    s_traceReentrant = false;
+  }
+  if (self) s_eiemResourceManagerInstance = self;
+  if (original)
+    original(self, logChannel, path, type, category, callback, priority,
+             methodInfo);
+}
+
+static void TraceResourceLoadSubAssetAsyncString(
+    void *self, int32_t logChannel, void *path, void *subAsset, void *type,
+    int category, void *callback, int priority, void *methodInfo) {
+  auto original = (TraceResourceLoadSubAssetAsyncStringFn)
+      s_origResourceLoadSubAssetAsyncString;
+  char pathText[768] = {};
+  char subAssetText[512] = {};
+  TraceDescribeString(path, pathText, sizeof(pathText));
+  TraceDescribeString(subAsset, subAssetText, sizeof(subAssetText));
+  if (!s_traceReentrant &&
+      TraceTakeTargetBudget(&s_tracePathHashCount, 120, pathText,
+                            subAssetText)) {
+    s_traceReentrant = true;
+    char typeText[512] = {};
+    TraceDescribeObject(type, typeText, sizeof(typeText));
+    Log("[RES-TRACE] BundleResourceManager.LoadSubAssetAsync(string "
+        "callback): channel=%d path=\"%s\" subAsset=\"%s\" type=%s "
+        "category=%d priority=%d callback=%p", logChannel,
+        pathText[0] ? pathText : "?", subAssetText[0] ? subAssetText : "?",
+        typeText, category, priority, callback);
+    s_traceReentrant = false;
+  }
+  if (self) s_eiemResourceManagerInstance = self;
+  if (original)
+    original(self, logChannel, path, subAsset, type, category, callback,
+             priority, methodInfo);
+}
+
+static void TraceResourceLoadAsyncHash(
+    void *self, int32_t logChannel, int64_t pathHash, void *type, int category,
+    void *callback, int priority, void *methodInfo) {
+  auto original = (TraceResourceLoadAsyncHashFn)s_origResourceLoadAsyncHash;
+  char pathText[768] = {};
+  TraceLookupHashPath(pathHash, pathText, sizeof(pathText));
+  if (!pathText[0] && EiemOnUnityThread())
+    TraceResolveStringPathHashPath(pathHash, pathText, sizeof(pathText));
+  if (!s_traceReentrant &&
+      TraceTakeTargetBudget(&s_traceHashLoadCount, 120, pathText)) {
+    s_traceReentrant = true;
+    char typeText[512] = {};
+    TraceDescribeObject(type, typeText, sizeof(typeText));
+    Log("[RES-TRACE] BundleResourceManager.LoadAsync(hash callback): "
+        "channel=%d hash=%lld path=\"%s\" type=%s category=%d "
+        "priority=%d callback=%p", logChannel, (long long)pathHash,
+        pathText[0] ? pathText : "?", typeText, category, priority, callback);
+    s_traceReentrant = false;
+  }
+  if (self) s_eiemResourceManagerInstance = self;
+  if (original)
+    original(self, logChannel, pathHash, type, category, callback, priority,
+             methodInfo);
+}
+
+static void TraceResourceLoadSubAssetAsyncHash(
+    void *self, int32_t logChannel, int64_t pathHash, void *subAsset,
+    void *type, int category, void *callback, int priority, void *methodInfo) {
+  auto original = (TraceResourceLoadSubAssetAsyncHashFn)
+      s_origResourceLoadSubAssetAsyncHash;
+  char pathText[768] = {};
+  char subAssetText[512] = {};
+  TraceLookupHashPath(pathHash, pathText, sizeof(pathText));
+  if (!pathText[0] && EiemOnUnityThread())
+    TraceResolveStringPathHashPath(pathHash, pathText, sizeof(pathText));
+  TraceDescribeString(subAsset, subAssetText, sizeof(subAssetText));
+  if (!s_traceReentrant &&
+      TraceTakeTargetBudget(&s_traceHashSubAssetCount, 120, pathText,
+                            subAssetText)) {
+    s_traceReentrant = true;
+    char typeText[512] = {};
+    TraceDescribeObject(type, typeText, sizeof(typeText));
+    Log("[RES-TRACE] BundleResourceManager.LoadSubAssetAsync(hash "
+        "callback): channel=%d hash=%lld path=\"%s\" subAsset=\"%s\" "
+        "type=%s category=%d priority=%d callback=%p", logChannel,
+        (long long)pathHash, pathText[0] ? pathText : "?",
+        subAssetText[0] ? subAssetText : "?", typeText, category, priority,
+        callback);
+    s_traceReentrant = false;
+  }
+  if (self) s_eiemResourceManagerInstance = self;
+  if (original)
+    original(self, logChannel, pathHash, subAsset, type, category, callback,
+             priority, methodInfo);
+}
+
+static void TraceSimpleAssetLoaderLoadAsync(
+    void *self, int64_t pathHash, void *type, void *callback, int priority,
+    void *methodInfo) {
+  auto original = (TraceAssetLoaderAsyncHashFn)s_origSimpleAssetLoaderLoadAsync;
+  char pathText[768] = {};
+  TraceLookupHashPath(pathHash, pathText, sizeof(pathText));
+  if (!pathText[0] && EiemOnUnityThread())
+    TraceResolveStringPathHashPath(pathHash, pathText, sizeof(pathText));
+  if (!s_traceReentrant &&
+      TraceTakeTargetBudget(&s_traceHashLoadCount, 120, pathText)) {
+    s_traceReentrant = true;
+    char typeText[512] = {};
+    TraceDescribeObject(type, typeText, sizeof(typeText));
+    Log("[RES-TRACE] SimpleAssetLoader.LoadAsync(hash callback): "
+        "loader=%p hash=%lld path=\"%s\" type=%s priority=%d callback=%p",
+        self, (long long)pathHash, pathText[0] ? pathText : "?", typeText,
+        priority, callback);
+    s_traceReentrant = false;
+  }
+  if (original)
+    original(self, pathHash, type, callback, priority, methodInfo);
+}
+
+static void TraceMonoEntitySimpleAssetLoaderLoadAsync(
+    void *self, int64_t pathHash, void *type, void *callback, int priority,
+    void *methodInfo) {
+  auto original = (TraceAssetLoaderAsyncHashFn)
+      s_origMonoEntitySimpleAssetLoaderLoadAsync;
+  char pathText[768] = {};
+  TraceLookupHashPath(pathHash, pathText, sizeof(pathText));
+  if (!pathText[0] && EiemOnUnityThread())
+    TraceResolveStringPathHashPath(pathHash, pathText, sizeof(pathText));
+  if (!s_traceReentrant &&
+      TraceTakeTargetBudget(&s_traceHashLoadCount, 120, pathText)) {
+    s_traceReentrant = true;
+    char typeText[512] = {};
+    TraceDescribeObject(type, typeText, sizeof(typeText));
+    Log("[RES-TRACE] MonoEntitySimpleAssetLoader.LoadAsync(hash "
+        "callback): loader=%p hash=%lld path=\"%s\" type=%s priority=%d "
+        "callback=%p", self, (long long)pathHash,
+        pathText[0] ? pathText : "?", typeText, priority, callback);
+    s_traceReentrant = false;
+  }
+  if (original)
+    original(self, pathHash, type, callback, priority, methodInfo);
+}
+
+static bool TraceAssetLoaderTryLoadHash(void *self, int64_t pathHash,
+                                        void *type, void *outHandle,
+                                        void *methodInfo, void *originalPtr,
+                                        const char *label) {
+  auto original = (TraceAssetLoaderTryLoadHashFn)originalPtr;
+  const bool result = original
+                          ? original(self, pathHash, type, outHandle,
+                                     methodInfo)
+                          : false;
+  if (!kEiemValidationIdentityProbe || s_traceReentrant ||
+      InterlockedIncrement(&s_traceAssetLoaderTryLoadCount) > 320)
+    return result;
+
+  char pathText[768] = {};
+  TraceLookupHashPath(pathHash, pathText, sizeof(pathText));
+  if (!pathText[0] && EiemOnUnityThread())
+    TraceResolveStringPathHashPath(pathHash, pathText, sizeof(pathText));
+
+  // The output handle is a value type stored at the caller-provided address.
+  // Calling its getter after the original resolves the concrete cache path
+  // without reading the value type's fields or changing ownership.
+  char handlePath[768] = {};
+  auto pathGetter = (TraceProxyObjectFn)s_origAssetProxyLoaderHandlePath;
+  if (result && pathGetter && outHandle) {
+    __try {
+      TraceDescribeString(pathGetter(outHandle, nullptr), handlePath,
+                          sizeof(handlePath));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+      handlePath[0] = '\0';
+    }
+  }
+  char typeText[512] = {};
+  TraceDescribeObject(type, typeText, sizeof(typeText));
+
+  Log("[RES-TRACE] %s: loader=%p hash=%lld path=\"%s\" type=%s "
+      "result=%d outHandle=%p handlePath=\"%s\"",
+      label ? label : "AssetLoader.TryLoad(hash,type,out)", self,
+      (long long)pathHash, pathText[0] ? pathText : "?",
+      typeText[0] ? typeText : "?", result ? 1 : 0, outHandle,
+      handlePath[0] ? handlePath : "?");
+  return result;
+}
+
+static bool TraceSimpleAssetLoaderTryLoad(void *self, int64_t pathHash,
+                                          void *type, void *outHandle,
+                                          void *methodInfo) {
+  return TraceAssetLoaderTryLoadHash(
+      self, pathHash, type, outHandle, methodInfo,
+      s_origSimpleAssetLoaderTryLoad,
+      "SimpleAssetLoader.TryLoad(hash,type,out)");
+}
+
+static bool TraceMonoEntitySimpleAssetLoaderTryLoad(
+    void *self, int64_t pathHash, void *type, void *outHandle,
+    void *methodInfo) {
+  return TraceAssetLoaderTryLoadHash(
+      self, pathHash, type, outHandle, methodInfo,
+      s_origMonoEntitySimpleAssetLoaderTryLoad,
+      "MonoEntitySimpleAssetLoader.TryLoad(hash,type,out)");
+}
+
+static void *TraceCachedPathAssetLoaderLoadDirect(void *self, void *path,
+                                                  void *type,
+                                                  void *methodInfo) {
+  auto original = (TraceCachedLoaderLoadDirectFn)
+      s_origCachedPathAssetLoaderLoadDirect;
+  void *result = original ? original(self, path, type, methodInfo) : nullptr;
+  if (!kEiemValidationIdentityProbe || s_traceReentrant ||
+      InterlockedIncrement(&s_traceCachedLoaderCount) > 240)
+    return result;
+  char pathText[768] = {};
+  TraceDescribeString(path, pathText, sizeof(pathText));
+  char typeText[512] = {};
+  TraceDescribeObject(type, typeText, sizeof(typeText));
+  char resultText[512] = {};
+  TraceDescribeObject(result, resultText, sizeof(resultText));
+  if (!TraceIdentityTextMatchesTyphoea(pathText) &&
+      !TraceIdentityTextMatchesTyphoea(resultText))
+    return result;
+  Log("[RES-TRACE] CachedPathAssetLoader.LoadDirect(string,type): "
+      "loader=%p path=\"%s\" type=%s result=%s", self,
+      pathText[0] ? pathText : "?", typeText[0] ? typeText : "?",
+      resultText[0] ? resultText : "<null>");
+  return result;
+}
+
+static bool TraceCachedPathAssetLoaderTryLoad(void *self, void *path,
+                                              void *type, void *outHandle,
+                                              void *methodInfo) {
+  auto original = (TraceCachedLoaderTryLoadStringFn)
+      s_origCachedPathAssetLoaderTryLoad;
+  const bool result = original
+                          ? original(self, path, type, outHandle, methodInfo)
+                          : false;
+  if (!kEiemValidationIdentityProbe || s_traceReentrant ||
+      InterlockedIncrement(&s_traceCachedLoaderCount) > 240)
+    return result;
+  char pathText[768] = {};
+  TraceDescribeString(path, pathText, sizeof(pathText));
+  if (!TraceIdentityTextMatchesTyphoea(pathText)) return result;
+  char typeText[512] = {};
+  TraceDescribeObject(type, typeText, sizeof(typeText));
+  Log("[RES-TRACE] CachedPathAssetLoader.TryLoad(string,type,out): "
+      "loader=%p path=\"%s\" type=%s result=%d outHandle=%p", self,
+      pathText[0] ? pathText : "?", typeText[0] ? typeText : "?",
+      result ? 1 : 0, outHandle);
+  return result;
+}
+
 static void *TraceAssetBundleLoadAsset1(void *self, void *path,
-                                        void *methodInfo) {
+                                         void *methodInfo) {
   auto original = (TraceLoadAsset1Fn)s_origAssetBundleLoadAsset1;
   void *result = original ? original(self, path, methodInfo) : nullptr;
   if (!s_traceReentrant && TraceTakeBudget(&s_traceLoadAssetCount, 300)) {
@@ -7995,11 +8667,16 @@ static void TraceSkinnedMeshSetSharedMesh(void *self, void *mesh,
   void *retained = EiemReplacementForSourceMesh(self, sourceMesh);
   if (retained) mesh = retained;
   if (original) original(self, mesh, methodInfo);
-  if (!retained && sourceMesh)
-    EiemApplyStandaloneRenderRulesToRenderer(
-        self, self, sourceMesh, "SkinnedMeshRenderer", methodInfo,
-        "SkinnedMeshRenderer.set_sharedMesh", false);
-  if (!s_traceReentrant && TraceTakeBudget(&s_traceSharedMeshCount, 500)) {
+  // This setter is also used while the game's skin/LOD assembly is only
+  // partially populated.  It remains observation/reassertion-only; resource
+  // rules are committed at the completed assembly boundaries instead.
+  char identityText[768] = {};
+  TraceLookupAssetOrigin(mesh, nullptr, identityText,
+                         sizeof(identityText));
+  if (!TraceIdentityTextMatchesTyphoea(identityText))
+    TraceReadUnityObjectName(mesh, identityText, sizeof(identityText));
+  if (!s_traceReentrant &&
+      TraceTakeTargetBudget(&s_traceSharedMeshCount, 180, identityText)) {
     s_traceReentrant = true;
     char rendererText[512] = {};
     char meshText[512] = {};
@@ -8024,14 +8701,16 @@ static void TraceMeshFilterSetSharedMesh(void *self, void *mesh,
   void *retained = EiemReplacementForSourceMesh(self, sourceMesh);
   if (retained) mesh = retained;
   if (original) original(self, mesh, methodInfo);
-  if (!retained && sourceMesh) {
-    void *drawRenderer = EiemFindMeshFilterDrawRenderer(self);
-    if (drawRenderer)
-      EiemApplyStandaloneRenderRulesToRenderer(
-          self, drawRenderer, sourceMesh, "MeshFilter", methodInfo,
-          "MeshFilter.set_sharedMesh", false);
-  }
-  if (!s_traceReentrant && TraceTakeBudget(&s_traceMeshFilterCount, 300)) {
+  // MeshFilter follows the same rule as SkinnedMeshRenderer: do not mutate a
+  // resource from a low-level setter before the owning game assembly returns;
+  // commit only at completed assembly boundaries.
+  char identityText[768] = {};
+  TraceLookupAssetOrigin(mesh, nullptr, identityText,
+                         sizeof(identityText));
+  if (!TraceIdentityTextMatchesTyphoea(identityText))
+    TraceReadUnityObjectName(mesh, identityText, sizeof(identityText));
+  if (!s_traceReentrant &&
+      TraceTakeTargetBudget(&s_traceMeshFilterCount, 120, identityText)) {
     s_traceReentrant = true;
     char rendererText[512] = {};
     char meshText[512] = {};
@@ -8158,15 +8837,29 @@ static void *FindMethodWithParamTypesAndReturnType(
   return nullptr;
 }
 
-// Depends on FindMethodWithParamTypes / FindMethodWithReturnType above.
-#include "eiem_assembly_probe.h"
-
 static void HookTraceMethodWithParamTypes(
     void *klass, const char *methodName, const char *const *paramTypes,
     int paramCount, const char *label, void *detour, void **original) {
   if (!klass) return;
   void *method =
       FindMethodWithParamTypes(klass, methodName, paramTypes, paramCount);
+  if (!method) {
+    Log("[RES-TRACE] %s not found", label);
+    return;
+  }
+  if (Hook(method, label, detour, original))
+    Log("[RES-TRACE] %s observation hook installed", label);
+  else
+    Log("[RES-TRACE] %s hook failed", label);
+}
+
+static void HookTraceMethodWithParamTypesAndReturnType(
+    void *klass, const char *methodName, const char *const *paramTypes,
+    int paramCount, const char *label, const char *returnType, void *detour,
+    void **original) {
+  if (!klass) return;
+  void *method = FindMethodWithParamTypesAndReturnType(
+      klass, methodName, paramTypes, paramCount, returnType);
   if (!method) {
     Log("[RES-TRACE] %s not found", label);
     return;
@@ -8225,8 +8918,11 @@ static void InitIl2CppResourceTrace(void **assemblies, size_t assemblyCount) {
   // blocked (Il2CppDumper cannot resolve this build's registration pointers), and
   // several earlier hooks were guessed wrong, so the exact class names and field
   // offsets are enumerated once here instead.
-  EiemDumpMetadataClasses(assemblies, assemblyCount);
-  EiemInstallPartTableTest(assemblies, assemblyCount);
+  // Metadata enumeration and the part-table mutation are research-only paths.
+  // The former floods the startup log; the latter writes SubMeshInfo.isActive.
+  // Re-enable them only in a dedicated evidence build.
+  Log("[VALIDATION] mode=static-resource-baseline metadata-enumeration=off "
+      "part-table-mutation=off");
   EiemInitUnityLifetime(assemblies, assemblyCount);
   EiemInstallNpcModelOwner(assemblies, assemblyCount);
 
@@ -8239,9 +8935,6 @@ static void InitIl2CppResourceTrace(void **assemblies, size_t assemblyCount) {
       "Beyond.Gameplay.View", "EntityRenderHelper", assemblies,
       assemblyCount);
   if (entityRenderHelperClass) {
-    // Native discovery probe: _ValidRenderers feeds m_allChildrenRenderers.
-    // Installed before the assembly boundary so the first init is observed.
-    EiemInstallAssemblyProbes(entityRenderHelperClass);
     HookTraceMethod(
         entityRenderHelperClass, "_InitRenderAndMaterial", 0,
         "EntityRenderHelper._InitRenderAndMaterial",
@@ -8251,9 +8944,10 @@ static void InitIl2CppResourceTrace(void **assemblies, size_t assemblyCount) {
     Log("[RES-TRACE] Beyond.Gameplay.View.EntityRenderHelper class not found");
   }
 
-  void *assetBundleClass = FindClass("UnityEngine", "AssetBundle", assemblies,
-                                     assemblyCount);
-  if (assetBundleClass) {
+  if (kEiemValidationIdentityProbe) {
+    void *assetBundleClass = FindClass("UnityEngine", "AssetBundle", assemblies,
+                                       assemblyCount);
+    if (assetBundleClass) {
     HookTraceMethod(assetBundleClass, "LoadAsset", 1,
                     "AssetBundle.LoadAsset(string)",
                     (void *)TraceAssetBundleLoadAsset1,
@@ -8281,8 +8975,9 @@ static void InitIl2CppResourceTrace(void **assemblies, size_t assemblyCount) {
                     "AssetBundleCreateRequest.get_assetBundle",
                     (void *)TraceAssetBundleCreateRequestGetAssetBundle,
                     &s_origAssetBundleCreateRequestGetAssetBundle);
-  } else {
-    Log("[RES-TRACE] UnityEngine.AssetBundle not found");
+    } else {
+      Log("[RES-TRACE] UnityEngine.AssetBundle not found");
+    }
   }
 
   // Endfield's RendererInfo owns the source/replacement material arrays and
@@ -8295,9 +8990,13 @@ static void InitIl2CppResourceTrace(void **assemblies, size_t assemblyCount) {
   if (materialRendererInfoClass) {
     const char *infoInitTypes[] = {"UnityEngine.Renderer", "System.Collections.Generic.List<Beyond.Rendering.EntityRendererTypeConfig>"};
     void *infoInit = FindMethodWithParamTypesAndReturnType(materialRendererInfoClass, "_Init", infoInitTypes, 2, "System.Void");
-    if (!infoInit || !Hook(infoInit, "RendererInfo._Init source isolation", (void *)TraceMaterialInfoInit,
-                          &s_origMaterialInfoInit))
-      Log("[MOD-MATERIAL-SOURCE] RendererInfo._Init source isolation unavailable");
+    if (kEiemEnableMaterialLifecycle) {
+      if (!infoInit || !Hook(infoInit, "RendererInfo._Init source isolation", (void *)TraceMaterialInfoInit,
+                            &s_origMaterialInfoInit))
+        Log("[MOD-MATERIAL-SOURCE] RendererInfo._Init source isolation unavailable");
+    } else {
+      Log("[VALIDATION] RendererInfo source isolation disabled");
+    }
     Log("[RES-TRACE] Material RendererInfo renderer field: 0x%X",
         s_materialRendererInfoRendererOffset);
     HookTraceMethod(materialRendererInfoClass, "TrySetSharedMaterial", 1,
@@ -8622,9 +9321,10 @@ static void InitIl2CppResourceTrace(void **assemblies, size_t assemblyCount) {
                   "NPCAvatarCreatorUtils.SetSMRRootBone",
                   (void *)TraceSetSmrRootBone, &s_origSetSmrRootBone);
 
-  void *bundleClass =
-      FindClass("Beyond.Resource.Runtime", "Bundle", assemblies,
-               assemblyCount);
+  if (kEiemValidationIdentityProbe) {
+    void *bundleClass =
+        FindClass("Beyond.Resource.Runtime", "Bundle", assemblies,
+                  assemblyCount);
   HookTraceMethod(bundleClass, "_LoadAssetBundle", 1,
                   "Beyond.Resource.Runtime.Bundle._LoadAssetBundle",
                   (void *)TraceBundleLoadAssetBundle,
@@ -8756,6 +9456,101 @@ static void InitIl2CppResourceTrace(void **assemblies, size_t assemblyCount) {
       (void *)TraceResourceLoadSubAssetInternalHash,
       &s_origResourceLoadSubAssetInternalHash);
 
+  static const char *const loadAsyncStringCallbackTypes[] = {
+      "Beyond.ELogChannel", "System.String", "System.Type",
+      "Beyond.Resource.RootCategory",
+      "System.Action<System.Boolean,Beyond.Resource.FAssetProxyHandle>",
+      "Beyond.Resource.EResourceRequestPriority"};
+  static const char *const loadSubAssetAsyncStringCallbackTypes[] = {
+      "Beyond.ELogChannel", "System.String", "System.String", "System.Type",
+      "Beyond.Resource.RootCategory",
+      "System.Action<System.Boolean,Beyond.Resource.FAssetProxyHandle>",
+      "Beyond.Resource.EResourceRequestPriority"};
+  static const char *const loadAsyncHashCallbackTypes[] = {
+      "Beyond.ELogChannel", "Beyond.Resource.StringPathHash", "System.Type",
+      "Beyond.Resource.RootCategory",
+      "System.Action<System.Boolean,Beyond.Resource.FAssetProxyHandle>",
+      "Beyond.Resource.EResourceRequestPriority"};
+  static const char *const loadSubAssetAsyncHashCallbackTypes[] = {
+      "Beyond.ELogChannel", "Beyond.Resource.StringPathHash", "System.String",
+      "System.Type", "Beyond.Resource.RootCategory",
+      "System.Action<System.Boolean,Beyond.Resource.FAssetProxyHandle>",
+      "Beyond.Resource.EResourceRequestPriority"};
+  HookTraceMethodWithParamTypes(
+      resourceManagerClass, "LoadAsync", loadAsyncStringCallbackTypes, 6,
+      "BundleResourceManager.LoadAsync(string callback)",
+      (void *)TraceResourceLoadAsyncString, &s_origResourceLoadAsyncString);
+  HookTraceMethodWithParamTypes(
+      resourceManagerClass, "LoadSubAssetAsync",
+      loadSubAssetAsyncStringCallbackTypes, 7,
+      "BundleResourceManager.LoadSubAssetAsync(string callback)",
+      (void *)TraceResourceLoadSubAssetAsyncString,
+      &s_origResourceLoadSubAssetAsyncString);
+  HookTraceMethodWithParamTypes(
+      resourceManagerClass, "LoadAsync", loadAsyncHashCallbackTypes, 6,
+      "BundleResourceManager.LoadAsync(hash callback)",
+      (void *)TraceResourceLoadAsyncHash, &s_origResourceLoadAsyncHash);
+  HookTraceMethodWithParamTypes(
+      resourceManagerClass, "LoadSubAssetAsync",
+      loadSubAssetAsyncHashCallbackTypes, 7,
+      "BundleResourceManager.LoadSubAssetAsync(hash callback)",
+      (void *)TraceResourceLoadSubAssetAsyncHash,
+      &s_origResourceLoadSubAssetAsyncHash);
+
+  static const char *const assetLoaderAsyncHashCallbackTypes[] = {
+      "Beyond.Resource.StringPathHash", "System.Type",
+      "System.Action<System.Boolean,Beyond.Resource.FAssetProxyLoaderHandle>",
+      "Beyond.Resource.EResourceRequestPriority"};
+  void *simpleAssetLoaderClass =
+      FindClass("Beyond.Resource", "SimpleAssetLoader", assemblies,
+                assemblyCount);
+  HookTraceMethodWithParamTypes(
+      simpleAssetLoaderClass, "LoadAsync", assetLoaderAsyncHashCallbackTypes,
+      4, "SimpleAssetLoader.LoadAsync(hash callback)",
+      (void *)TraceSimpleAssetLoaderLoadAsync,
+      &s_origSimpleAssetLoaderLoadAsync);
+  static const char *const assetLoaderTryLoadHashTypes[] = {
+      "Beyond.Resource.StringPathHash", "System.Type",
+      "Beyond.Resource.FAssetProxyLoaderHandle&"};
+  HookTraceMethodWithParamTypesAndReturnType(
+      simpleAssetLoaderClass, "TryLoad", assetLoaderTryLoadHashTypes, 3,
+      "SimpleAssetLoader.TryLoad(hash,type,out)", "System.Boolean",
+      (void *)TraceSimpleAssetLoaderTryLoad, &s_origSimpleAssetLoaderTryLoad);
+  void *monoEntitySimpleAssetLoaderClass =
+      FindClass("Beyond.Resource", "MonoEntitySimpleAssetLoader", assemblies,
+                assemblyCount);
+  HookTraceMethodWithParamTypes(
+      monoEntitySimpleAssetLoaderClass, "LoadAsync",
+      assetLoaderAsyncHashCallbackTypes, 4,
+      "MonoEntitySimpleAssetLoader.LoadAsync(hash callback)",
+      (void *)TraceMonoEntitySimpleAssetLoaderLoadAsync,
+      &s_origMonoEntitySimpleAssetLoaderLoadAsync);
+  HookTraceMethodWithParamTypesAndReturnType(
+      monoEntitySimpleAssetLoaderClass, "TryLoad",
+      assetLoaderTryLoadHashTypes, 3,
+      "MonoEntitySimpleAssetLoader.TryLoad(hash,type,out)", "System.Boolean",
+      (void *)TraceMonoEntitySimpleAssetLoaderTryLoad,
+      &s_origMonoEntitySimpleAssetLoaderTryLoad);
+
+  void *cachedPathAssetLoaderClass =
+      FindClass("Beyond.Resource", "CachedPathAssetLoader", assemblies,
+                assemblyCount);
+  static const char *const cachedLoadDirectTypes[] = {
+      "System.String", "System.Type"};
+  HookTraceMethodWithParamTypesAndReturnType(
+      cachedPathAssetLoaderClass, "LoadDirect", cachedLoadDirectTypes, 2,
+      "CachedPathAssetLoader.LoadDirect(string,type)",
+      "UnityEngine.Object", (void *)TraceCachedPathAssetLoaderLoadDirect,
+      &s_origCachedPathAssetLoaderLoadDirect);
+  static const char *const cachedTryLoadTypes[] = {
+      "System.String", "System.Type",
+      "Beyond.Resource.FAssetProxyLoaderHandle&"};
+  HookTraceMethodWithParamTypesAndReturnType(
+      cachedPathAssetLoaderClass, "TryLoad", cachedTryLoadTypes, 3,
+      "CachedPathAssetLoader.TryLoad(string,type,out)", "System.Boolean",
+      (void *)TraceCachedPathAssetLoaderTryLoad,
+      &s_origCachedPathAssetLoaderTryLoad);
+
   void *hashProcessorClass =
       FindClass("Beyond.Resource", "HashStringPathProcessor", assemblies,
                 assemblyCount);
@@ -8807,6 +9602,44 @@ static void InitIl2CppResourceTrace(void **assemblies, size_t assemblyCount) {
     Log("[RES-TRACE] FAssetProxyHandle not found");
   }
 
+  void *proxyLoaderHandleClass =
+      FindClass("Beyond.Resource", "FAssetProxyLoaderHandle", assemblies,
+                assemblyCount);
+  if (proxyLoaderHandleClass) {
+    void *pathMethod = FindMethodWithReturnType(
+        proxyLoaderHandleClass, "get_pathOrName", "System.String", 0);
+    if (pathMethod && Hook(pathMethod, "FAssetProxyLoaderHandle.get_pathOrName",
+                           (void *)TraceAssetProxyLoaderHandlePath,
+                           &s_origAssetProxyLoaderHandlePath))
+      Log("[V1.1] FAssetProxyLoaderHandle.get_pathOrName observation hook installed");
+
+    void *getMethod = FindMethodWithReturnType(
+        proxyLoaderHandleClass, "Get", "UnityEngine.Object", 0);
+    if (getMethod && Hook(getMethod, "FAssetProxyLoaderHandle.Get",
+                          (void *)TraceAssetProxyLoaderHandleGet,
+                          &s_origAssetProxyLoaderHandleGet))
+      Log("[V1.1] FAssetProxyLoaderHandle.Get observation hook installed");
+
+    void *loadImmediate = FindMethodWithReturnType(
+        proxyLoaderHandleClass, "LoadImmediate", "System.Void", 0);
+    if (loadImmediate && Hook(
+            loadImmediate, "FAssetProxyLoaderHandle.LoadImmediate",
+            (void *)TraceAssetProxyLoaderHandleLoadImmediate,
+            &s_origAssetProxyLoaderHandleLoadImmediate))
+      Log("[V1.1] FAssetProxyLoaderHandle.LoadImmediate observation hook installed");
+
+    static const char *const addCompletedTypes[] = {
+        "Beyond.ELogChannel",
+        "System.Action<System.Boolean,Beyond.Resource.FAssetProxyUntrackedHandle>"};
+    HookTraceMethodWithParamTypes(
+        proxyLoaderHandleClass, "AddOnProxyCompleted", addCompletedTypes, 2,
+        "FAssetProxyLoaderHandle.AddOnProxyCompleted",
+        (void *)TraceAssetProxyLoaderHandleAddOnProxyCompleted,
+        &s_origAssetProxyLoaderHandleAddOnProxyCompleted);
+  } else {
+    Log("[V1.1] FAssetProxyLoaderHandle not found");
+  }
+
   void *untrackedClass =
       FindClass("Beyond.Resource", "FAssetProxyUntrackedHandle", assemblies,
                 assemblyCount);
@@ -8840,5 +9673,56 @@ static void InitIl2CppResourceTrace(void **assemblies, size_t assemblyCount) {
                   "Beyond.Resource.Runtime.Asset.OnComplete",
                   (void *)TraceAssetOnComplete, &s_origAssetOnComplete);
 
-  Log("[RES-TRACE] Observation hooks ready; original VFS loading preserved");
+  void *subMeshInfoClass =
+      FindClass("Beyond.NPC.Avatar", "SubMeshInfo", assemblies, assemblyCount);
+  if (subMeshInfoClass) {
+    HookTraceMethod(subMeshInfoClass, "get_mesh", 0,
+                    "SubMeshInfo.get_mesh",
+                    (void *)TraceV11DescriptorGetMesh,
+                    &s_origSubMeshInfoGetMesh);
+    HookTraceMethod(subMeshInfoClass, "set_mesh", 1,
+                    "SubMeshInfo.set_mesh",
+                    (void *)TraceV11DescriptorSetMesh,
+                    &s_origSubMeshInfoSetMesh);
+  } else {
+    Log("[V1.1] SubMeshInfo class not found");
+  }
+
+  void *lodMeshAssetsClass = FindClass(
+      "Beyond.NPC.Avatar", "NPCAvatarLodMeshAssets", assemblies,
+      assemblyCount);
+  if (lodMeshAssetsClass) {
+    static const char *const getSubMeshInfoTypes[] = {
+        "Beyond.NPC.Lod.ELODLevel", "System.Boolean"};
+    HookTraceMethodWithParamTypes(
+        lodMeshAssetsClass, "GetSubMeshInfo", getSubMeshInfoTypes, 2,
+        "NPCAvatarLodMeshAssets.GetSubMeshInfo",
+        (void *)TraceLodMeshAssetsGetSubMeshInfo,
+        &s_origLodMeshAssetsGetSubMeshInfo);
+  } else {
+    Log("[V1.1] NPCAvatarLodMeshAssets class not found");
+  }
+
+  void *meshAssetsClass = FindClass(
+      "Beyond.NPC.Avatar", "NPCAvatarMeshAssetsSO", assemblies,
+      assemblyCount);
+  if (meshAssetsClass) {
+    HookTraceMethod(
+        meshAssetsClass, "GetAvatarSlotMeshAssets", 0,
+        "NPCAvatarMeshAssetsSO.GetAvatarSlotMeshAssets",
+        (void *)TraceMeshAssetsGetAvatarSlotMeshAssets,
+        &s_origMeshAssetsGetAvatarSlotMeshAssets);
+    HookTraceMethod(
+        meshAssetsClass, "GetAllAvatarSlotMeshAssets", 0,
+        "NPCAvatarMeshAssetsSO.GetAllAvatarSlotMeshAssets",
+        (void *)TraceMeshAssetsGetAllAvatarSlotMeshAssets,
+        &s_origMeshAssetsGetAllAvatarSlotMeshAssets);
+  } else {
+    Log("[V1.1] NPCAvatarMeshAssetsSO class not found");
+  }
+
+    Log("[RES-TRACE] Identity observation hooks ready");
+  } else {
+    Log("[RES-TRACE] Identity observation hooks disabled");
+  }
 }

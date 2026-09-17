@@ -15,6 +15,8 @@ bin/
 /Maps/
 /tmp_*
 /tools/_inspect_skel.py
+/_blender_selected_export/
+/_blender_visible_export/
 
 # Pre-deploy plugin binaries kept for quick rollback. These are build outputs,
 # not sources; the corresponding releases live outside the repository.

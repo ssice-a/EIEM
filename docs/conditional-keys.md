@@ -64,6 +64,26 @@ endif
   模板中的 `if` 同样可以使用当前 mod 的变量。
 - `0,1` 就是普通开关；`0,1,2,...` 为多状态循环，不另加 toggle 别名。
 
+合并 Mesh 时可以在条件分支里控制单个 submesh 的显隐：
+
+```ini
+[KeyOutfit]
+key=F6
+type=cycle
+$outfit=0,1
+
+[RenderCloth]
+asset=S_actor_cloth_lod0
+mesh=MeshClothMerged
+if $outfit == 0
+    submesh_visible.2=true
+else
+    submesh_visible.2=false
+endif
+```
+
+`submesh_visible.N=false` 会生成同一 Mesh 的隐藏变体，把第 N 个 submesh 的索引缓冲置空；它不会创建或销毁 Renderer，也不会改变骨骼、LOD 或物理。`true` 恢复正常索引。N 从 0 开始，最多 32 个 submesh。
+
 ## 语法约定
 
 - `[Constants]` 的变量名为 `$` 加英文字母/下划线开头的名称，**区分大小写**，当前 mod 内共享。

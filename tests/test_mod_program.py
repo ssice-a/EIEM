@@ -41,9 +41,14 @@ int main(int argc, char **argv) {
     CHECK(mesh.rules[0].hasMesh && !mesh.rules[0].handling[0]);
     CHECK(parse("[RenderAdd]\npartner.0=RenderExtra\n[RenderExtra]\n", mesh, error));
     CHECK(!mesh.rules[1].hasMesh && mesh.rules[1].partnerCount == 1);
+    EiemModProgram visibility;
+    CHECK(parse("[RenderBody]\nasset=Body\nsubmesh_visible.2=false\n", visibility, error));
+    CHECK(visibility.rules[0].hiddenSubmeshMask == (1u << 2));
+    CHECK(parse("[RenderBody]\nasset=Body\nsubmesh_visible.2=true\n", visibility, error));
+    CHECK(visibility.rules[1].hiddenSubmeshMask == 0);
   } else if (scenario == "invalid") {
     const char *bad[] = {"match.vertices=12garbage", "match.indices=-1", "match.submeshes=99999999999999999",
-      "material.0tail=M", "partner.-1=R", "submesh.1x=0", "submesh.0=no", "handling=clone",
+      "material.0tail=M", "partner.-1=R", "submesh.1x=0", "submesh.0=no", "submesh_visible.32=false", "submesh_visible.0=maybe", "handling=clone",
       "if $toggle", "if $toggle == 1", "if($toggle==1)", "else", "endif"};
     CHECK(parse("[RenderExisting]\nasset=Existing\n", p, error));
     for (const char *line : bad) {

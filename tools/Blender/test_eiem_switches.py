@@ -184,11 +184,11 @@ plan = addon.plan_switch_export(selected)
 package = output / "package"
 bpy.context.scene.eiem_ui_template = True
 stats = addon.export_package(package, selected, [])
-assert stats == {"meshes": 4, "materials": 1, "textures": 0, "skeletons": 0,
+assert stats == {"meshes": 1, "materials": 2, "textures": 0, "skeletons": 0,
                  "physics": 0, "prefabs": 0}, stats
 text = (package / "mod.ini").read_text(encoding="utf-8")
 assert text.count("asset=SourceAsset") >= 1
-assert text.count("handling=skip") == 1
+assert "handling=skip" not in text
 assert text.count("[KeySwitch") == 2
 assert text.count("[KeyShape") == 2
 assert "key=CTRL+ALT+NUMPAD7" in text
@@ -199,9 +199,10 @@ assert "||" in text
 ui = (package / "ui.lua").read_text(encoding="utf-8")
 shape_variable = declarations[0][0]
 assert "imgui.SliderFloat" in ui and ('mod.get("' + shape_variable + '")') in ui
-assert text.count("[Render") == 5
+assert text.count("[Render") == 1
+assert "submesh_visible." in text
 payloads = [addon.read_mesh(p) for p in (package / "meshes").glob("*.mesh")]
-assert sorted(len(p["indices"]) for p in payloads) == [3, 3, 6, 6]
+assert len(payloads) == 1 and len(payloads[0]["indices"]) == 18
 for p in payloads:
     assert len(p["bindposes"]) == 3 and p["bone_hashes"] == [10, 20, 30]
     assert p["bone_paths"] == ["Root", "Tip", "Unused"]
@@ -299,6 +300,6 @@ assert len(addon.plan_switch_export(selected)["groups"]) == 1
 
 # Exported switch conditions are executable EIEM syntax rather than ordinary
 # INI keys.  They must not prevent the same package from being imported again.
-assert addon.import_package(package, clean=True) == 4
+assert addon.import_package(package, clean=True) == 1
 addon.unregister()
 print("EIEM_SWITCHES_OK", stats)

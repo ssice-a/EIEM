@@ -31,5 +31,5 @@
 - 隐藏 Mesh 不等于删除物理骨骼；新增节点必须保留到消费者和原生工作不再引用它们。
 - 自动测试、构建、部署和游戏验收分别记录。源码中的版本字符串不等于已构建或已安装版本。
 
-物理接入的证据和未完成条件以标记为 authoritative 的[原生调查](docs/native-physics-investigation.md)为准，计划不作为验证结果；
+物理接入的历史证据和未完成条件见[原生调查归档](docs/archive/native-physics-investigation.md)，计划不作为验证结果；
 完整作者链路要求见[三端设计契约](docs/physics-authoring-design.md)。

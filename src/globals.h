@@ -5,6 +5,19 @@
 #define EIEM_VERSION_MINOR 2
 #define EIEM_VERSION_PATCH 0
 
+// Stable static-replacement profile. Legacy animation, camera, face and MMD
+// workers stay out of the process so resource assembly has one owner.
+static constexpr bool kEiemStaticReplacementBaseline = true;
+// Resource-level material replacement is independent from the baseline.
+// Keep legacy animation/Partner/physics paths disabled while allowing the
+// game's RendererInfo controller to restore the declared material array after
+// its own initialization or commit.
+static constexpr bool kEiemEnableMaterialLifecycle = true;
+// Enable the identity probe only for a dedicated evidence run. It is
+// intentionally separate from the production baseline.
+static constexpr bool kEiemValidationIdentityProbe = false;
+static constexpr bool kEiemValidationVfsCapture = false;
+
 #define EIEM_STRINGIFY2(x) #x
 #define EIEM_STRINGIFY(x) EIEM_STRINGIFY2(x)
 #define EIEM_VERSION EIEM_STRINGIFY(EIEM_VERSION_MAJOR) "." EIEM_STRINGIFY(EIEM_VERSION_MINOR) "." EIEM_STRINGIFY(EIEM_VERSION_PATCH)

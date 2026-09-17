@@ -12,10 +12,7 @@ SOURCE = r'''
 #include <cstdio>
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL %d: %s\n", __LINE__, #x); return 1; } } while (false)
 static unsigned mask(const EiemModProgram &p) {
-  const auto &r = p.rules[p.standaloneRules[0]];
-  unsigned bits = 0;
-  for (unsigned i = 0; i < r.partnerCount; ++i) if (r.partners[i][0]) bits |= 1u << i;
-  return bits;
+  return p.rules[p.standaloneRules[0]].hiddenSubmeshMask;
 }
 static float shape(const EiemModProgram &p) {
   for (const auto &r : p.rules)
@@ -32,8 +29,9 @@ int main(int argc, char **argv) {
   EiemCompileModProgram(p);
   CHECK(p.standaloneRules.size() == 1);
   const auto &r = p.rules[p.standaloneRules[0]];
-  CHECK(EiemModEquals(r.handling, "skip") && !r.hasMesh);
-  CHECK(mask(p) == 7); // accessory + always + top
+  CHECK(r.hasMesh && EiemModEquals(r.mesh, "MeshSource_MERGED"));
+  CHECK(!EiemModEquals(r.handling, "skip") && r.partnerCount == 0);
+  CHECK(mask(p) == (1u << 3)); // default accessory + top, variant hidden
   EiemKeyChord top, accessory, increase, decrease;
   CHECK(EiemParseKeyChord("Ctrl+Alt+Numpad7", &top));
   CHECK(top.vk == VK_NUMPAD7 && top.modifiers == (MOD_CONTROL | MOD_ALT));
@@ -44,16 +42,16 @@ int main(int argc, char **argv) {
   EiemCycleModKey(p, increase); CHECK(shape(p) == 1); // direction never reverses
   EiemCycleModKey(p, decrease); CHECK(shape(p) == 0);
   EiemCycleModKey(p, decrease); CHECK(shape(p) == 0);
-  EiemCycleModKey(p, top); CHECK(mask(p) == 15); // reordered: variant comes next
-  EiemCycleModKey(p, accessory); CHECK(mask(p) == 14);
-  EiemCycleModKey(p, top); CHECK(mask(p) == 2); // then the empty style
-  EiemCycleModKey(p, accessory); CHECK(mask(p) == 3);
-  EiemCycleModKey(p, top); CHECK(mask(p) == 7);
+  EiemCycleModKey(p, top); CHECK(mask(p) == 0); // variant submesh becomes visible
+  EiemCycleModKey(p, accessory); CHECK(mask(p) == 1);
+  EiemCycleModKey(p, top); CHECK(mask(p) == 13); // empty top style
+  EiemCycleModKey(p, accessory); CHECK(mask(p) == 12);
+  EiemCycleModKey(p, top); CHECK(mask(p) == 8);
   EiemModProgram off;
   CHECK(EiemModParseFile(argv[2], off, &error));
   EiemCompileModProgram(off);
-  CHECK(mask(off) == 3);
-  EiemCycleModKey(off, top); CHECK(mask(off) == 7);
+  CHECK(mask(off) == 12);
+  EiemCycleModKey(off, top); CHECK(mask(off) == 8);
   puts("EIEM_BLENDER_DLL_SWITCHES_OK");
 }
 '''
