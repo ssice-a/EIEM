@@ -2,6 +2,16 @@
 
 This project uses the following third-party components:
 
+## AnimeStudio
+
+- **Author/upstream:** Escartem and AnimeStudio contributors
+- **License:** MIT
+- **Source:** https://github.com/Escartem/AnimeStudio
+
+EIEM's Endfield VFS browser and extraction integration is based on a pinned
+AnimeStudio fork. The corresponding upstream `LICENSE` file is included in
+the extractor package.
+
 ## MinHook
 
 - **Author:** Tsuda Kageyu

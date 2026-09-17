@@ -61,5 +61,6 @@ Typhoea 的 body_01 / cloth_01 / cloth_02 虽然共用同一套
 同一源 asset 的不同 LOD 级别**不能合进同一个子网格集合**：游戏切换 LOD 时
 会整组换 renderer 或换 mesh，混在一起的几何会跟着一起消失或一起露出。
 
-当前 mod 只供应 LOD0，所以尚未触发。加入 LOD1/2/3 之后，合并必须按
-"每个 LOD 级别内部合并"来做。
+Blender 导出器的 LOD 模板功能已经按“每个 LOD 级别内部合并”执行：LOD0、LOD1 等
+分别生成独立 Mesh/Render 规则，不能跨级别共享顶点缓冲或子网格集合。缺失的目标 LOD
+不会生成对应 INI 规则，切换变量仍可在各级 Render 中复用。

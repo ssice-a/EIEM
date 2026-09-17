@@ -8,6 +8,37 @@ Brings MMD animation playback to *Arknights: Endfield*. Supports muscle-driven b
 
 example: [bilibili](https://www.bilibili.com/video/BV1YdEC6bEfP/)
 
+## v1.0.0 Resource Replacement
+
+v1.0.0 is the first resource-replacement release. Mesh, material, and texture rules enter the game's existing Renderer assembly path, leaving animation, skinning, LOD, and instance lifetime under the game's own systems.
+
+### Available now
+
+- Replace Mesh, materials, textures, and declared material parameters by resource identity.
+- Attach one merged Mesh to the target Renderer with multiple submeshes and material slots.
+- Use the same resource rules for world characters, character UI, and NPC instances without creating an independent Partner.
+- F10 hot reload updates existing instances and keeps the previous valid generation when parsing fails.
+- `cycle` toggles once per press; `hold` continuously moves shape values while held. Mod state is isolated per Mod.
+- Blender 0.32.0 supports LOD0-4 selection/template replication and selected Mesh-only export with materials and textures while skipping skeleton and physics export.
+- LOD export only targets levels discovered in the current project; each level gets an independent Mesh/Render rule while sharing the same switch state.
+
+### TODO
+
+- Unified registration of added skeletons across world, UI, and NPC instances.
+- Native-factory integration for physics bones, colliders, and physics parameters.
+- Regression coverage and automated release validation across more game versions.
+
+### Upstream acknowledgements
+
+- [AnimeStudio](https://github.com/Escartem/AnimeStudio) and its contributors provide the Unity asset browser, VFS access, dependency resolution, and export foundation. EIEM maintains the Endfield integration plus the Blender and DLL layers on top of it. AnimeStudio is MIT-licensed and its license is included with the extractor package.
+- Copyright and license information for [MinHook](https://github.com/TsudaKageyu/minhook), [Dear ImGui](https://github.com/ocornut/imgui), and other dependencies is in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
+
+Release packages:
+
+- `EIEM_v1.0.0_dll.zip`: DLL, proxy loaders, and configuration template.
+- `EIEM_Blender_v0.32.0.zip`: Blender add-on.
+- `EIEM_Extractor_v1.0.0_win-x64.zip`: AnimeStudio extractor and EIEM extraction helpers.
+
 ## User Agreement & Disclaimer
 
 <details>

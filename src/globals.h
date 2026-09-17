@@ -1,8 +1,8 @@
 #pragma once
 #include <atomic>
 
-#define EIEM_VERSION_MAJOR 0
-#define EIEM_VERSION_MINOR 2
+#define EIEM_VERSION_MAJOR 1
+#define EIEM_VERSION_MINOR 0
 #define EIEM_VERSION_PATCH 0
 
 // Stable static-replacement profile. Legacy animation, camera, face and MMD

@@ -1,6 +1,6 @@
 # 资源替换重构设计
 
-状态：静态 Mesh、Material、Texture 基线已实机验收；按键、F10、Skeleton 和 Physics 仍按阶段推进。
+状态：v1.0.0 已完成静态 Mesh、Material、Texture、按键显隐和 F10 热重载的实机验收；Skeleton、Physics 和碰撞体继续作为后续阶段。
 
 本文定义 DLL 端资源替换的现行边界。2026-09-15 至 2026-09-17 的探针、部署和 PFB 对比记录保存在[验证归档](archive/resource-replacement-validation-20260915-17.md)，不作为当前行为的直接说明。
 
@@ -26,7 +26,7 @@ EIEM 需要支持：
 |---|---|---|
 | 大世界 | `BaseModelViewPart`、`EntityRenderHelper`、`RendererInfo` | 在游戏装配边界识别并应用规则 |
 | 角色 UI | `UIModelLoader`、`CharUIModelMono`、`RendererInfo` | 注册 UI owner，并复用相同资源规则 |
-| NPC | `CreateSMSGO`、`CreateSMSInfoForPostModel`、`AssignSkin`、`StartNPC` | 等待原生 skin 完成，注册并应用相同规则 |
+| NPC | `CreateSMSGO`、`CreateSMSInfoForPostModel`、`AssignSkin`、`StartNPC` | 原生 skin 完成后注册并应用相同资源规则，v1.0.0 已实机通过 |
 
 三端需要轻量 owner 适配器，但不能各自实现一套 Mesh、材质或状态语义。
 
@@ -124,7 +124,7 @@ DLL 只登记游戏创建的实例，并在游戏 owner 释放边界忘记登记
 
 首选游戏原生 submesh/部件可见性输入。当前验证路径在同一个已装配 Mesh 上原地更新目标 submesh 的索引：隐藏时写入空索引，显示时从资源代际缓存恢复原始索引。按键不更换 `sharedMesh`，顶点、骨骼槽位、bindpose、材质槽、LOD、`bones[]`、`rootBone`、Animator 和 Physics 均保持不变。
 
-DLL 已将 Mod 按键输入泵与旧动画、GUI、相机和更新线程分离，并通过最小窗口过程把事件送到 Unity 线程。submesh 更新在 Physics 生命周期边界前返回，不创建或销毁 Partner。2026-09-17 已部署 F6 单 submesh 测试，尚待世界、角色 UI、NPC 的实机验收。
+DLL 已将 Mod 按键输入泵与旧动画、GUI、相机和更新线程分离，并通过最小窗口过程把事件送到 Unity 线程。submesh 更新在 Physics 生命周期边界前返回，不创建或销毁 Partner。v1.0.0 已完成世界、角色 UI、NPC 三端实机验收。
 
 ## 5. F10 热重载
 
@@ -167,7 +167,7 @@ F10 不得把“恢复所有旧覆盖、逐 Renderer 重放、重建 Partner/Phy
 |---|---|---|---|
 | 0 | 清理研究 Hook 和日志 | 已完成 | 诊断探针默认关闭，测试和构建通过 |
 | 1 | 静态 Mesh/Material/Texture | 已实机通过 | 三条目标 Render、三端实例使用相同规则且稳定 |
-| 2 | 按键显隐 | 原地索引更新已实现，待实机验收 | Mesh、Renderer 和 skin/Physics 指针不变，只更新目标 submesh 索引 |
+| 2 | 按键显隐 | 原地索引更新已实机通过 | Mesh、Renderer 和 skin/Physics 指针不变，只更新目标 submesh 索引 |
 | 3 | F10 统一资源代际 | 事务预检完成，资源回放待收敛 | 已有实例一致更新，失败可回滚，旧代际可退休 |
 | 4 | 材质参数热更新 | 待验收 | 只影响声明槽位，不污染共享对象 |
 | 5 | Skeleton/Physics/碰撞体 | 待取证 | 三端原生消费入口和释放边界均有证据 |

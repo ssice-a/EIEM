@@ -9,6 +9,37 @@ Mod 制作工具、现行契约与工作区状态：[文档索引](docs/README.m
 演示动画: [bilibili](https://www.bilibili.com/video/BV1YdEC6bEfP/)
 交流群：1036919766
 
+## v1.0.0 资源级替换
+
+v1.0.0 是资源替换第一阶段的发布版本。它把 Mesh、材质和贴图替换接入游戏已有的 Renderer 装配路径，保留游戏自己的动画、蒙皮、LOD 和实例生命周期。
+
+### 当前可以做到
+
+- 按资源身份替换 Mesh、材质、贴图和已声明的材质参数。
+- 一个目标 Renderer 装配合并 Mesh，支持多个 submesh 和多个材质槽。
+- 世界角色、角色 UI 和 NPC 使用同一套资源规则，不创建独立 Partner。
+- F10 热重载更新已存在实例；解析失败时保留上一代有效配置。
+- `cycle` 一按一切换，`hold` 按住连续改变形态值；Mod 之间的状态彼此隔离。
+- Blender 0.32.0 插件支持 LOD0-4 选择与模板复制、选中 Mesh-only 导出，包含材质和贴图，跳过骨架与物理导出。
+- LOD 导出只针对当前工程实际发现的级别；每个 LOD 生成独立 Mesh/Render 规则，并复用同一切换状态。
+
+### TODO
+
+- 骨架新增与跨世界/UI/NPC 实例的统一注册。
+- 物理骨骼、碰撞体和物理参数接入游戏原生工厂与生命周期。
+- 更多游戏版本的资源契约回归和发布包自动化验证。
+
+### 上游鸣谢
+
+- [AnimeStudio](https://github.com/Escartem/AnimeStudio) 及其历史贡献者：提供 Unity 资源浏览、VFS 读取、依赖解析和导出基础；EIEM 的 Endfield 适配与 Blender/DLL 集成在此基础上维护。上游使用 MIT 许可证，随解包包附带其许可证文件。
+- [MinHook](https://github.com/TsudaKageyu/minhook)、[Dear ImGui](https://github.com/ocornut/imgui) 及其他依赖的版权与许可证见 [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES)。
+
+发布包：
+
+- `EIEM_v1.0.0_dll.zip`：DLL、代理加载器和配置模板。
+- `EIEM_Blender_v0.32.0.zip`：Blender 插件。
+- `EIEM_Extractor_v1.0.0_win-x64.zip`：AnimeStudio 解包程序与 EIEM 解包辅助脚本。
+
 ## 用户协议与免责声明
 
 <details>

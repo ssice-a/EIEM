@@ -21,17 +21,47 @@ jobs:
         cmd /c build.bat
 
     - name: Package Release
+      shell: pwsh
       run: |
-        mkdir release_pkg
-        copy bin\eiem.dll release_pkg\
-        copy bin\d3dcompiler_47.dll release_pkg\
-        copy bin\vulkan-1.dll release_pkg\
-        Compress-Archive -Path release_pkg\* -DestinationPath "EIEM_${{ github.ref_name }}.zip"
+        $tag = "${{ github.ref_name }}"
+        $releaseRoot = "release_pkg"
+        $dllRoot = Join-Path $releaseRoot "dll"
+        $blenderRoot = Join-Path $releaseRoot "blender"
+        New-Item -ItemType Directory -Force -Path $dllRoot, $blenderRoot | Out-Null
+
+        Copy-Item bin\eiem.dll, bin\d3dcompiler_47.dll, bin\vulkan-1.dll, bin\eiem.ini, bin\LUA-LICENSE.txt, LICENSE, THIRD_PARTY_NOTICES -Destination $dllRoot
+        Compress-Archive -Path "$dllRoot\*" -DestinationPath "EIEM_${tag}_dll.zip" -Force
+
+        Get-ChildItem tools\Blender -File |
+          Where-Object { $_.Name -notlike "test_*" } |
+          Copy-Item -Destination $blenderRoot
+        Copy-Item LICENSE, THIRD_PARTY_NOTICES -Destination $blenderRoot
+        Compress-Archive -Path "$blenderRoot\*" -DestinationPath "EIEM_Blender_v0.32.0.zip" -Force
+
+        # AnimeStudio is maintained as a pinned, local fork and is deliberately
+        # not checked into this repository. A verified prebuilt extractor can be
+        # supplied to the tag runner as release/EIEM_Extractor_v1.0.0_win-x64.zip.
+        # Do not manufacture a misleading source-only archive when it is absent.
+        $extractorZip = "EIEM_Extractor_v1.0.0_win-x64.zip"
+        if (Test-Path (Join-Path "release" $extractorZip)) {
+          Copy-Item (Join-Path "release" $extractorZip) $extractorZip
+        }
 
     - name: Publish to GitHub Releases
       uses: softprops/action-gh-release@v2
       with:
-        files: EIEM_${{ github.ref_name }}.zip
+        files: |
+          EIEM_${{ github.ref_name }}_dll.zip
+          EIEM_Blender_v0.32.0.zip
         generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Attach verified extractor package
+      if: ${{ hashFiles('EIEM_Extractor_v1.0.0_win-x64.zip') != '' }}
+      uses: softprops/action-gh-release@v2
+      with:
+        files: EIEM_Extractor_v1.0.0_win-x64.zip
+        tag_name: ${{ github.ref_name }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

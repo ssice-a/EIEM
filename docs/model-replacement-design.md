@@ -119,6 +119,8 @@ render.0=RenderBody
 - Hook 安装日志只会在进程启动时出现一次。判断某个实例是否执行规则，应查看该 Renderer 的
   `resource rule applied` 或模型的 `actions=N`，不能等待第二条 Hook 安装日志。
 - LOD 是不同的 Mesh asset。只声明 `asset=..._lod0` 不会同时匹配 `lod1`、`lod2` 或 `lod3`。
+  Blender 导出器可从已导入资源发现实际存在的 LOD，并为勾选级别生成各自的精确
+  `asset=` Render 规则；运行时仍不使用通配匹配。
 
 普通 Blender 导出只需生成带 `asset=` 的 Render；保留或省略 PFB 关系都不改变运行时命中范围。
 

@@ -20,6 +20,7 @@ bin/
 # fixtures/probes, not source-controlled assets.
 /_blender_*/
 /_test_output/
+/release/
 
 # Pre-deploy plugin binaries kept for quick rollback. These are build outputs,
 # not sources; the corresponding releases live outside the repository.

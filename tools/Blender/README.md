@@ -7,7 +7,7 @@
 目录只需要：
 
 - `__init__.py`：插件发现和注册入口，包含 Blender 要求的 `bl_info`。
-- `eiem_blender_addon.py`：导入、编辑、导出入口，仓库源码版本 0.31.0。
+- `eiem_blender_addon.py`：导入、编辑、导出入口，仓库源码版本 0.32.0。
 - `eiem_blender_controls.py`：形态键与网格切换的作者数据、预览和导出计划，必须一起分发。
 - `eiem_physics_authoring.py`、`eiem_physics_document.py`：Physics 面板、辅助体和资源读写，必须一起分发。
 - `eiem_physics_native.py`、`eiem_physics_source.py`：源物理图保留、编辑和独立 v2 导出，必须一起分发。
@@ -32,6 +32,7 @@ Blender: Start 会重新发现入口。不要同时手动运行单文件版，�
 - 导入选择 AnimeStudio 离线导出的 EIEM 资源目录中的 `mod.ini`，不是单独的
   FBX，也不是只含一个修改网格的游戏测试 mod。
 - 按资源导入网格、共享骨架和 LOD 集合；保存 `.blend` 作为编辑工程。
+- 导出面板可选择 `LOD0` 到 `LOD4`，或导出当前工程已发现的全部 LOD。选中的 Mesh 作为模板复制到目标级别；缺失级别不生成规则，详情见 [LOD 导出](../../docs/blender-lod-export.md)。
 - 修改网格、材质、贴图；需要按键切换时，选网格，在 N → EIEM 中创建切换组，
   录制快捷键。只调整整组的眼睛显隐后记录款式快照；同一网格可在同组多个款式中可见。
   支持主键盘、小键盘数字与运算键，以及 `Ctrl/Shift/Alt` 修饰键组合；小键盘 Enter 与普通 Enter
@@ -152,7 +153,7 @@ MOVE 骨段的半角为 `limitAngle.value × curve(depth)`。这里的 depth 与
 
 原生源球体/胶囊现在可转为作者 v5 碰撞记录并进入组合 Mod；无限平面与完整原生 v2 图仍只用于导入、可视化、
 复制和独立保存。常规 Mesh 与作者物理均按选择增量输出，不以 PFB 限定消费者。
-0.31.0 的运行文件同步后，已运行的 Blender 会话需要执行 **Blender: Reload Addons** 才会载入新版。
+0.32.0 的运行文件同步后，已运行的 Blender 会话需要执行 **Blender: Reload Addons** 才会载入新版。
 旧 ZIP 和已经打开的 `.blend` 不会自行改写；旧场景可用上面的整理操作迁移物理集合。
 
 ## UV 接缝与导出顶点（0.8.2）
