@@ -8,6 +8,8 @@
 static SRWLOCK s_eiemModLock = SRWLOCK_INIT;
 static EiemModProgram s_eiemModProgram;
 static volatile LONG s_eiemModGeneration = 0;
+static volatile LONG s_eiemModControlGeneration = 0;
+static std::string s_eiemSelectedModPath;
 static EiemPersistentStore s_eiemPersistentStates;
 
 static bool EiemModAffected(const char *path, const std::vector<std::string> *mods) {
@@ -16,21 +18,129 @@ static bool EiemModAffected(const char *path, const std::vector<std::string> *mo
   return false;
 }
 
-static std::vector<EiemKeyChord> EiemGetModKeyChords(LONG *generation, bool uiFocus = false) {
-  std::vector<EiemKeyChord> result;
+struct EiemModControlSnapshot {
+  std::string modPath;
+  std::vector<EiemModKey> keys;
+  EiemVariables variables;
+  bool selected = false;
+};
+
+static bool EiemSelectableMod(const EiemModState &state) {
+  return !state.keys.empty();
+}
+
+// Caller owns s_eiemModLock exclusively.
+static void EiemReconcileControlledModLocked() {
+  std::string next;
+  for (const auto &state : s_eiemModProgram.states) {
+    if (!EiemSelectableMod(state)) continue;
+    if (EiemModEquals(state.path.c_str(), s_eiemSelectedModPath.c_str())) {
+      next = state.path;
+      break;
+    }
+    if (next.empty()) next = state.path;
+  }
+  const bool changed = !EiemModEquals(next.c_str(), s_eiemSelectedModPath.c_str());
+  s_eiemSelectedModPath = std::move(next);
+  if (changed) InterlockedIncrement(&s_eiemModControlGeneration);
+}
+
+static bool EiemSelectControlledMod(const std::string &modPath) {
+  bool found = false, changed = false;
+  AcquireSRWLockExclusive(&s_eiemModLock);
+  for (const auto &state : s_eiemModProgram.states) {
+    if (!EiemSelectableMod(state) ||
+        !EiemModEquals(state.path.c_str(), modPath.c_str()))
+      continue;
+    found = true;
+    changed = !EiemModEquals(state.path.c_str(), s_eiemSelectedModPath.c_str());
+    s_eiemSelectedModPath = state.path;
+    break;
+  }
+  if (changed) InterlockedIncrement(&s_eiemModControlGeneration);
+  ReleaseSRWLockExclusive(&s_eiemModLock);
+  return found;
+}
+
+static std::string EiemGetSelectedModPath() {
   AcquireSRWLockShared(&s_eiemModLock);
-  *generation = s_eiemModGeneration;
-  for (const auto &state : s_eiemModProgram.states) for (const auto &key : state.keys)
-    if (EiemKeyInScope(key.scope,uiFocus) && std::find(result.begin(), result.end(), key.chord) == result.end()) result.push_back(key.chord);
+  std::string result = s_eiemSelectedModPath;
   ReleaseSRWLockShared(&s_eiemModLock);
   return result;
 }
 
+static std::vector<EiemModControlSnapshot> EiemGetModControls(
+    LONG *generation, LONG *controlGeneration) {
+  std::vector<EiemModControlSnapshot> result;
+  AcquireSRWLockShared(&s_eiemModLock);
+  if (generation) *generation = s_eiemModGeneration;
+  if (controlGeneration) *controlGeneration = s_eiemModControlGeneration;
+  for (const auto &state : s_eiemModProgram.states) {
+    if (!EiemSelectableMod(state)) continue;
+    result.push_back({state.path, state.keys, state.variables,
+                      EiemModEquals(state.path.c_str(),
+                                    s_eiemSelectedModPath.c_str())});
+  }
+  ReleaseSRWLockShared(&s_eiemModLock);
+  return result;
+}
+
+struct EiemModHotkeyBinding {
+  EiemKeyChord chord;
+  EiemModKeyBehavior behavior = EiemModKeyBehavior::Cycle;
+};
+
+static std::vector<EiemModHotkeyBinding> EiemGetModKeyBindings(
+    LONG *generation, LONG *controlGeneration, std::string *modPath,
+    bool uiFocus = false) {
+  std::vector<EiemModHotkeyBinding> result;
+  AcquireSRWLockShared(&s_eiemModLock);
+  if (generation) *generation = s_eiemModGeneration;
+  if (controlGeneration) *controlGeneration = s_eiemModControlGeneration;
+  if (modPath) *modPath = s_eiemSelectedModPath;
+  for (const auto &state : s_eiemModProgram.states) {
+    if (!EiemModEquals(state.path.c_str(), s_eiemSelectedModPath.c_str()))
+      continue;
+    for (const auto &key : state.keys)
+      if (EiemKeyInScope(key.scope,uiFocus)) {
+        auto existing = std::find_if(result.begin(), result.end(),
+            [&](const auto &binding) { return binding.chord == key.chord; });
+        if (existing == result.end())
+          result.push_back({key.chord, key.behavior});
+        else if (key.behavior == EiemModKeyBehavior::Hold)
+          existing->behavior = EiemModKeyBehavior::Hold;
+      }
+  }
+  ReleaseSRWLockShared(&s_eiemModLock);
+  return result;
+}
+
+static std::vector<EiemKeyChord> EiemGetModKeyChords(
+    LONG *generation, LONG *controlGeneration, std::string *modPath,
+    bool uiFocus = false) {
+  std::vector<EiemKeyChord> result;
+  for (const auto &binding : EiemGetModKeyBindings(
+           generation, controlGeneration, modPath, uiFocus))
+    result.push_back(binding.chord);
+  return result;
+}
+
+static std::vector<EiemKeyChord> EiemGetModKeyChords(
+    LONG *generation, bool uiFocus = false) {
+  LONG controlGeneration = 0;
+  std::string modPath;
+  return EiemGetModKeyChords(generation, &controlGeneration, &modPath,
+                             uiFocus);
+}
+
 struct EiemModInputEvent {
   EiemKeyChord chord; LONG generation;
-  std::string modPath, uiSection; // empty for a key event
+  std::string modPath, uiSection;
   EiemVariables values; // one successful Lua frame, committed atomically
   bool uiFocus = false; // focus at key dispatch; used only by generic Key scope
+  std::string keySection; // non-empty when the manager invokes one Key section
+  bool holdTick = false; // true for polling ticks; cycle keys ignore these
+  double holdSeconds = 0.02;
 };
 
 struct EiemUiSnapshot {
@@ -102,11 +212,20 @@ static bool EiemSameRenderWithoutSubmeshVisibility(EiemModRule a,
   return memcmp(&a, &b, sizeof(a)) == 0;
 }
 
+struct EiemSubmeshVisibilityChange {
+  std::string modPath;
+  std::string section;
+  uint32_t beforeMask = 0;
+  uint32_t afterMask = 0;
+};
+
 static bool EiemPrepareInputUpdate(const std::vector<EiemModInputEvent> &events,
                                    EiemModProgram *next, std::vector<std::string> *affected,
                                    bool *shapesOnly = nullptr,
                                    bool *partnerLinksOnly = nullptr,
-                                   bool *submeshVisibilityOnly = nullptr) {
+                                   bool *submeshVisibilityOnly = nullptr,
+                                   std::vector<EiemSubmeshVisibilityChange>
+                                       *visibilityChanges = nullptr) {
   AcquireSRWLockShared(&s_eiemModLock);
   *next = s_eiemModProgram;
   const LONG generation = s_eiemModGeneration;
@@ -116,7 +235,13 @@ static bool EiemPrepareInputUpdate(const std::vector<EiemModInputEvent> &events,
   for (const auto &event : events) {
     if (event.generation != generation) continue; // queued before an F10 reset
     std::vector<std::string> changed;
-    if (event.uiSection.empty()) changed = EiemCycleModKey(*next, event.chord, event.uiFocus);
+    if (event.uiSection.empty() && !event.modPath.empty())
+      changed = EiemApplyModKey(*next, event.chord, event.uiFocus,
+                                event.modPath.c_str(),
+                                event.keySection.empty()
+                                    ? nullptr
+                                    : event.keySection.c_str(),
+                                event.holdTick, event.holdSeconds);
     else {
       for (size_t i = 0; i < next->states.size(); ++i) {
         auto &state = next->states[i];
@@ -152,6 +277,21 @@ static bool EiemPrepareInputUpdate(const std::vector<EiemModInputEvent> &events,
       *submeshVisibilityOnly =
           EiemSameRenderWithoutSubmeshVisibility(before[i], next->rules[i]);
   }
+  if (visibilityChanges) {
+    visibilityChanges->clear();
+    if (before.size() == next->rules.size()) {
+      for (size_t i = 0; i < before.size(); ++i) {
+        if (before[i].hiddenSubmeshMask == next->rules[i].hiddenSubmeshMask)
+          continue;
+        EiemSubmeshVisibilityChange change;
+        change.modPath = next->rules[i].modPath;
+        change.section = next->rules[i].section;
+        change.beforeMask = before[i].hiddenSubmeshMask;
+        change.afterMask = next->rules[i].hiddenSubmeshMask;
+        visibilityChanges->push_back(std::move(change));
+      }
+    }
+  }
   return !affected->empty();
 }
 
@@ -159,13 +299,20 @@ static void EiemPublishModState(EiemModProgram next) {
   s_eiemPersistentStates.Queue(next);
   AcquireSRWLockExclusive(&s_eiemModLock);
   s_eiemModProgram = std::move(next);
+  EiemReconcileControlledModLocked();
   ReleaseSRWLockExclusive(&s_eiemModLock);
 }
 
-// Called before hooks at startup; subsequently only by the Unity-thread update
-// dispatcher, after restoring effects of the previously published program.
-static void EiemReloadMods() {
-  s_eiemPersistentStates.Flush(true);
+// Parse and validate a complete candidate before any live Renderer is changed.
+// A malformed mod rejects the whole generation so existing instances never
+// observe a partially loaded program.
+static bool EiemPrepareModReload(EiemModProgram *prepared,
+                                 std::string *failure = nullptr) {
+  if (failure) failure->clear();
+  if (!prepared) {
+    if (failure) *failure = "Missing reload destination";
+    return false;
+  }
   EiemModProgram next;
   std::vector<std::string> files;
   WIN32_FIND_DATAA data = {};
@@ -187,13 +334,23 @@ static void EiemReloadMods() {
   for (const auto &file : files) {
     std::string error; EiemModProgram document;
     if (!EiemModParseFile(file.c_str(), document, &error)) {
-      if (!error.empty()) Log("[MOD] Invalid configuration %s:%s (file skipped)", file.c_str(), error.c_str());
+      // A discovered folder does not have to contain a mod.ini. A present but
+      // invalid file supplies an error and rejects the candidate generation.
+      if (!error.empty()) {
+        if (failure) *failure = file + ":" + error;
+        return false;
+      }
       continue;
     }
     EiemAppendModDocument(next,std::move(document));
   }
   s_eiemPersistentStates.Load(next);
   EiemCompileModProgram(next);
+  *prepared = std::move(next);
+  return true;
+}
+
+static LONG EiemPublishPreparedModReload(EiemModProgram next) {
   for (const auto &prefab : next.prefabs)
     Log("[MOD] prefab section=%s path=%s renders=%u", prefab.section, prefab.path, prefab.renderCount);
   for (const auto &rule : next.rules)
@@ -204,10 +361,27 @@ static void EiemReloadMods() {
   const size_t resourceCount = next.resources.size(), standaloneCount = next.standaloneRules.size();
   AcquireSRWLockExclusive(&s_eiemModLock);
   s_eiemModProgram = std::move(next);
+  EiemReconcileControlledModLocked();
   const LONG generation = InterlockedIncrement(&s_eiemModGeneration);
   ReleaseSRWLockExclusive(&s_eiemModLock);
   Log("[MOD] Reloaded %zu Prefab declarations, %zu Render rules (%zu standalone), %zu resources, generation=%ld",
       prefabCount, ruleCount, standaloneCount, resourceCount, generation);
+  return generation;
+}
+
+// Called before hooks at startup. Runtime F10 prepares its candidate before
+// entering the Unity-side resource transaction.
+static bool EiemReloadMods() {
+  s_eiemPersistentStates.Flush(true);
+  EiemModProgram next;
+  std::string failure;
+  if (!EiemPrepareModReload(&next, &failure)) {
+    Log("[MOD] Reload rejected; current generation retained: %s",
+        failure.empty() ? "unknown parse error" : failure.c_str());
+    return false;
+  }
+  EiemPublishPreparedModReload(std::move(next));
+  return true;
 }
 
 static void EiemFindModPrefabs(const char *path,

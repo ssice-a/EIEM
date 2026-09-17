@@ -18,6 +18,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND,UINT,WPARAM,LP
 static int g_guiToggleVK=VK_INSERT, g_modReloadVK=VK_F10;
 static HWND g_gameHwnd=nullptr,g_guiHwnd=nullptr,g_modUiHwnd=nullptr;
 static bool g_guiVisible=false,g_modUiVisible=false,g_pluginActive=true;
+static bool g_guiRunning=true,g_shutdownRequested=false;
 static void Log(const char *,...) {}
 static void ReleaseCursorToGui() {}
 static void ReturnCursorToGame() {}

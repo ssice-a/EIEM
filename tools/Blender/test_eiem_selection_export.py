@@ -67,6 +67,20 @@ assert ini["RenderVisible"]["mesh"] == "MeshVisible"
 assert "handling" not in ini["RenderVisible"]
 assert not (package / "materials").exists() and not (package / "textures").exists()
 
+# Mesh-only export must ignore unrelated author controls on the selected Mesh.
+# A full package still validates these controls; this path is intentionally
+# limited to Mesh/material/texture payloads.
+mesh_only_bad = make_object("MeshOnlyBad")
+mesh_only_bad.data.eiem_shape_controls.add().shape = "MissingShape"
+mesh_only_package = output / "mesh-only-no-author-checks"
+mesh_only_stats = addon.export_package(
+    mesh_only_package, [mesh_only_bad], [], physics_objects=[], mesh_only=True)
+assert mesh_only_stats["meshes"] == 1
+mesh_only_ini = read_ini(mesh_only_package)
+assert "skeleton" not in mesh_only_ini["RenderMeshOnlyBad"]
+assert "physics" not in mesh_only_ini["RenderMeshOnlyBad"]
+bpy.data.objects.remove(mesh_only_bad, do_unlink=True)
+
 # Permanent hide emits only a rule, even with invalid geometry dependencies.
 hide_only = output / "hide-only"
 stats = addon.export_package(hide_only, [hidden], [])
@@ -109,9 +123,9 @@ split = output / "split"
 assert addon.export_package(split, [part_a, part_b], [])["meshes"] == 1
 ini = read_ini(split)
 assert dict(ini["RenderPartA"]) == {
-    "asset": "SplitSource", "handling": "skip", "partner.0": "RenderPartAPart0"}
-assert ini["RenderPartAPart0"]["mesh"] == "MeshPartA"
+    "asset": "SplitSource", "mesh": "MeshPartA"}
 assert "MeshPartB" not in ini and "RenderPartB" not in ini
+assert "partner." not in (split / "mod.ini").read_text(encoding="utf-8")
 part_a.hide_render = True
 assert addon.export_package(output / "split-hidden", [part_a, part_b], [])["meshes"] == 0
 assert dict(read_ini(output / "split-hidden")["RenderPartA"]) == {

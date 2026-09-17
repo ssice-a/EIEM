@@ -17,8 +17,9 @@
 ## 现行约束
 
 - 一个资源的所有匹配消费者均受规则影响；mesh、skip 和 partner 各自有明确语义。
-- NPC 可直接构造 Renderer 而不经过 PFB/模型根及 Unity `sharedMesh` setter；这类实例在游戏的
-  `RendererInfo._Init` 完成干净源材质采样后进入同一个 Mesh 身份执行器。
+- `EntityRenderHelper` 遍历中的 `RendererInfo._Init` 只完成游戏的干净源材质采样，完整 helper
+  返回后才统一提交资源；不经过 helper 的直接 NPC/UI Renderer 在独立 `_Init` 完成后进入同一个
+  Mesh 身份执行器。入口可以不同，替换实现不能分叉。
 - 同名 Mesh 不证明来源相同；不能以缺省骨骼索引、猜测 PFB 名称或吞错掩盖缺失依赖。
 - Blender 只导出显式选择的网格。对象相机关表示游戏隐藏；眼睛/显示器只影响编辑预览。
 - 源骨骼槽、bind pose 和有效顶点通道保留；新增骨骼按完整路径解析到当前实例。

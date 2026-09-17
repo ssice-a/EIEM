@@ -70,6 +70,33 @@ try:
     raise AssertionError('new bone exported without its Skeleton dependency')
 except ValueError as ex: assert '同时选择共享骨架' in str(ex),str(ex)
 assert not (output/'missing-rig').exists()
+
+# Explicit Mesh-only export skips author Skeleton/Physics dependency checks but
+# still writes the mesh's existing skin payload for runtime deformation.
+mesh_only = output/'mesh-only-explicit'
+mesh_only_stats = addon.export_package(
+    mesh_only, [first], [], physics_objects=[], mesh_only=True)
+assert mesh_only_stats['meshes'] == 1
+assert mesh_only_stats['skeletons'] == 0 and mesh_only_stats['physics'] == 0
+mesh_only_ini = configparser.ConfigParser(interpolation=None)
+mesh_only_ini.read(mesh_only/'mod.ini', encoding='utf-8')
+assert 'skeleton' not in mesh_only_ini['RenderFirst']
+assert 'physics' not in mesh_only_ini['RenderFirst']
+
+# Other selected Meshes may share an author Rig that contains unrelated new
+# bones. They do not own a Skeleton dependency unless positive weights use one.
+native_only=mesh('NativeOnly')
+obj_names.remove(native_only.name)
+native_only.vertex_groups.remove(native_only.vertex_groups['Extra'])
+native_only.vertex_groups.remove(native_only.vertex_groups['Tip'])
+native_only.vertex_groups['Unused'].add([0,1,2],1,'REPLACE')
+native_package=output/'native-only'
+native_stats=addon.export_package(native_package,[native_only],[])
+assert native_stats['meshes']==1 and native_stats['skeletons']==0,native_stats
+native_ini=configparser.ConfigParser(interpolation=None)
+native_ini.read(native_package/'mod.ini',encoding='utf-8')
+assert 'skeleton' not in native_ini['RenderNativeOnly']
+
 package=output/'package'; stats=addon.export_package(package,[first,second],[rig])
 assert stats['meshes']==2 and stats['skeletons']==1 and stats['physics']==0,stats
 ini=configparser.ConfigParser(interpolation=None); ini.read(package/'mod.ini',encoding='utf-8')
@@ -85,19 +112,18 @@ physics=addon.physics_authoring
 group=physics.create_group(rig,[rig.data.bones['Extra'],rig.data.bones['Tip']],'新增尾链')
 group.eiem_physics.gravity=6.25
 
-# A split source with one shared Rig emits model-level dependencies once on
-# the source Render.  Partner templates keep their own Mesh/material actions,
-# but do not repeat Skeleton/Physics ownership.
-split_partner=second.copy(); split_partner.data=second.data.copy()
-bpy.context.scene.collection.objects.link(split_partner)
-split_partner.name='SplitPartner'
-split_partner.data['eiem_section']='MeshSplitPartner'
-split_partner.data['eiem_source']=first.data['eiem_source']
-split_partner.data['eiem_asset']=first.data['eiem_asset']
-split_partner['eiem_render_section']='RenderSplitPartner'
-split_package=output/'shared-partner'; stats=addon.export_package(
-    split_package,[first,split_partner],[rig])
-assert stats['meshes']==2 and stats['skeletons']==1 and stats['physics']==1,stats
+# A split source with one shared Rig is merged into one Mesh on the source
+# Renderer. Skeleton and Physics remain model-level dependencies on that action.
+split_part=second.copy(); split_part.data=second.data.copy()
+bpy.context.scene.collection.objects.link(split_part)
+split_part.name='SplitPart'
+split_part.data['eiem_section']='MeshSplitPart'
+split_part.data['eiem_source']=first.data['eiem_source']
+split_part.data['eiem_asset']=first.data['eiem_asset']
+split_part['eiem_render_section']='RenderSplitPart'
+split_package=output/'shared-merged'; stats=addon.export_package(
+    split_package,[first,split_part],[rig])
+assert stats['meshes']==1 and stats['skeletons']==1 and stats['physics']==1,stats
 split_ini=configparser.ConfigParser(interpolation=None)
 split_ini.read(split_package/'mod.ini',encoding='utf-8')
 split_root=split_ini['RenderFirst']
@@ -105,10 +131,9 @@ assert split_root['skeleton']=='SkeletonShared'
 split_physics=next(name for name in split_ini.sections()
                    if name.startswith('Physics'))
 assert split_root['physics']==split_physics
-split_partner_section=split_root['partner.0']
-assert 'skeleton' not in split_ini[split_partner_section]
-assert 'physics' not in split_ini[split_partner_section]
-bpy.data.objects.remove(split_partner,do_unlink=True)
+assert 'mesh' in split_root
+assert not any(key.startswith('partner.') for key in split_root)
+bpy.data.objects.remove(split_part,do_unlink=True)
 
 # A Mesh that has positive weights on an authored Physics group's bones owns
 # that dependency even when the helper Empty was not manually selected. This
@@ -166,11 +191,15 @@ reloaded_skeleton=package/reloaded_ini[reloaded_ini['RenderFirst']['skeleton']][
 assert reloaded_skeleton.read_bytes()==original_skeleton
 assert (package/'meshes/MeshFirst.mesh').read_bytes()==new_file.read_bytes()
 
-# Two author rigs may carry a copied section name. Keep files and Render
-# associations distinct, even if their meshes share a Blender datablock.
+# Two target resources may use author rigs whose copied section names collide.
+# Keep their files and Render associations distinct.
 copy_rig=rig.copy(); copy_rig.data=rig.data.copy(); bpy.context.scene.collection.objects.link(copy_rig)
-copy_mesh=first.copy(); bpy.context.scene.collection.objects.link(copy_mesh)
+copy_mesh=first.copy(); copy_mesh.data=first.data.copy(); bpy.context.scene.collection.objects.link(copy_mesh)
 copy_mesh.modifiers[0].object=copy_rig
+copy_mesh.name='FirstCopy'; copy_mesh.data['eiem_section']='MeshFirstCopy'
+copy_mesh.data['eiem_source']='assets/test/FirstCopy.asset'
+copy_mesh.data['eiem_asset']='FirstCopy'
+copy_mesh['eiem_render_section']='RenderFirstCopy'
 bpy.context.view_layer.objects.active=copy_rig; bpy.ops.object.mode_set(mode='EDIT')
 copy_rig.data.edit_bones['Extra'].head.x+=.2
 bpy.ops.object.mode_set(mode='OBJECT')

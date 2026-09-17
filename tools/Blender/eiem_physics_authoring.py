@@ -1743,7 +1743,11 @@ def active_group_node_sample(context, group):
     if not rig or context.object != rig:
         return None
     bone = rig.data.bones.active
-    if not bone or not bone.select:
+    # Blender 5.0 no longer exposes selection on data Bone objects. Selection
+    # remains an attribute of the corresponding PoseBone, which is also what
+    # the authoring operators use when selecting a chain.
+    pose_bone = rig.pose.bones.get(bone.name) if bone else None
+    if not bone or not pose_bone or not pose_bone.select:
         return None
     if native.is_native(group):
         return native.native_bone_sample(group, bone)

@@ -348,6 +348,7 @@ static void *g_eiemShaderGetPropertyName = nullptr;
 static void *g_eiemShaderGetPropertyType = nullptr;
 static void *s_eiemRendererSetSharedMaterials = nullptr;
 static void *s_eiemResourceManagerLoad = nullptr;
+static void *s_eiemResourceManagerGetInstance = nullptr;
 static void *s_eiemProxyLoadImmediate = nullptr;
 static void *s_eiemProxyGet = nullptr;
 static void *s_eiemTexture2DClass = nullptr;
@@ -403,11 +404,18 @@ static DWORD s_eiemUnityThreadId = 0;
 // Mesh, material and texture resources are generated on demand. Keep their
 // managed wrappers rooted for reuse; native lifetime must still be checked.
 // Snapshot copies share the root, so Unity validity calls run outside locks.
+struct EiemMeshSubmeshVisibilityState {
+  std::vector<std::vector<int32_t>> triangles;
+  uint32_t appliedMask = 0;
+};
+
 struct EiemObjectResourceCacheEntry {
   char modPath[MAX_PATH] = {};
   char section[96] = {};
   uint64_t fileStamp = 0;
+  uint64_t variant = 0;
   std::shared_ptr<const EiemSkinIdentity> skin;
+  std::shared_ptr<EiemMeshSubmeshVisibilityState> submeshVisibility;
   EiemUnityRef object;
 };
 
@@ -426,9 +434,12 @@ static bool EiemFindCachedObject(
     std::vector<EiemObjectResourceCacheEntry> &cache, SRWLOCK *lock,
     const char *modPath, const char *section, uint64_t fileStamp,
     void **out, char *error, size_t errorSize,
-    std::shared_ptr<const EiemSkinIdentity> *skin = nullptr) {
+    std::shared_ptr<const EiemSkinIdentity> *skin = nullptr,
+    uint64_t variant = 0,
+    std::shared_ptr<EiemMeshSubmeshVisibilityState> *submeshVisibility = nullptr) {
   if (out) *out = nullptr;
   if (skin) skin->reset();
+  if (submeshVisibility) submeshVisibility->reset();
   if (!EiemOnUnityThread()) {
     if (error) strncpy_s(error, errorSize, "Resource cache requires Unity thread", _TRUNCATE);
     return false;
@@ -439,7 +450,8 @@ static bool EiemFindCachedObject(
     AcquireSRWLockShared(lock);
     for (const auto &entry : cache) {
       if (_stricmp(entry.modPath, modPath) == 0 &&
-          _stricmp(entry.section, section) == 0) {
+          _stricmp(entry.section, section) == 0 &&
+          entry.variant == variant) {
         snapshot = entry;
         found = true;
         break;
@@ -455,6 +467,8 @@ static bool EiemFindCachedObject(
     if (status == 1) {
       if (out) *out = snapshot.object.Target();
       if (skin) *skin = snapshot.skin;
+      if (submeshVisibility)
+        *submeshVisibility = snapshot.submeshVisibility;
       return true;
     }
     // Remove only this snapshot. A concurrent cache clear/store cannot make
@@ -462,7 +476,9 @@ static bool EiemFindCachedObject(
     AcquireSRWLockExclusive(lock);
     cache.erase(std::remove_if(cache.begin(), cache.end(), [&](const auto &entry) {
       return entry.object.Handle() == snapshot.object.Handle() &&
-             _stricmp(entry.modPath, modPath) == 0 && _stricmp(entry.section, section) == 0;
+             _stricmp(entry.modPath, modPath) == 0 &&
+             _stricmp(entry.section, section) == 0 &&
+             entry.variant == variant;
     }), cache.end());
     ReleaseSRWLockExclusive(lock);
     Log("[MOD-CACHE] evicted mod=%s section=%s reason=%s", modPath, section,
@@ -474,7 +490,9 @@ static bool EiemCacheObject(std::vector<EiemObjectResourceCacheEntry> &cache,
                             SRWLOCK *lock, const char *modPath,
                             const char *section, uint64_t fileStamp,
                             void *object, char *error, size_t errorSize,
-                            std::shared_ptr<const EiemSkinIdentity> skin = nullptr) {
+                            std::shared_ptr<const EiemSkinIdentity> skin = nullptr,
+                            uint64_t variant = 0,
+                            std::shared_ptr<EiemMeshSubmeshVisibilityState> submeshVisibility = nullptr) {
   if (EiemNativeObjectStatus(object) != 1) {
     if (error) strncpy_s(error, errorSize, "Generated resource is not natively valid", _TRUNCATE);
     return false;
@@ -483,7 +501,9 @@ static bool EiemCacheObject(std::vector<EiemObjectResourceCacheEntry> &cache,
   strncpy_s(entry.modPath, sizeof(entry.modPath), modPath, _TRUNCATE);
   strncpy_s(entry.section, sizeof(entry.section), section, _TRUNCATE);
   entry.fileStamp = fileStamp;
+  entry.variant = variant;
   entry.skin = std::move(skin);
+  entry.submeshVisibility = std::move(submeshVisibility);
   entry.object = EiemUnityRef::Capture(object, false);
   if (!entry.object) {
     if (error) strncpy_s(error, errorSize, "Unable to retain generated resource", _TRUNCATE);
@@ -492,7 +512,7 @@ static bool EiemCacheObject(std::vector<EiemObjectResourceCacheEntry> &cache,
   AcquireSRWLockExclusive(lock);
   for (auto it = cache.begin(); it != cache.end();) {
     if (_stricmp(it->modPath, modPath) == 0 &&
-        _stricmp(it->section, section) == 0) {
+        _stricmp(it->section, section) == 0 && it->variant == variant) {
       it = cache.erase(it);
     } else {
       ++it;
@@ -563,6 +583,9 @@ static void EiemResolveResourceBackend(void **assemblies, size_t assemblyCount) 
   s_eiemRendererClass = FindClass("UnityEngine", "Renderer", assemblies, assemblyCount);
   s_eiemResourceManagerClass = FindClass("Beyond.Resource.Runtime", "BundleResourceManager",
                                          assemblies, assemblyCount);
+  void *resourceManagerFacadeClass =
+      FindClass("Beyond.Resource", "ResourceManager", assemblies,
+                assemblyCount);
   s_eiemProxyHandleClass = FindClass("Beyond.Resource", "FAssetProxyHandle",
                                      assemblies, assemblyCount);
   s_eiemTexture2DClass = FindClass("UnityEngine", "Texture2D", assemblies, assemblyCount);
@@ -652,6 +675,9 @@ static void EiemResolveResourceBackend(void **assemblies, size_t assemblyCount) 
     s_eiemResourceManagerLoad = EiemFindMethodWithParamTypes(
         s_eiemResourceManagerClass, "Load", loadTypes, _countof(loadTypes));
   }
+  if (resourceManagerFacadeClass)
+    s_eiemResourceManagerGetInstance =
+        FindMethod(resourceManagerFacadeClass, "get_instance", 0);
   if (s_eiemProxyHandleClass) {
     s_eiemProxyLoadImmediate = FindMethod(s_eiemProxyHandleClass, "LoadImmediate", 0);
     s_eiemProxyGet = EiemFindMethodWithReturnType(
@@ -702,8 +728,9 @@ static void EiemResolveResourceBackend(void **assemblies, size_t assemblyCount) 
       s_eiemMeshUploadMeshData,
       s_eiemMeshAddBlendShapeFrame,
       g_mesh_recalculateBounds, s_eiemMeshGetBounds);
-  Log("[MOD] Material backend: load=%p immediate=%p get=%p clone=%p setMaterials=%p scale=%p offset=%p",
-      s_eiemResourceManagerLoad, s_eiemProxyLoadImmediate, s_eiemProxyGet,
+  Log("[MOD] Material backend: manager=%p load=%p immediate=%p get=%p clone=%p setMaterials=%p scale=%p offset=%p",
+      s_eiemResourceManagerGetInstance, s_eiemResourceManagerLoad,
+      s_eiemProxyLoadImmediate, s_eiemProxyGet,
       s_eiemMaterialCtorCopy, s_eiemRendererSetSharedMaterials,
       s_eiemMaterialSetTextureScale, s_eiemMaterialSetTextureOffset);
   Log("[MOD] Texture backend: texture2D=%p imageConversion=%p loadImage=%p setTexture=%p getTexture=%p ctor=%p filter=%p wrap=%p aniso=%p bias=%p",
@@ -727,6 +754,96 @@ static void *EiemMakeValueArray(void *klass, const std::vector<T> &values) {
     memcpy((char *)array + IL2CPP_ARRAY_DATA, values.data(),
            values.size() * sizeof(T));
   return array;
+}
+
+// A visibility key must preserve the Mesh object already registered with the
+// game's skinning path. Only the changed submesh index arrays are rewritten;
+// vertices, bind poses, bone weights and every Renderer field stay untouched.
+static bool EiemApplyMeshSubmeshVisibility(
+    void *mesh, const std::shared_ptr<EiemMeshSubmeshVisibilityState> &state,
+    uint32_t mask, char *error, size_t errorSize) {
+  if (error && errorSize) error[0] = '\0';
+  if (!EiemOnUnityThread() || !mesh || !state || !s_eiemMeshSetTriangles ||
+      !s_eiemInt32Class) {
+    if (error)
+      strncpy_s(error, errorSize,
+                "Mesh submesh visibility APIs are unavailable", _TRUNCATE);
+    return false;
+  }
+  if (EiemNativeObjectStatus(mesh) != 1) {
+    if (error)
+      strncpy_s(error, errorSize,
+                "Mesh submesh visibility target is not valid", _TRUNCATE);
+    return false;
+  }
+  const uint32_t validBits = state->triangles.size() >= 32
+                                 ? UINT32_MAX
+                                 : ((1u << (uint32_t)state->triangles.size()) - 1u);
+  if (mask & ~validBits) {
+    if (error)
+      strncpy_s(error, errorSize,
+                "Submesh visibility mask exceeds Mesh submesh count",
+                _TRUNCATE);
+    return false;
+  }
+  const uint32_t before = state->appliedMask;
+  const uint32_t changed = (before ^ mask) & validBits;
+  if (!changed) return true;
+
+  const std::vector<int32_t> empty;
+  auto write = [&](uint32_t submesh, bool hidden) {
+    const auto &triangles = hidden ? empty : state->triangles[submesh];
+    void *array = EiemMakeValueArray(s_eiemInt32Class, triangles);
+    if (!array) return false;
+    int32_t index = (int32_t)submesh;
+    void *result = nullptr;
+    void *params[] = {array, &index};
+    if (!InvokeChecked(s_eiemMeshSetTriangles, mesh, params, &result))
+      return false;
+    if (g_mesh_GetIndexCount) {
+      void *boxed = nullptr;
+      if (!InvokeChecked(g_mesh_GetIndexCount, mesh, &params[1], &boxed) ||
+          !boxed)
+        return false;
+      const uint32_t actual = *(uint32_t *)((char *)boxed + 16);
+      if (actual != (uint32_t)triangles.size()) return false;
+    }
+    return true;
+  };
+
+  std::vector<uint32_t> written;
+  for (uint32_t submesh = 0;
+       submesh < state->triangles.size() && submesh < 32; ++submesh) {
+    if (!(changed & (1u << submesh))) continue;
+    if (write(submesh, (mask & (1u << submesh)) != 0)) {
+      written.push_back(submesh);
+      continue;
+    }
+    for (auto it = written.rbegin(); it != written.rend(); ++it)
+      write(*it, (before & (1u << *it)) != 0);
+    if (error)
+      strncpy_s(error, errorSize,
+                "Unity rejected an in-place submesh index update", _TRUNCATE);
+    return false;
+  }
+  if (s_eiemMeshUploadMeshData) {
+    bool markNoLongerReadable = false;
+    void *result = nullptr;
+    void *params[] = {&markNoLongerReadable};
+    if (!InvokeChecked(s_eiemMeshUploadMeshData, mesh, params, &result)) {
+      for (auto it = written.rbegin(); it != written.rend(); ++it)
+        write(*it, (before & (1u << *it)) != 0);
+      if (error)
+        strncpy_s(error, errorSize,
+                  "Unity rejected the in-place Mesh upload", _TRUNCATE);
+      return false;
+    }
+  }
+  state->appliedMask = mask;
+  Log("[MOD] Submesh visibility indices applied mesh=%p before=0x%08X "
+      "after=0x%08X changed=0x%08X",
+      mesh, before, mask, changed);
+  return true;
 }
 
 static int32_t EiemBackendManagedArrayLength(void *array) {
@@ -942,9 +1059,12 @@ static void EiemLogRendererBoneFingerprint(const char *label, void *renderer) {
       matrices = EiemHashBytes(matrices, (char *)boxed + 16,
                                sizeof(Matrix4x4));
   }
-  Log("[DEBUG-SKIN-DIFF] bones=%s renderer=%p count=%d refs=%016llX "
-      "matrices=%016llX",
-      label ? label : "unknown", renderer, count,
+  void *rootBone = g_smr_get_rootBone
+                       ? EiemBackendInvokeNoThrow(g_smr_get_rootBone, renderer)
+                       : nullptr;
+  Log("[DEBUG-GROUND-v1] bones=%s renderer=%p array=%p root=%p count=%d "
+      "refs=%016llX matrices=%016llX",
+      label ? label : "unknown", renderer, bones, rootBone, count,
       (unsigned long long)references, (unsigned long long)matrices);
 }
 
@@ -1064,14 +1184,12 @@ static bool EiemWriteMeshShapes(void *mesh, const EiemNativeMeshDocument &docume
 static void *EiemBuildNativeMesh(const char *path, void *templateMesh,
                                  char *error, size_t errorSize,
                                  std::shared_ptr<const EiemSkinIdentity> *skin = nullptr,
-                                 uint32_t hiddenSubmeshMask = 0) {
+                                 std::shared_ptr<EiemMeshSubmeshVisibilityState> *submeshVisibility = nullptr) {
   EiemNativeMeshDocument document;
   if (!EiemReadNativeMesh(path, &document, error, errorSize)) return nullptr;
-  if (hiddenSubmeshMask) {
-    for (size_t index = 0; index < document.subMeshes.size() && index < 32; ++index)
-      if (hiddenSubmeshMask & (1u << (uint32_t)index))
-        document.subMeshes[index].indexCount = 0;
-  }
+  if (submeshVisibility) submeshVisibility->reset();
+  auto visibility = std::make_shared<EiemMeshSubmeshVisibilityState>();
+  visibility->triangles.resize(document.subMeshes.size());
   if (skin) {
     skin->reset();
     if (!document.skin.empty()) {
@@ -1173,7 +1291,7 @@ static void *EiemBuildNativeMesh(const char *path, void *templateMesh,
   for (int32_t index = 0; index < subMeshCount; ++index) {
     const auto &subMesh = document.subMeshes[(size_t)index];
     expectedIndexCount += subMesh.indexCount;
-    std::vector<int32_t> triangles;
+    auto &triangles = visibility->triangles[(size_t)index];
     triangles.reserve(subMesh.indexCount);
     for (uint32_t offset = 0; offset < subMesh.indexCount; ++offset) {
       const uint32_t value = document.indices[(size_t)subMesh.indexStart + offset];
@@ -1276,6 +1394,7 @@ static void *EiemBuildNativeMesh(const char *path, void *templateMesh,
   }
   Log("[DEBUG-mesh-state] expected boneWeights=%zu bindposes=%zu",
       document.skin.size(), document.bindPoses.size());
+  if (submeshVisibility) *submeshVisibility = std::move(visibility);
   return mesh;
 }
 
@@ -1358,14 +1477,17 @@ static bool EiemBuildMeshResource(const EiemModRule &rule, void **outMesh,
   if (!GetFullPathNameA(path, _countof(fullPath), fullPath, nullptr))
     strncpy_s(fullPath, sizeof(fullPath), path, _TRUNCATE);
   uint64_t fileStamp = EiemMeshCacheStamp(EiemMeshResourceFileStamp(fullPath));
-  // Visibility variants share the source payload but must not share a Unity
-  // Mesh cache entry: each mask has a different per-submesh index buffer.
-  fileStamp ^= (uint64_t)rule.hiddenSubmeshMask * 1099511628211ull;
   void *cachedMesh = nullptr;
+  std::shared_ptr<EiemMeshSubmeshVisibilityState> visibility;
   if (!EiemFindCachedObject(s_eiemMeshResourceCache, &s_eiemMeshResourceCacheLock,
                            resource.modPath, resource.section, fileStamp,
-                           &cachedMesh, error, errorSize, skin)) return false;
+                           &cachedMesh, error, errorSize, skin, 0,
+                           &visibility)) return false;
   if (cachedMesh) {
+    if (!EiemApplyMeshSubmeshVisibility(cachedMesh, visibility,
+                                        rule.hiddenSubmeshMask, error,
+                                        errorSize))
+      return false;
     if (s_eiemResourceDiagnostic) s_eiemResourceDiagnostic("mesh-cache-hit", resource.modPath, resource.section, cachedMesh);
     Log("[DEBUG-hr1] mesh cache hit mod=%s section=%s mesh=%p",
         resource.modPath, resource.section, cachedMesh);
@@ -1374,12 +1496,16 @@ static bool EiemBuildMeshResource(const EiemModRule &rule, void **outMesh,
   }
 
   std::shared_ptr<const EiemSkinIdentity> identity;
-  void *mesh = EiemBuildNativeMesh(fullPath, templateMesh, error, errorSize, &identity,
-                                   rule.hiddenSubmeshMask);
+  void *mesh = EiemBuildNativeMesh(fullPath, templateMesh, error, errorSize,
+                                   &identity, &visibility);
   if (!mesh) return false;
   if (!EiemCacheObject(s_eiemMeshResourceCache, &s_eiemMeshResourceCacheLock,
                        resource.modPath, resource.section, fileStamp, mesh,
-                       error, errorSize, identity)) return false;
+                       error, errorSize, identity, 0, visibility)) return false;
+  if (!EiemApplyMeshSubmeshVisibility(mesh, visibility,
+                                      rule.hiddenSubmeshMask, error,
+                                      errorSize))
+    return false;
   if (skin) *skin = identity;
   if (outMesh) *outMesh = mesh;
   if (s_eiemResourceDiagnostic) s_eiemResourceDiagnostic("mesh-built", resource.modPath, resource.section, mesh);
@@ -1467,8 +1593,16 @@ static uint64_t EiemMaterialDependencyStamp(
   return stamp;
 }
 
+static void *EiemResolveResourceManagerInstance() {
+  if (!s_eiemResourceManagerInstance && s_eiemResourceManagerGetInstance)
+    s_eiemResourceManagerInstance =
+        Invoke(s_eiemResourceManagerGetInstance, nullptr);
+  return s_eiemResourceManagerInstance;
+}
+
 static void *EiemLoadOriginalAsset(const char *logicalPath, void *assetClass,
                                    char *error, size_t errorSize) {
+  EiemResolveResourceManagerInstance();
   if (!logicalPath || !logicalPath[0] || !assetClass ||
       !s_eiemResourceManagerInstance || !s_eiemResourceManagerLoad ||
       !s_eiemProxyLoadImmediate || !s_eiemProxyGet ||

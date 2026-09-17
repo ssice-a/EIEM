@@ -77,3 +77,36 @@ static bool EiemParseKeyChord(const std::string &text, EiemKeyChord *out) {
   *out = chord;
   return true;
 }
+
+static std::string EiemFormatKeyChord(EiemKeyChord chord) {
+  std::string result;
+  if (chord.modifiers & MOD_CONTROL) result += "Ctrl+";
+  if (chord.modifiers & MOD_SHIFT) result += "Shift+";
+  if (chord.modifiers & MOD_ALT) result += "Alt+";
+  if (chord.vk >= '0' && chord.vk <= '9')
+    result.push_back((char)chord.vk);
+  else if (chord.vk >= 'A' && chord.vk <= 'Z')
+    result.push_back((char)chord.vk);
+  else if (chord.vk >= VK_F1 && chord.vk <= VK_F24)
+    result += "F" + std::to_string(chord.vk - VK_F1 + 1);
+  else if (chord.vk >= VK_NUMPAD0 && chord.vk <= VK_NUMPAD9)
+    result += "Numpad" + std::to_string(chord.vk - VK_NUMPAD0);
+  else {
+    struct Entry { UINT vk; const char *name; };
+    static const Entry entries[] = {
+      {VK_INSERT,"Insert"},{VK_DELETE,"Delete"},{VK_HOME,"Home"},
+      {VK_END,"End"},{VK_PRIOR,"PageUp"},{VK_NEXT,"PageDown"},
+      {VK_LEFT,"Left"},{VK_RIGHT,"Right"},{VK_UP,"Up"},{VK_DOWN,"Down"},
+      {VK_SPACE,"Space"},{VK_RETURN,"Enter"},{VK_ESCAPE,"Esc"},
+      {VK_TAB,"Tab"},{VK_BACK,"Backspace"},{VK_CAPITAL,"CapsLock"},
+      {VK_ADD,"Numpad+"},{VK_SUBTRACT,"Numpad-"},
+      {VK_MULTIPLY,"Numpad*"},{VK_DIVIDE,"Numpad/"},
+      {VK_DECIMAL,"Numpad."}
+    };
+    for (const auto &entry : entries)
+      if (entry.vk == chord.vk) { result += entry.name; break; }
+    if (result.empty() || result.back() == '+')
+      result += "VK" + std::to_string(chord.vk);
+  }
+  return result;
+}

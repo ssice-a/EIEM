@@ -2,8 +2,17 @@
 #include "eiem_lua_ui.h"
 #include <wrl/client.h>
 
-// Dedicated native overlay, not a game swap-chain hook and not the INSERT
-// panel. All methods execute on GuiThread; only variable events cross threads.
+static volatile LONG s_eiemModManagerOpen = 0;
+
+static void EiemToggleModManager() {
+  LONG previous = InterlockedCompareExchange(&s_eiemModManagerOpen, 0, 0);
+  while (InterlockedCompareExchange(&s_eiemModManagerOpen,
+                                    previous ? 0 : 1, previous) != previous)
+    previous = InterlockedCompareExchange(&s_eiemModManagerOpen, 0, 0);
+}
+
+// Dedicated native overlay, not a game swap-chain hook. Its worker owns all
+// window and D3D calls; only immutable snapshots and input events cross threads.
 class EiemUiHost {
   template<class T> using Com = Microsoft::WRL::ComPtr<T>;
   HWND hwnd = nullptr;
@@ -16,7 +25,7 @@ class EiemUiHost {
   Com<IDCompositionTarget> compositionTarget;
   Com<IDCompositionVisual> visual;
   LONG generation = -1;
-  bool failed = false, shown = false;
+  bool failed = false, shown = false, managerWasOpen = false;
   int width = 0, height = 0;
   struct Entry { EiemUiSnapshot snapshot; std::unique_ptr<EiemLuaUi> script; bool reported = false; };
   std::vector<Entry> entries;
@@ -37,7 +46,10 @@ class EiemUiHost {
     }
     // This transparent host is infrastructure, not an authored Mod window.
     // Script-owned Begin/open values govern application windows.
-    if (message == WM_CLOSE) return 0;
+    if (message == WM_CLOSE) {
+      InterlockedExchange(&s_eiemModManagerOpen, 0);
+      return 0;
+    }
     if (message == WM_ERASEBKGND) return 1;
     return DefWindowProcW(window,message,wp,lp);
   }
@@ -110,6 +122,75 @@ class EiemUiHost {
       if (GetForegroundWindow() == hwnd && g_gameHwnd) SetForegroundWindow(g_gameHwnd);
     }
   }
+  static std::string ModLabel(const std::string &path) {
+    auto parent = std::filesystem::u8path(path).parent_path();
+    std::string label = parent.filename().u8string();
+    return label.empty() ? path : label;
+  }
+  void DrawManager(LONG generation) {
+    if (!InterlockedCompareExchange(&s_eiemModManagerOpen, 0, 0)) return;
+    LONG snapshotGeneration = 0, controlGeneration = 0;
+    auto controls = EiemGetModControls(&snapshotGeneration, &controlGeneration);
+    (void)controlGeneration;
+    bool open = true;
+    ImGui::SetNextWindowSize(ImVec2(620.0f, 420.0f), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("EIEM Mod Manager", &open)) {
+      // A scrollable tab bar keeps the manager usable with many Mods while
+      // retaining the full path as the stable ImGui/control identity.
+      int selectedIndex = -1;
+      for (size_t index = 0; index < controls.size(); ++index)
+        if (controls[index].selected) { selectedIndex = (int)index; break; }
+      if (ImGui::BeginTabBar("##mods", ImGuiTabBarFlags_FittingPolicyScroll)) {
+        for (size_t index = 0; index < controls.size(); ++index) {
+          const auto &control = controls[index];
+          std::string tabLabel = ModLabel(control.modPath) + "##" + control.modPath;
+          if (ImGui::BeginTabItem(tabLabel.c_str(), nullptr,
+                                  control.selected ? ImGuiTabItemFlags_SetSelected
+                                                   : ImGuiTabItemFlags_None)) {
+            if (selectedIndex != (int)index) {
+              EiemSelectControlledMod(control.modPath);
+              selectedIndex = (int)index;
+            }
+            ImGui::EndTabItem();
+          }
+        }
+        ImGui::EndTabBar();
+      }
+      ImGui::Separator();
+      const EiemModControlSnapshot *selected =
+          selectedIndex >= 0 && selectedIndex < (int)controls.size()
+              ? &controls[(size_t)selectedIndex]
+              : nullptr;
+      if (!selected) {
+        ImGui::TextDisabled("No Mod with key controls is loaded.");
+      } else {
+        ImGui::TextUnformatted(ModLabel(selected->modPath).c_str());
+        ImGui::Separator();
+        for (const auto &key : selected->keys) {
+          ImGui::PushID(key.section.c_str());
+          std::string label = key.section + "  [" + EiemFormatKeyChord(key.chord) + "]";
+          if (ImGui::Button(label.c_str(), ImVec2(-1.0f, 0.0f)) &&
+              snapshotGeneration == generation) {
+            EiemModInputEvent event;
+            event.chord = key.chord;
+            event.generation = snapshotGeneration;
+            event.modPath = selected->modPath;
+            event.uiFocus = key.scope != EiemKeyScope::Game;
+            event.keySection = key.section;
+            EiemQueueModInput(std::move(event));
+          }
+          for (const auto &assignment : key.assignments) {
+            auto value = selected->variables.find(assignment.variable);
+            if (value != selected->variables.end())
+              ImGui::Text("%s = %.3g", assignment.variable.c_str(), value->second);
+          }
+          ImGui::PopID();
+        }
+      }
+    }
+    ImGui::End();
+    if (!open) InterlockedExchange(&s_eiemModManagerOpen, 0);
+  }
 public:
   ~EiemUiHost() { Shutdown(); }
   bool InitializeHidden() {
@@ -149,7 +230,14 @@ public:
     }
     HWND foreground = GetForegroundWindow();
     const bool owned = foreground == g_gameHwnd || foreground == g_guiHwnd || foreground == hwnd;
-    if (entries.empty() || !g_pluginActive || !owned || IsIconic(g_gameHwnd)) { Visible(false); return; }
+    const bool managerRequested =
+        InterlockedCompareExchange(&s_eiemModManagerOpen, 0, 0) != 0;
+    if ((entries.empty() && !managerRequested) || !g_pluginActive || !owned ||
+        IsIconic(g_gameHwnd)) {
+      managerWasOpen = managerRequested;
+      Visible(false);
+      return;
+    }
     if (failed) return;
     if (!hwnd && !InitializeHidden()) {
       Log("[UI] Native host creation failed err=%lu; retry with Reload",GetLastError());
@@ -162,6 +250,7 @@ public:
     if (!Resize(rect.right,rect.bottom)) { Log("[UI] Resize failed; retry with Reload"); Visible(false); failed = true; return; }
     SetWindowPos(hwnd,HWND_TOPMOST,origin.x,origin.y,rect.right,rect.bottom,SWP_NOACTIVATE);
     ImGui_ImplDX11_NewFrame(); ImGui_ImplWin32_NewFrame(); ImGui::NewFrame();
+    DrawManager(nextGeneration);
     for (auto &entry : entries) {
       EiemVariables values;
       if (entry.script->Draw(entry.snapshot.variables,values,entry.snapshot.defaults) && !values.empty()) {
@@ -187,6 +276,14 @@ public:
     // Run callbacks even while nothing is shown: Lua decides whether to emit
     // windows. No private DLL "open" state can prevent a script from opening one.
     Visible(ImGui::GetDrawData()->TotalVtxCount > 0);
+    const bool managerOpen =
+        InterlockedCompareExchange(&s_eiemModManagerOpen, 0, 0) != 0;
+    if (managerOpen && !managerWasOpen && shown) {
+      ShowWindow(hwnd, SW_SHOW);
+      SetForegroundWindow(hwnd);
+      ReleaseCursorToGui();
+    }
+    managerWasOpen = managerOpen;
     POINT mouse; GetCursorPos(&mouse); ScreenToClient(hwnd,&mouse);
     bool hit = context->ActiveId != 0;
     for (auto *window : context->Windows)
@@ -201,3 +298,22 @@ public:
     if (FAILED(swap->Present(0,0))) { Log("[UI] Present failed; retry with Reload"); Visible(false); failed = true; }
   }
 };
+
+static DWORD WINAPI EiemModUiThread(LPVOID) {
+  Log("[MOD-UI] Thread started");
+  while (g_guiRunning && !g_shutdownRequested && !g_gameHwnd) Sleep(100);
+  if (!g_guiRunning || g_shutdownRequested || !g_gameHwnd) return 0;
+  EiemUiHost host;
+  MSG message = {};
+  while (g_guiRunning && !g_shutdownRequested && IsWindow(g_gameHwnd)) {
+    while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+      TranslateMessage(&message);
+      DispatchMessageW(&message);
+    }
+    host.Tick();
+    Sleep(g_modUiVisible ? 8 : 40);
+  }
+  host.Shutdown();
+  Log("[MOD-UI] Thread exited");
+  return 0;
+}

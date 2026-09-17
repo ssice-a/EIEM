@@ -2198,6 +2198,7 @@ static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     g_trojanActive = false;
     KillTimer(hwnd, kEiemShapeTransitionTimer);
     KillTimer(hwnd, kEiemModRetryTimer);
+    KillTimer(hwnd, kEiemModReplayTimer);
     s_eiemShapeTransitionTick = 0;
 
     // Wake the GUI message loop. It will observe g_guiRunning=false and tear
@@ -2271,12 +2272,22 @@ static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     EiemRunModReconcile();
     return 0;
   }
+  if (msg == WM_TIMER && wParam == kEiemModReplayTimer) {
+    KillTimer(hwnd, kEiemModReplayTimer);
+    EiemRunModReconcile();
+    return 0;
+  }
   if (msg == WM_TIMER && wParam == kEiemShapeTransitionTimer) {
     EiemRunShapeTransitions();
     return 0;
   }
   if (msg == WM_EIEM_MOD_KEY) {
     EiemQueueModKey({LOWORD(wParam), HIWORD(wParam)}, (LONG)lParam);
+    return 0;
+  }
+  if (msg == WM_EIEM_MOD_HOLD) {
+    EiemQueueModKey({LOWORD(wParam), HIWORD(wParam)}, (LONG)lParam,
+                    true, 0.02);
     return 0;
   }
   if (msg == WM_EIEM_DUMP_DISABLED) {

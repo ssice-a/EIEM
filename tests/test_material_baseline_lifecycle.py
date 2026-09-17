@@ -15,6 +15,10 @@ ROOT = Path(__file__).resolve().parents[1]
 EXTRA = r'''
 static uintptr_t s_eiemActivePrefabInstance=0;
 static bool programEnabled=true,unityThread=true;
+static thread_local bool s_eiemEntityRenderHelperInitGuard=false;
+static constexpr bool kEiemEnableMaterialLifecycle=true;
+static volatile LONG s_eiemModGeneration=1;
+static void EiemRegistrationTraceRenderer(void *,const char *,LONG) {}
 static bool EiemOnUnityThread() { return unityThread; }
 static bool EiemIsSkinnedRenderer(void *) { return true; }
 static bool EiemApplyStandaloneRenderRulesToRenderer(

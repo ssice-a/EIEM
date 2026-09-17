@@ -44,6 +44,10 @@ static thread_local bool s_traceReentrant = false;
 static volatile LONG s_traceSetterThreadLogged = 0;
 static volatile LONG s_tracePrefabIdentityCount = 0;
 static volatile LONG s_traceBonesSetterCount = 0;
+// One bounded timeline for the intermittent ground-pose investigation. This
+// records only tracked replacement Renderers; it does not mutate Unity state.
+static volatile LONG s_eiemSkinTimelineCount = 0;
+static volatile LONG64 s_eiemLastSkinCommitTick = 0;
 // Bounds the skinned-mesh measurements, which transform a sample of vertices
 // and therefore must not run unbounded on the Unity thread.
 static volatile LONG s_traceSkinProbeCount = 0;
@@ -51,8 +55,8 @@ static volatile LONG s_traceSkinProbeCount = 0;
 // source skin with the generated Mesh only for the first few cloth instances,
 // so a bad bind/weight result is visible without reintroducing periodic work.
 static volatile LONG s_traceResourceSkinProbeCount = 0;
-// Armed where Partners are created, which is above the per-frame driver that
-// consumes it. Defined next to that driver.
+// Armed after an in-place replacement is committed, which is above the
+// per-frame driver that consumes it. Defined next to that driver.
 static void EiemArmSkinProbeSweep();
 static volatile LONG s_traceMaterialCommitCount = 0;
 
@@ -281,6 +285,9 @@ static void TraceSkinnedMeshSetSharedMesh(void *self, void *mesh,
                                            void *methodInfo);
 static void TraceSkinnedMeshSetBones(void *self, void *bones,
                                      void *methodInfo);
+static void EiemLogSkinSetterTimeline(const char *event, void *renderer,
+                                      void *requestedMesh, void *appliedMesh,
+                                      void *incomingBones, void *afterBones);
 static void TraceMeshFilterSetSharedMesh(void *self, void *mesh,
                                           void *methodInfo);
 static size_t EiemApplyStandaloneRenderRulesToSkinArray(
@@ -1052,6 +1059,7 @@ static void EiemRestoreRenderOverrides(const std::vector<std::string> *affected 
     };
     const int rendererStatus = state.rendererRef.Status();
     if (rendererStatus != 1) { finish(rendererStatus == 0); continue; }
+    const int drawStatus = state.drawRendererRef.Status();
     bool restoredAll = true;
     EiemModRule noShapes = {};
     EiemUpdateRendererShapes(state.renderer, state.rendererType, noShapes, state.shapes);
@@ -1060,6 +1068,25 @@ static void EiemRestoreRenderOverrides(const std::vector<std::string> *affected 
         state.renderer, state.originalMesh, state.replacementMesh,
         state.hasEnabled ? 1 : 0,
         state.originalEnabled ? 1 : 0);
+    bool restoreEnabledBefore = true;
+    const bool restoreEnabledRead =
+        drawStatus == 1 && EiemReadRendererEnabled(state.drawRenderer,
+                                                   &restoreEnabledBefore);
+    bool rendererDisabledForRestore = false;
+    if (state.ownsMesh && restoreEnabledRead && restoreEnabledBefore &&
+        g_renderer_set_enabled) {
+      rendererDisabledForRestore =
+          EiemSetRendererEnabled(state.drawRenderer, false);
+      Log("[DEBUG-HR-ATOMIC-v2] restore-begin renderer=%p section=%s "
+          "enabledBefore=%d disabled=%d meshBefore=%p bonesBefore=%zu",
+          state.drawRenderer, state.renderSection,
+          restoreEnabledBefore ? 1 : 0, rendererDisabledForRestore ? 1 : 0,
+          EiemReadSharedMesh(state.renderer, state.rendererType),
+          g_smr_get_bones
+              ? EiemManagedArrayLength(Invoke(g_smr_get_bones, state.renderer))
+              : 0);
+      if (!rendererDisabledForRestore) restoredAll = false;
+    }
     const bool sourceAlive = !state.ownsMesh ||
         (state.sourceMeshRef.Target() == state.originalMesh && state.sourceMeshRef.Status() == 1);
     if (!sourceAlive) restoredAll = false;
@@ -1085,7 +1112,6 @@ static void EiemRestoreRenderOverrides(const std::vector<std::string> *affected 
           state.renderer, restored, state.originalMesh,
           restored == state.originalMesh ? 1 : 0);
     }
-    const int drawStatus = state.drawRendererRef.Status();
     if (drawStatus < 0 && (state.hasMaterials || state.hasEnabled)) restoredAll = false;
     if (drawStatus == 1 && state.hasMaterials &&
         state.originalMaterialsHandle &&
@@ -1114,13 +1140,6 @@ static void EiemRestoreRenderOverrides(const std::vector<std::string> *affected 
         }
       } else restoredAll = false;
     } else if (drawStatus == 1 && state.hasMaterials) restoredAll = false;
-    if (drawStatus == 1 && state.hasEnabled && g_renderer_set_enabled) {
-      bool enabled = state.originalEnabled;
-      void *params[] = {&enabled};
-      Invoke(g_renderer_set_enabled, state.drawRenderer, params);
-      bool actual = !enabled;
-      if (!EiemReadRendererEnabled(state.drawRenderer, &actual) || actual != enabled) restoredAll = false;
-    } else if (drawStatus == 1 && state.hasEnabled) restoredAll = false;
     if (sourceAlive && state.ownsMesh &&
         EiemReadSharedMesh(state.renderer, state.rendererType) == state.originalMesh && state.hasSkinning &&
         il2cpp_gchandle_get_target) {
@@ -1142,6 +1161,30 @@ static void EiemRestoreRenderOverrides(const std::vector<std::string> *affected 
           if (rootBone != Invoke(g_smr_get_rootBone, state.renderer)) restoredAll = false;
         }
       }
+    }
+    if (drawStatus == 1 && (state.hasEnabled || rendererDisabledForRestore) &&
+        g_renderer_set_enabled) {
+      bool enabled = state.hasEnabled ? state.originalEnabled
+                                      : restoreEnabledBefore;
+      void *params[] = {&enabled};
+      Invoke(g_renderer_set_enabled, state.drawRenderer, params);
+      bool actual = !enabled;
+      if (!EiemReadRendererEnabled(state.drawRenderer, &actual) || actual != enabled) restoredAll = false;
+    } else if (drawStatus == 1 && (state.hasEnabled || rendererDisabledForRestore)) {
+      restoredAll = false;
+    }
+    if (state.ownsMesh && drawStatus == 1) {
+      bool enabledAfter = false;
+      const bool readAfter =
+          EiemReadRendererEnabled(state.drawRenderer, &enabledAfter);
+      Log("[DEBUG-HR-ATOMIC-v2] restore-end renderer=%p section=%s "
+          "meshAfter=%p bonesAfter=%zu enabledAfter=%d readBack=%d ok=%d",
+          state.drawRenderer, state.renderSection,
+          EiemReadSharedMesh(state.renderer, state.rendererType),
+          g_smr_get_bones
+              ? EiemManagedArrayLength(Invoke(g_smr_get_bones, state.renderer))
+              : 0,
+          enabledAfter ? 1 : 0, readAfter ? 1 : 0, restoredAll ? 1 : 0);
     }
     finish(restoredAll);
   }
@@ -2125,6 +2168,9 @@ static void TraceSkinnedMeshSetBones(void *self, void *bones,
   if (!self || s_eiemApplyingModMeshAssignment) {
     return;
   }
+  void *gameAfterBones = g_smr_get_bones ? Invoke(g_smr_get_bones, self) : nullptr;
+  EiemLogSkinSetterTimeline("bones-game", self, nullptr, nullptr, bones,
+                            gameAfterBones);
 
   // Measure the skinning result at the one boundary where the bone palette
   // changes. `localBounds` cannot answer this: it is authored data and does not
@@ -2213,6 +2259,9 @@ static void TraceSkinnedMeshSetBones(void *self, void *bones,
         Log("[MOD-SKIN] game refresh binding failed renderer=%p error=%s", self, error);
     }
   }
+  void *finalBones = g_smr_get_bones ? Invoke(g_smr_get_bones, self) : nullptr;
+  EiemLogSkinSetterTimeline("bones-final", self, nullptr, nullptr, bones,
+                            finalBones);
   if (tracked) EiemProbePartnerBoneBindings(self, "source-set-bones");
   if (!tracked || !TraceTakeBudget(&s_traceBonesSetterCount, 80)) return;
 
@@ -2476,6 +2525,64 @@ static bool EiemReadBoxedInt(void *getter, void *object, int32_t *value) {
   } __except (EXCEPTION_EXECUTE_HANDLER) {
     return false;
   }
+}
+
+static uint64_t EiemSkinTimelineBoneRefs(void *bones) {
+  const size_t count = EiemManagedArrayLength(bones);
+  if (!bones || count > 512) return 0;
+  void **items = (void **)((char *)bones + IL2CPP_ARRAY_DATA);
+  uint64_t hash = 1469598103934665603ull;
+  for (size_t index = 0; index < count; ++index) {
+    hash ^= (uint64_t)(uintptr_t)items[index];
+    hash *= 1099511628211ull;
+  }
+  return hash;
+}
+
+// This probe answers the timing question directly: a later game-owned setter
+// is evidence of a post-commit overwrite; no later setter shifts suspicion to
+// Unity/game skin-cache invalidation. Keep it small enough for a real run.
+static void EiemLogSkinSetterTimeline(const char *event, void *renderer,
+                                      void *requestedMesh, void *appliedMesh,
+                                      void *incomingBones, void *afterBones) {
+  if (!renderer || InterlockedIncrement(&s_eiemSkinTimelineCount) > 240)
+    return;
+  bool tracked = false;
+  void *replacement = nullptr;
+  char section[96] = {};
+  AcquireSRWLockShared(&s_eiemOverrideLock);
+  const size_t index = EiemFindOverrideLocked(renderer);
+  if (index != SIZE_MAX) {
+    const auto &state = s_eiemOverrides[index];
+    tracked = !state.restorePending && state.ownsMesh && state.replacementMesh;
+    replacement = state.replacementMesh;
+    strncpy_s(section, sizeof(section), state.renderSection, _TRUNCATE);
+  }
+  ReleaseSRWLockShared(&s_eiemOverrideLock);
+  if (!tracked) return;
+
+  const size_t incomingCount = EiemManagedArrayLength(incomingBones);
+  const size_t afterCount = EiemManagedArrayLength(afterBones);
+  const ULONGLONG now = GetTickCount64();
+  const LONG64 commitTick = InterlockedCompareExchange64(
+      &s_eiemLastSkinCommitTick, 0, 0);
+  const ULONGLONG sinceCommit =
+      commitTick > 0 && now >= (ULONGLONG)commitTick
+          ? now - (ULONGLONG)commitTick
+          : 0;
+  const LONG generation = InterlockedCompareExchange(&s_eiemModGeneration, 0, 0);
+  Log("[DEBUG-SKIN-TIMELINE-v1] event=%s tick=%llu gen=%ld tid=%lu "
+      "renderer=%p section=%s requestedMesh=%p appliedMesh=%p currentMesh=%p "
+      "replacement=%p incomingBones=%p incomingCount=%zu incomingRefs=%016llX "
+      "afterBones=%p afterCount=%zu afterRefs=%016llX sinceCommitMs=%llu",
+      event ? event : "unknown", (unsigned long long)now, generation,
+      (unsigned long)GetCurrentThreadId(), renderer,
+      section[0] ? section : "<unknown>", requestedMesh, appliedMesh,
+      EiemReadSharedMesh(renderer, "SkinnedMeshRenderer"), replacement,
+      incomingBones, incomingCount,
+      (unsigned long long)EiemSkinTimelineBoneRefs(incomingBones), afterBones,
+      afterCount, (unsigned long long)EiemSkinTimelineBoneRefs(afterBones),
+      (unsigned long long)sinceCommit);
 }
 
 // A partner is another view of the same source skin. Unity does not clone the
@@ -4781,11 +4888,35 @@ static bool EiemApplyResolvedRenderRule(void *renderer, void *drawRenderer,
         source, asset);
   }
 
-  // `mesh=` replaces the source Renderer's shared Mesh in place. It does not
+  // Build every declared material before changing sharedMesh. A generated
+  // multi-submesh Mesh paired with the source's shorter material array makes
+  // the remaining submeshes disappear. Resource preparation is therefore a
+  // prerequisite for the Mesh write, even though the two Unity assignments
+  // remain separate calls.
+  char error[256] = {};
+  void *preparedMaterials = nullptr;
+  const bool prepareMaterials =
+      (rule.materialCount || rule.submeshCount) &&
+      !EiemMaterialSourceInitActive(drawRenderer);
+  bool resourcesReady = true;
+  if (prepareMaterials &&
+      !EiemBuildRendererMaterialsForSource(rule, drawRenderer,
+                                           &preparedMaterials, error,
+                                           sizeof(error))) {
+    resourcesReady = false;
+    Log("[MOD] %s resource preparation failed before mutation: source=%s "
+        "asset=%s section=%s error=%s",
+        rendererType, source, asset, rule.section,
+        error[0] ? error : "unknown");
+  }
+
+  // `mesh=` replaces the source Renderer’s shared Mesh in place. It does not
   // create another Renderer; an additional Renderer must be declared and
   // referenced explicitly through `partner.N`.
   bool meshApplied = false;
-  if (applyMesh && skeletonReady) {
+  bool rendererDisabledForCommit = false;
+  bool rendererEnabledBeforeCommit = true;
+  if (applyMesh && skeletonReady && resourcesReady) {
     EiemBounds sourceBounds = {};
     const bool hasSourceBounds =
         EiemModEquals(rendererType, "SkinnedMeshRenderer") &&
@@ -4829,6 +4960,21 @@ static bool EiemApplyResolvedRenderRule(void *renderer, void *drawRenderer,
     if (assignedMesh && skinPaletteReady &&
         (!assignedBones || (assignedBonesRoot=EiemUnityRef::Capture(assignedBones,false))) &&
         EiemPrepareRendererShapeBinding(renderer,assignedMesh,rendererType,meshError,sizeof(meshError))) {
+      // A SkinnedMeshRenderer observes sharedMesh and bones through separate
+      // native setters. Keep it out of the render/skin submission path while
+      // those fields are being replaced, otherwise Unity can consume the
+      // intermediate source-Mesh/new-bones or new-Mesh/source-bones pair.
+      if (EiemModEquals(rendererType, "SkinnedMeshRenderer") &&
+          g_renderer_set_enabled &&
+          EiemReadRendererEnabled(drawRenderer, &rendererEnabledBeforeCommit)) {
+        if (rendererEnabledBeforeCommit &&
+            EiemSetRendererEnabled(drawRenderer, false)) {
+          rendererDisabledForCommit = true;
+          Log("[DEBUG-HR-ATOMIC-v1] disabled renderer=%p section=%s "
+              "before mesh/bones commit",
+              drawRenderer, rule.section);
+        }
+      }
       // A failed native setter can already have cleared the field. Own the
       // restoration BEFORE calling it, independently of skip and success.
       EiemBeginMeshWrite(renderer);
@@ -4846,6 +4992,15 @@ static bool EiemApplyResolvedRenderRule(void *renderer, void *drawRenderer,
       Log("[MOD] %s resource mesh replaced: source=%s asset=%s mesh=%s actual=%p",
           rendererType, source, asset, rule.mesh,
           EiemReadSharedMesh(renderer, rendererType));
+      if (EiemModEquals(rendererType, "SkinnedMeshRenderer")) {
+        InterlockedExchange64(&s_eiemLastSkinCommitTick,
+                              (LONG64)GetTickCount64());
+        Log("[DEBUG-GROUND-v1] phase=commit renderer=%p section=%s "
+            "asset=%s replacement=%p",
+            renderer, rule.section, asset, assignedMesh);
+        EiemLogRendererBoneFingerprint("commit", renderer);
+        EiemArmSkinProbeSweep();
+      }
       EiemSetReplacementDrawBounds(renderer, rendererType, assignedMesh,
                                    hasSourceBounds ? &sourceBounds : nullptr);
       if (probeResourceSkin) {
@@ -4864,49 +5019,49 @@ static bool EiemApplyResolvedRenderRule(void *renderer, void *drawRenderer,
   // source Renderer after mesh construction failed would corrupt the source
   // asset and leave a rule that can never be restored consistently. Rules
   // without mesh= remain ordinary source material edits.
-  const bool resourceCommitted = !applyMesh || meshApplied;
-  if (resourceCommitted)
-    EiemRememberRuleBinding(renderer, rule);
-  else
+  bool resourceCommitted = resourcesReady && (!applyMesh || meshApplied);
+  if (!resourceCommitted)
     Log("[MOD] %s resource rule not bound after mesh failure: source=%s "
         "asset=%s mesh=%s",
         rendererType, source, asset, rule.mesh);
-  char error[256] = {};
-  if ((rule.materialCount || rule.submeshCount) && resourceCommitted &&
-      !EiemMaterialSourceInitActive(drawRenderer)) {
-    void *materials = nullptr;
-    if (!EiemBuildRendererMaterialsForSource(rule, drawRenderer, &materials,
-                                             error,
-                                             sizeof(error))) {
-      Log("[MOD] %s material resource failed: source=%s asset=%s section=%s error=%s",
-          rendererType, source, asset, rule.section,
-          error[0] ? error : "unknown");
-    } else if (materials) {
+  if (prepareMaterials && resourceCommitted && preparedMaterials) {
       const bool captured = EiemCaptureOriginal(
           renderer, drawRenderer, mesh, rendererType, false, &rule);
       const bool assigned = captured && EiemAssignRendererMaterials(
-          drawRenderer, materials, error, sizeof(error));
+          drawRenderer, preparedMaterials, error, sizeof(error));
       if (!assigned) {
+        resourceCommitted = false;
         Log("[MOD] %s material assignment failed: source=%s asset=%s section=%s error=%s",
             rendererType, source, asset, rule.section,
             error[0] ? error : (captured ? "assignment failed" : "capture failed"));
       } else {
         Log("[MOD-MATERIAL] applied renderer=%p source=%s asset=%s section=%s slots=%u array=%p stage=resource-rule",
             drawRenderer, source, asset, rule.section, rule.materialCount,
-            materials);
+            preparedMaterials);
       }
-    }
-  } else if ((rule.materialCount || rule.submeshCount) && !resourceCommitted) {
+  } else if (prepareMaterials && !resourceCommitted) {
     Log("[MOD] %s resource dependent edits skipped after mesh failure: "
         "source=%s asset=%s mesh=%s materials=%u submeshes=%u",
         rendererType, source, asset, rule.mesh, rule.materialCount,
         rule.submeshCount);
   }
+  if (resourceCommitted)
+    EiemRememberRuleBinding(renderer, rule);
   if (resourceCommitted) {
     AcquireSRWLockExclusive(&s_eiemOverrideLock);
     const size_t index = EiemFindOverrideLocked(renderer);
     if (index != SIZE_MAX) EiemUpdateRendererShapes(renderer, rendererType, rule, s_eiemOverrides[index].shapes);
     ReleaseSRWLockExclusive(&s_eiemOverrideLock);
+  }
+  if (rendererDisabledForCommit) {
+    const bool restored = EiemSetRendererEnabled(drawRenderer,
+                                                 rendererEnabledBeforeCommit);
+    bool actual = false;
+    const bool readBack = EiemReadRendererEnabled(drawRenderer, &actual);
+    Log("[DEBUG-HR-ATOMIC-v1] restored renderer=%p section=%s setter=%d "
+        "readBack=%d enabled=%d",
+        drawRenderer, rule.section, restored ? 1 : 0, readBack ? 1 : 0,
+        actual ? 1 : 0);
   }
   bool currentEnabled = true;
   const bool readEnabled = EiemReadRendererEnabled(drawRenderer,
@@ -5822,10 +5977,17 @@ static void TraceMaterialInfoInit(void *self, void *renderer, void *configs, voi
     if (original) original(self, renderer, configs, methodInfo);
   }
   if (sourceReady) {
-    // RendererInfo._Init is a per-Renderer callback and can run while the game
-    // is iterating its skin assembly. Apply in-place resource/material actions
-    // here, but defer hierarchy-growing Partner creation to the enclosing
-    // BaseModel/CreateSMS assembly boundary.
+    // EntityRenderHelper owns a complete renderer-registration pass.  Do not
+    // replace one Mesh while that pass is still iterating: later game systems
+    // can otherwise cache a mixture of source and replacement generations.
+    // The enclosing hook commits all rules once the original pass returns.
+    // Standalone RendererInfo initialization remains the verified fallback for
+    // NPC/UI paths which have no enclosing EntityRenderHelper boundary.
+    if (s_eiemEntityRenderHelperInitGuard) return;
+    // Without an enclosing helper this per-Renderer callback is the completed
+    // boundary available to direct NPC/UI construction. Apply in-place
+    // resource/material actions here, while still deferring hierarchy-growing
+    // Partner creation to a model assembly boundary.
     bool applied = false;
     if (EiemIsSkinnedRenderer(renderer)) {
       void *mesh = EiemReadSharedMesh(renderer, "SkinnedMeshRenderer");
@@ -6350,19 +6512,18 @@ static void EiemReapplyShapeControls(const std::vector<std::string> &affected) {
 
 static constexpr UINT_PTR kEiemShapeTransitionTimer = 0xE153;
 static ULONGLONG s_eiemShapeTransitionTick = 0;
-// Partner skinning is measured once at creation, but the reported failure --
-// a mesh lying on the ground -- is a later state: the source Animator assigns
-// bone arrays after the Mod builds the Renderer, and that is what can displace
-// the mesh. Arm a one-shot sweep so the same Renderers are measured again once
-// the character has settled, and trigger the frame timer for it.
+// A replacement can look structurally valid at commit time and still lie on
+// the ground after animation/physics initialization. Revisit only the existing
+// game Renderers whose sharedMesh EIEM replaced; no Partner is involved.
 static ULONGLONG s_eiemSkinProbeArmTick = 0;
 static bool s_eiemSkinProbeSweepDone = false;
 static constexpr ULONGLONG kEiemSkinProbeSettleMs = 1500;
 static volatile LONG s_traceSkinProbeSweepCount = 0;
 
 static void EiemArmSkinProbeSweep() {
-  if (s_eiemSkinProbeArmTick) return;
+  if (s_eiemSkinProbeArmTick && !s_eiemSkinProbeSweepDone) return;
   s_eiemSkinProbeArmTick = GetTickCount64();
+  s_eiemSkinProbeSweepDone = false;
   if (g_gameHwnd && IsWindow(g_gameHwnd))
     SetTimer(g_gameHwnd, kEiemShapeTransitionTimer, 16, nullptr);
 }
@@ -6393,24 +6554,37 @@ static void EiemRefreshShapeTransitionTimer() {
   }
 }
 
-// Measure every Partner again, after the game's own skin/Animator passes have
-// run. This is the state the player actually sees, and the only point where a
-// mesh that lies on the ground can be compared against one that does not.
+// Measure each in-place replacement again after the game's skin/Animator and
+// physics initialization have had time to run. This observes the architecture
+// used by current Mesh replacement rather than the retired Partner path.
 static void EiemRunSkinProbeSweep() {
   if (s_eiemSkinProbeSweepDone || !s_eiemSkinProbeArmTick) return;
   if (GetTickCount64() - s_eiemSkinProbeArmTick < kEiemSkinProbeSettleMs) return;
   s_eiemSkinProbeSweepDone = true;
-  std::vector<void *> partners;
-  AcquireSRWLockShared(&s_eiemPartnerLock);
-  partners.reserve(s_eiemPartners.size());
-  for (const auto &state : s_eiemPartners)
-    if (state.partnerRenderer) partners.push_back(state.partnerRenderer);
-  ReleaseSRWLockShared(&s_eiemPartnerLock);
-  Log("[SKIN-PROBE] phase=settled sweep partners=%zu", partners.size());
-  for (void *partner : partners) {
-    if (!partner || InterlockedIncrement(&s_traceSkinProbeSweepCount) > 400) break;
-    const EiemSkinProbe::Result measurement = EiemSkinProbe::Measure(partner);
-    EiemSkinProbe::LogResult("[SKIN-PROBE] phase=settled partner=1", measurement);
+  std::vector<EiemRenderOverrideState> replacements;
+  AcquireSRWLockShared(&s_eiemOverrideLock);
+  replacements.reserve(s_eiemOverrides.size());
+  for (const auto &state : s_eiemOverrides)
+    if (!state.restorePending && state.ownsMesh && state.replacementMesh &&
+        EiemModEquals(state.rendererType, "SkinnedMeshRenderer"))
+      replacements.push_back(state);
+  ReleaseSRWLockShared(&s_eiemOverrideLock);
+  Log("[DEBUG-GROUND-v1] phase=settled-sweep replacements=%zu",
+      replacements.size());
+  for (const auto &state : replacements) {
+    if (InterlockedIncrement(&s_traceSkinProbeSweepCount) > 400) break;
+    void *renderer = state.rendererRef.Target();
+    if (!renderer || state.rendererRef.Status() != 1) continue;
+    void *current = EiemReadSharedMesh(renderer, state.rendererType);
+    Log("[DEBUG-GROUND-v1] phase=settled renderer=%p section=%s "
+        "original=%p replacement=%p current=%p replacementActive=%d",
+        renderer, state.renderSection[0] ? state.renderSection : "<unknown>",
+        state.originalMesh, state.replacementMesh, current,
+        current == state.replacementMesh ? 1 : 0);
+    EiemLogRendererBoneFingerprint("settled", renderer);
+    const EiemSkinProbe::Result measurement = EiemSkinProbe::Measure(renderer);
+    EiemSkinProbe::LogResult("[DEBUG-GROUND-v1] phase=settled-pose",
+                             measurement);
   }
 }
 
@@ -6448,6 +6622,12 @@ static EiemModUpdateQueue s_eiemModUpdates;
 // callback would otherwise flood the game's window queue while a scene is
 // assembling.
 static volatile LONG s_eiemModUpdateMessagePosted = 0;
+// A reload commits the candidate and restores source state in the current
+// Unity message, then replays live SkinnedMeshRenderers after several frames.
+// This is deliberately a one-shot experiment for the F10 pose race; the
+// replay-only request bit is never produced by the hotkey or lifecycle queues.
+static volatile LONG s_eiemDeferredModReplayPending = 0;
+static constexpr uint32_t kEiemDeferredReplayRequest = 0x80000000u;
 // One ordered queue for window-thread keys and render-thread ImGui controls.
 static SRWLOCK s_eiemInputLock = SRWLOCK_INIT;
 static std::vector<EiemModInputEvent> s_eiemPendingInputs;
@@ -6461,19 +6641,35 @@ static void EiemQueueModInput(EiemModInputEvent event) {
       s_eiemPendingInputs.back().uiSection == event.uiSection) {
     for (const auto &value : event.values) s_eiemPendingInputs.back().values[value.first] = value.second;
   }
+  else if (event.holdTick && !s_eiemPendingInputs.empty() &&
+           s_eiemPendingInputs.back().holdTick &&
+           s_eiemPendingInputs.back().generation == event.generation &&
+           s_eiemPendingInputs.back().modPath == event.modPath &&
+           s_eiemPendingInputs.back().chord == event.chord &&
+           s_eiemPendingInputs.back().uiFocus == event.uiFocus) {
+    // A busy Unity thread may leave several 20 ms polls queued. Merge their
+    // elapsed time into one transaction so the input queue stays bounded.
+    s_eiemPendingInputs.back().holdSeconds += event.holdSeconds;
+  }
   else s_eiemPendingInputs.push_back(std::move(event));
   ReleaseSRWLockExclusive(&s_eiemInputLock);
   EiemRequestModUpdate(EiemModUpdate::Reapply, "mod control");
 }
 
-static void EiemQueueModKey(EiemKeyChord chord, LONG generation) {
+static void EiemQueueModKey(EiemKeyChord chord, LONG generation,
+                            bool holdTick = false,
+                            double holdSeconds = 0.02) {
   if (!EiemOnUnityThread() || !g_pluginActive) return;
   HWND foreground = GetForegroundWindow();
   if (foreground != g_gameHwnd && foreground != g_guiHwnd && foreground != g_modUiHwnd) return;
   EiemModInputEvent event{chord,generation};
+  event.modPath = EiemGetSelectedModPath();
+  if (event.modPath.empty()) return;
   event.uiFocus = foreground != g_gameHwnd;
+  event.holdTick = holdTick;
+  event.holdSeconds = holdSeconds;
   EiemRegistrationTraceInput(chord.vk, chord.modifiers, generation,
-                             event.uiFocus, nullptr, nullptr, 0);
+                             event.uiFocus, event.modPath.c_str(), nullptr, 0);
   EiemQueueModInput(std::move(event));
 }
 
@@ -6515,11 +6711,87 @@ static void EiemQueueModReconcile(const char *reason) {
   EiemRequestModUpdate(EiemModUpdate::Reconcile, reason);
 }
 
+static bool EiemSubmeshVisibilityTargets(
+    const EiemRenderOverrideState &state,
+    const std::vector<EiemSubmeshVisibilityChange> &changes) {
+  for (const auto &change : changes)
+    if (EiemModEquals(state.modPath, change.modPath.c_str()) &&
+        EiemModEquals(state.renderSection, change.section.c_str()))
+      return true;
+  return false;
+}
+
+// A visibility key changes only the generated Mesh index buffers. Existing
+// Renderer skin/material/physics state already belongs to the game instance;
+// keep the registered Mesh identity and every Renderer field unchanged.
+static uint32_t EiemReapplySubmeshVisibility(
+    const std::vector<EiemSubmeshVisibilityChange> &changes) {
+  if (changes.empty()) return 0;
+  std::vector<EiemRenderOverrideState> targets;
+  AcquireSRWLockShared(&s_eiemOverrideLock);
+  for (const auto &state : s_eiemOverrides)
+    if (!state.restorePending && state.ownsMesh &&
+        EiemSubmeshVisibilityTargets(state, changes))
+      targets.push_back(state);
+  ReleaseSRWLockShared(&s_eiemOverrideLock);
+
+  uint32_t applied = 0;
+  for (const auto &state : targets) {
+    if (!state.renderer || state.rendererRef.Status() != 1 ||
+        state.sourceMeshRef.Status() != 1)
+      continue;
+    void *current = EiemReadSharedMesh(state.renderer, state.rendererType);
+    if (!current || current != state.replacementMesh) {
+      Log("[MOD] Submesh visibility skipped renderer=%p section=%s "
+          "reason=game mesh changed current=%p expected=%p",
+          state.renderer, state.renderSection, current,
+          state.replacementMesh);
+      continue;
+    }
+    EiemModRule rule = {};
+    if (!EiemFindRenderRuleBySection(state.modPath, state.renderSection,
+                                     &rule) ||
+        !rule.hasMesh)
+      continue;
+    void *resourceMesh = nullptr;
+    char error[256] = {};
+    if (!EiemBuildMeshResource(rule, &resourceMesh, error, sizeof(error),
+                               state.originalMesh) ||
+        !resourceMesh) {
+      Log("[MOD] Submesh visibility update failed renderer=%p section=%s "
+          "mask=0x%08X error=%s",
+          state.renderer, state.renderSection, rule.hiddenSubmeshMask,
+          error[0] ? error : "unknown");
+      continue;
+    }
+    if (resourceMesh != current) {
+      Log("[MOD] Submesh visibility skipped renderer=%p section=%s "
+          "reason=resource identity changed current=%p resource=%p; use F10",
+          state.renderer, state.renderSection, current, resourceMesh);
+      continue;
+    }
+    ++applied;
+    Log("[MOD] Submesh visibility applied renderer=%p section=%s "
+        "mask=0x%08X mesh=%p",
+        state.renderer, state.renderSection, rule.hiddenSubmeshMask,
+        resourceMesh);
+  }
+  return applied;
+}
+
 // Runs only from MmdWndProc. F10 restores the previous generation, then
 // replays configuration against instances registered by either supported
 // model lifecycle adapter. No scene-wide Mesh scan exists.
 static void EiemRunModReconcile() {
-  const uint32_t requests = s_eiemModUpdates.Take();
+  uint32_t requests = s_eiemModUpdates.Take();
+  bool deferredReplayOnly = false;
+  if (!requests && InterlockedCompareExchange(&s_eiemDeferredModReplayPending, 0, 1) == 1) {
+    requests = kEiemDeferredReplayRequest;
+    deferredReplayOnly = true;
+    Log("[DEBUG-HR-DEFER-v1] replay begin tick=%llu tid=%lu generation=%ld",
+        GetTickCount64(), (unsigned long)GetCurrentThreadId(),
+        InterlockedCompareExchange(&s_eiemModGeneration, 0, 0));
+  }
   if (g_shutdownRequested) return;
   // A stale wake-up message must not replay every registered model. The
   // request bitmask is the transaction authority; an empty mask is a no-op.
@@ -6551,15 +6823,30 @@ static void EiemRunModReconcile() {
   const ULONGLONG reconcileStarted = GetTickCount64();
   if (reload)
     Log("[MOD-RELOAD-TRACE] begin requests=0x%X", requests);
+  EiemModProgram reloadProgram;
+  if (reload) {
+    s_eiemPersistentStates.Flush(true);
+    std::string failure;
+    if (!EiemPrepareModReload(&reloadProgram, &failure)) {
+      Log("[MOD-RELOAD-TRACE] rejected before mutation: %s",
+          failure.empty() ? "unknown parse error" : failure.c_str());
+      EiemRegistrationTraceReconcile(
+          "reload-rejected", requests, generation, inputs.size(), 0, 0,
+          GetTickCount64() - reconcileStarted);
+      return;
+    }
+  }
   EiemModProgram next;
   std::vector<std::string> affectedMods;
   const std::vector<std::string> *affected = nullptr;
   bool partnerLinksOnly = false;
   bool submeshVisibilityOnly = false;
+  std::vector<EiemSubmeshVisibilityChange> visibilityChanges;
   if (!reload && !inputs.empty()) {
     bool shapesOnly = false;
     if (EiemPrepareInputUpdate(inputs, &next, &affectedMods, &shapesOnly,
-                               &partnerLinksOnly, &submeshVisibilityOnly)) {
+                               &partnerLinksOnly, &submeshVisibilityOnly,
+                               &visibilityChanges)) {
       if (shapesOnly && !(requests & (uint32_t)EiemModUpdate::Reconcile)) {
         EiemPublishModState(std::move(next));
         EiemReapplyShapeControls(affectedMods);
@@ -6575,24 +6862,14 @@ static void EiemRunModReconcile() {
         // Rebuild only the visibility variant; do not restore/destroy model
         // objects or replay Physics just because a key changed a submesh mask.
         EiemPublishModState(std::move(next));
-        EiemPruneModelInstances();
-        std::vector<EiemModelInstanceState> instances;
-        AcquireSRWLockShared(&s_eiemModelInstanceLock);
-        instances = s_eiemModelInstances;
-        ReleaseSRWLockShared(&s_eiemModelInstanceLock);
-        uint32_t matched = 0;
-        for (const auto &instance : instances) {
-          if (!instance.model || instance.modelRef.Status() != 1) continue;
-          if (EiemApplyStandaloneRenderRules(
-                  instance.model, "submesh visibility key", nullptr,
-                  &affectedMods, nullptr, false))
-            ++matched;
-        }
-        Log("[MOD] Submesh visibility reconcile: models=%zu matched=%u",
-            instances.size(), matched);
+        const uint32_t matched =
+            EiemReapplySubmeshVisibility(visibilityChanges);
+        Log("[MOD] Submesh visibility reconcile: rules=%zu renderers=%u",
+            visibilityChanges.size(), matched);
         EiemRefreshShapeTransitionTimer();
         EiemRegistrationTraceReconcile(
-            "end", requests, generation, inputs.size(), instances.size(),
+            "end", requests, generation, inputs.size(),
+            visibilityChanges.size(),
             matched, GetTickCount64() - reconcileStarted);
         return;
       }
@@ -6637,15 +6914,26 @@ static void EiemRunModReconcile() {
     if (reload)
       Log("[MOD-RELOAD-TRACE] phase=restore end elapsed=%llums",
           GetTickCount64() - phaseStarted);
-  }, [] {
+  }, [&] {
     const ULONGLONG phaseStarted = GetTickCount64();
     Log("[MOD-RELOAD-TRACE] phase=load begin");
-    LoadEiemConfig(); EiemReportCameraFade(); EiemReloadMods();
+    LoadEiemConfig();
+    EiemReportCameraFade();
+    EiemPublishPreparedModReload(std::move(reloadProgram));
     Log("[MOD-RELOAD-TRACE] phase=load end elapsed=%llums",
         GetTickCount64() - phaseStarted);
   }, [&] {
-   if (affected) EiemPublishModState(std::move(next));
-   const char *stage = reload ? "global reload" : affected ? "control state change" : "lifecycle reconcile";
+    if (affected) EiemPublishModState(std::move(next));
+    const char *stage = reload ? "global reload" : deferredReplayOnly ? "deferred reload" : affected ? "control state change" : "lifecycle reconcile";
+    if (reload) {
+      Log("[DEBUG-HR-DEFER-v1] restore/load complete tick=%llu tid=%lu generation=%ld; replay scheduled +100ms",
+          GetTickCount64(), (unsigned long)GetCurrentThreadId(),
+          InterlockedCompareExchange(&s_eiemModGeneration, 0, 0));
+      InterlockedExchange(&s_eiemDeferredModReplayPending, 1);
+      EiemPhysicsRuntimeBoundary("mod reload deferred");
+      if (g_gameHwnd) SetTimer(g_gameHwnd, kEiemModReplayTimer, 100, nullptr);
+      return;
+    }
    const ULONGLONG started = GetTickCount64();
    EiemPruneModelInstances();
   std::vector<EiemModelInstanceState> instances;
@@ -6699,8 +6987,12 @@ static void EiemRunModReconcile() {
       "end", requests,
       InterlockedCompareExchange(&s_eiemModGeneration, 0, 0), inputs.size(),
       instances.size(), matched, elapsed);
-  EiemPhysicsRuntimeBoundary("mod reconcile end");
-  });
+   EiemPhysicsRuntimeBoundary("mod reconcile end");
+   if (deferredReplayOnly)
+     Log("[DEBUG-HR-DEFER-v1] replay end tick=%llu tid=%lu generation=%ld",
+         GetTickCount64(), (unsigned long)GetCurrentThreadId(),
+         InterlockedCompareExchange(&s_eiemModGeneration, 0, 0));
+   });
   s_eiemPhysicsLifecycleTransaction = false;
 }
 
@@ -8667,6 +8959,8 @@ static void TraceSkinnedMeshSetSharedMesh(void *self, void *mesh,
   void *retained = EiemReplacementForSourceMesh(self, sourceMesh);
   if (retained) mesh = retained;
   if (original) original(self, mesh, methodInfo);
+  EiemLogSkinSetterTimeline("sharedMesh-game", self, sourceMesh, mesh,
+                            nullptr, nullptr);
   // This setter is also used while the game's skin/LOD assembly is only
   // partially populated.  It remains observation/reassertion-only; resource
   // rules are committed at the completed assembly boundaries instead.

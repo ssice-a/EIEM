@@ -155,6 +155,7 @@ struct EiemKeyAssignment {
   std::string variable;
   std::vector<double> values;
 };
+enum class EiemModKeyBehavior { Cycle, Hold };
 enum class EiemKeyScope { Game, Ui, Both };
 static bool EiemKeyInScope(EiemKeyScope scope, bool uiFocus) {
   return scope == EiemKeyScope::Both || scope == (uiFocus ? EiemKeyScope::Ui : EiemKeyScope::Game);
@@ -164,6 +165,8 @@ struct EiemModKey {
   EiemKeyChord chord;
   size_t line = 0;
   std::vector<EiemKeyAssignment> assignments;
+  EiemModKeyBehavior behavior = EiemModKeyBehavior::Cycle;
+  double speed = 0.0; // Hold target movement in variable units per second.
   EiemKeyScope scope = EiemKeyScope::Game;
 };
 struct EiemModUi {
@@ -481,12 +484,23 @@ static bool EiemValidateModDocument(EiemModProgram &doc, std::string &error) {
     if (!edges[target].empty()) { error = "Nested/cyclic partner references are not supported"; return false; }
   for (const auto &key : state.keys) {
     if (!key.chord.vk || key.assignments.empty()) {
-      error = std::to_string(key.line) + ": Key needs key=, type=cycle and variable values"; return false;
+      error = std::to_string(key.line) + ": Key needs key=, type and variable values"; return false;
     }
-    const size_t length = key.assignments.front().values.size();
-    for (const auto &assignment : key.assignments) {
-      if (!state.defaults.count(assignment.variable) || length < 2 || assignment.values.size() != length) {
-        error = std::to_string(key.line) + ": Invalid cycle variable/list: " + assignment.variable; return false;
+    if (key.behavior == EiemModKeyBehavior::Hold) {
+      if (!std::isfinite(key.speed) || key.speed <= 0) {
+        error = std::to_string(key.line) + ": Hold Key needs speed=positive"; return false;
+      }
+      for (const auto &assignment : key.assignments) {
+        if (!state.defaults.count(assignment.variable) || assignment.values.size() != 1) {
+          error = std::to_string(key.line) + ": Hold Key needs one target value: " + assignment.variable; return false;
+        }
+      }
+    } else {
+      const size_t length = key.assignments.front().values.size();
+      for (const auto &assignment : key.assignments) {
+        if (!state.defaults.count(assignment.variable) || length < 2 || assignment.values.size() != length) {
+          error = std::to_string(key.line) + ": Invalid cycle variable/list: " + assignment.variable; return false;
+        }
       }
     }
   }
@@ -531,11 +545,11 @@ static bool EiemModParseStream(std::istream &input, const char *path,
   };
   std::vector<Frame> stack;
   std::vector<EiemModStatement> *body = nullptr;
-  bool keyTypeSeen = false, keyScopeSeen = false;
+  bool keyTypeSeen = false, keySpeedSeen = false, keyScopeSeen = false;
   size_t conditionNodes = 0;
   auto finishSection = [&]() {
     if (!stack.empty()) return fail("Missing endif before section end");
-    if (section == Key && !keyTypeSeen) return fail("Key needs type=cycle");
+    if (section == Key && !keyTypeSeen) return fail("Key needs type=cycle or type=hold");
     if (section == Resource && !doc.resources.back().path[0]) return fail("Resource needs path");
     if (section == Prefab && !doc.prefabs.back().path[0]) return fail("Prefab needs path");
     return true;
@@ -562,7 +576,7 @@ static bool EiemModParseStream(std::istream &input, const char *path,
         state.uis.back().section = name;
       }
       else if (_strnicmp(name.c_str(), "Key", 3) == 0) {
-        section = Key; keyTypeSeen = keyScopeSeen = false;
+        section = Key; keyTypeSeen = keySpeedSeen = keyScopeSeen = false;
         state.keys.push_back({});
         state.keys.back().section = name; state.keys.back().line = lineNumber;
       } else if (_strnicmp(name.c_str(), "Render", 6) == 0) {
@@ -652,7 +666,7 @@ static bool EiemModParseStream(std::istream &input, const char *path,
         size_t end = value.find(',', start);
         std::string token = value.substr(start, end == std::string::npos ? end : end - start);
         EiemModTrim(token); double number = 0;
-        if (!EiemNumber(token, &number)) return fail("Invalid cycle value: " + token);
+        if (!EiemNumber(token, &number)) return fail("Invalid Key value: " + token);
         a.values.push_back(number);
         if (end == std::string::npos) break;
         start = end + 1;
@@ -676,7 +690,21 @@ static bool EiemModParseStream(std::istream &input, const char *path,
     if (section == Key) {
       if (key == "key") {
         if (state.keys.back().chord.vk || !EiemParseKeyChord(value, &state.keys.back().chord)) return fail("Invalid/duplicate key chord");
-      } else if (key == "type" && EiemModEquals(value.c_str(), "cycle") && !keyTypeSeen) keyTypeSeen = true;
+      } else if (key == "type" && !keyTypeSeen) {
+        if (EiemModEquals(value.c_str(), "cycle"))
+          state.keys.back().behavior = EiemModKeyBehavior::Cycle;
+        else if (EiemModEquals(value.c_str(), "hold"))
+          state.keys.back().behavior = EiemModKeyBehavior::Hold;
+        else
+          return fail("Key type must be cycle or hold");
+        keyTypeSeen = true;
+      } else if (key == "speed" && !keySpeedSeen) {
+        double speed = 0;
+        if (!EiemNumber(value, &speed) || !std::isfinite(speed) || speed <= 0)
+          return fail("Key speed must be positive");
+        state.keys.back().speed = speed;
+        keySpeedSeen = true;
+      }
       else if (key == "scope" && !keyScopeSeen) {
         keyScopeSeen = true;
         if (EiemModEquals(value.c_str(),"game")) state.keys.back().scope = EiemKeyScope::Game;
@@ -810,29 +838,63 @@ static bool EiemModParseFile(const char *path, EiemModProgram &output, std::stri
   EiemAppendModDocument(output,std::move(doc)); return true;
 }
 
-// Every press is evaluated in event order; never collapse two presses into one.
-// Returns the mods whose variables actually changed, for scoped restoration.
-static std::vector<std::string> EiemCycleModKey(EiemModProgram &program, EiemKeyChord chord, bool uiFocus = false) {
+// Apply one key event. Cycle keys advance once; hold keys move each assigned
+// variable toward its single target. The caller supplies elapsed wall time for
+// hold ticks, while an edge event receives one default 20 ms step.
+static std::vector<std::string> EiemApplyModKey(
+    EiemModProgram &program, EiemKeyChord chord, bool uiFocus = false,
+    const char *modPath = nullptr, const char *keySection = nullptr,
+    bool holdTick = false, double holdSeconds = 0.02) {
   std::vector<std::string> changed;
+  if (!std::isfinite(holdSeconds) || holdSeconds <= 0) holdSeconds = 0.02;
+  holdSeconds = (std::min)(holdSeconds, 0.25);
   for (auto &state : program.states) {
+    if (modPath && (!modPath[0] || !EiemModEquals(state.path.c_str(), modPath)))
+      continue;
     bool dirty = false;
     for (const auto &key : state.keys) {
+      if (keySection && (!keySection[0] || key.section != keySection))
+        continue;
       if (!(key.chord == chord) || !EiemKeyInScope(key.scope,uiFocus)) continue;
-      size_t count = key.assignments.front().values.size(), selected = 0;
-      for (size_t i = 0; i < count; ++i) {
-        bool matches = true;
-        for (const auto &a : key.assignments)
-          if (state.variables.at(a.variable) != a.values[i]) { matches = false; break; }
-        if (matches) { selected = (i + 1) % count; break; }
-      }
-      for (const auto &a : key.assignments) {
-        double &value = state.variables.at(a.variable);
-        dirty = dirty || value != a.values[selected];
-        value = a.values[selected];
+      if (key.behavior == EiemModKeyBehavior::Hold) {
+        // A hold edge and every subsequent poll use the same target movement.
+        // The target may be either side of the current value, so increase and
+        // decrease keys need no separate direction flag.
+        for (const auto &a : key.assignments) {
+          double &value = state.variables.at(a.variable);
+          const double target = a.values.front();
+          const double distance = key.speed * holdSeconds;
+          const double next = value < target
+              ? (std::min)(value + distance, target)
+              : (std::max)(value - distance, target);
+          dirty = dirty || value != next;
+          value = next;
+        }
+      } else if (!holdTick) {
+        size_t count = key.assignments.front().values.size(), selected = 0;
+        for (size_t i = 0; i < count; ++i) {
+          bool matches = true;
+          for (const auto &a : key.assignments)
+            if (state.variables.at(a.variable) != a.values[i]) { matches = false; break; }
+          if (matches) { selected = (i + 1) % count; break; }
+        }
+        for (const auto &a : key.assignments) {
+          double &value = state.variables.at(a.variable);
+          dirty = dirty || value != a.values[selected];
+          value = a.values[selected];
+        }
       }
     }
     if (dirty) changed.push_back(state.path);
   }
   if (!changed.empty()) EiemEvaluateModProgram(program);
   return changed;
+}
+
+// Compatibility wrapper for callers/tests that explicitly request a cycle.
+static std::vector<std::string> EiemCycleModKey(
+    EiemModProgram &program, EiemKeyChord chord, bool uiFocus = false,
+    const char *modPath = nullptr, const char *keySection = nullptr) {
+  return EiemApplyModKey(program, chord, uiFocus, modPath, keySection,
+                         false, 0.02);
 }

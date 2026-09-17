@@ -16,6 +16,9 @@ class RuntimeHookContracts(unittest.TestCase):
             encoding="utf-8"
         )
         cls.init = (ROOT / "src" / "init.h").read_text(encoding="utf-8")
+        cls.dispatcher = (ROOT / "src" / "eiem_mod_dispatcher.h").read_text(
+            encoding="utf-8"
+        )
 
     def test_model_instances_have_prefab_and_ui_lifecycle_adapters(self):
         self.assertIn("TracePrefabInstantiateCompleted", self.trace)
@@ -76,12 +79,15 @@ class RuntimeHookContracts(unittest.TestCase):
         start = self.trace.index("static bool EiemApplyResolvedRenderRule")
         end = self.trace.index("static void *EiemFindMeshFilterDrawRenderer", start)
         body = self.trace[start:end]
-        self.assertIn("const bool resourceCommitted = !applyMesh || meshApplied", body)
+        self.assertIn(
+            "bool resourceCommitted = resourcesReady && (!applyMesh || meshApplied)",
+            body,
+        )
         self.assertIn("resource dependent edits skipped after mesh failure", body)
         self.assertIn("if (resourceCommitted)\n    EiemRememberRuleBinding", body)
         self.assertLess(
-            body.index("if (resourceCommitted)\n    EiemRememberRuleBinding"),
-            body.index("if ((rule.materialCount || rule.submeshCount) && resourceCommitted"),
+            body.index("EiemBuildRendererMaterialsForSource"),
+            body.index("EiemBeginMeshWrite(renderer)"),
         )
         self.assertIn("if (resourceCommitted) {", body)
 
@@ -292,12 +298,16 @@ class RuntimeHookContracts(unittest.TestCase):
         self.assertIn("TraceRendererInfoTryReplaceSharedMaterials", self.trace)
         self.assertIn("EiemFindBoundRenderRule", self.trace)
 
-    def test_renderer_info_init_does_not_create_partners_reentrantly(self):
+    def test_renderer_info_init_defers_inside_entity_helper_and_does_not_create_partners(self):
         start = self.trace.index("static void TraceMaterialInfoInit")
         end = self.trace.index("static bool TraceRendererInfoTrySetSharedMaterial", start)
         body = self.trace[start:end]
         self.assertLess(
             body.index("original(self, renderer, configs, methodInfo)"),
+            body.index("EiemApplyStandaloneRenderRulesToRenderer"),
+        )
+        self.assertLess(
+            body.index("if (s_eiemEntityRenderHelperInitGuard) return;"),
             body.index("EiemApplyStandaloneRenderRulesToRenderer"),
         )
         self.assertIn('"RendererInfo._Init"', body)
@@ -389,15 +399,52 @@ class RuntimeHookContracts(unittest.TestCase):
         self.assertIn("void *sourceMaterial = EiemLoadOriginalAsset", material_body)
         self.assertNotIn("EiemBuildGlobalResource", self.backend)
 
+    def test_material_loader_resolves_the_game_resource_manager_without_probes(self):
+        resolve_start = self.backend.index("static void EiemResolveResourceBackend")
+        resolve_end = self.backend.index("template <typename T>", resolve_start)
+        resolve = self.backend[resolve_start:resolve_end]
+        load_start = self.backend.index("static void *EiemLoadOriginalAsset")
+        load_end = self.backend.index("static bool EiemParseColor", load_start)
+        load = self.backend[load_start:load_end]
+        self.assertIn('FindClass("Beyond.Resource", "ResourceManager"', resolve)
+        self.assertIn('FindMethod(', resolve)
+        self.assertIn('"get_instance"', resolve)
+        self.assertIn("EiemResolveResourceManagerInstance()", load)
+        self.assertNotIn("kEiemValidationIdentityProbe", load)
+
+    def test_mesh_and_declared_materials_are_prepared_before_renderer_mutation(self):
+        start = self.trace.index("static bool EiemApplyResolvedRenderRule")
+        end = self.trace.index("static void *EiemFindMeshFilterDrawRenderer", start)
+        body = self.trace[start:end]
+        prepare = body.index("EiemBuildRendererMaterialsForSource")
+        mesh_write = body.index("EiemBeginMeshWrite(renderer)")
+        material_write = body.index("EiemAssignRendererMaterials")
+        self.assertLess(prepare, mesh_write)
+        self.assertLess(mesh_write, material_write)
+        self.assertIn("resource preparation failed before mutation", body)
+
+    def test_skinned_mesh_commit_is_hidden_until_mesh_bones_and_materials_are_ready(self):
+        start = self.trace.index("static bool EiemApplyResolvedRenderRule")
+        end = self.trace.index("static void *EiemFindMeshFilterDrawRenderer", start)
+        body = self.trace[start:end]
+        disable = body.index("[DEBUG-HR-ATOMIC-v1]")
+        mesh = body.index("EiemSetSharedMesh(renderer, assignedMesh")
+        material = body.index("EiemAssignRendererMaterials")
+        restore = body.index("restored renderer=%p section=%s")
+        self.assertLess(disable, mesh)
+        self.assertLess(mesh, material)
+        self.assertLess(material, restore)
+        self.assertIn("rendererEnabledBeforeCommit", body)
+        self.assertIn("EiemReadRendererEnabled(drawRenderer, &actual)", body)
+
     def test_initial_mod_rules_load_before_resource_hooks_are_enabled(self):
         start = self.init.index("static DWORD WINAPI InitThread")
         body = self.init[start:]
         self.assertLess(body.index("EiemReloadMods();"),
                         body.index("InitIl2CppResourceTrace(asms, ac);"))
 
-        hotkey_start = self.init.index("static DWORD WINAPI HotkeyThread")
-        hotkey_end = self.init.index("static DWORD WINAPI InitThread")
-        hotkey_body = self.init[hotkey_start:hotkey_end]
+        hotkey_start = self.dispatcher.index("static DWORD WINAPI HotkeyThread")
+        hotkey_body = self.dispatcher[hotkey_start:]
         hotkey_setup = hotkey_body[:hotkey_body.index("enum class KeyAction")]
         self.assertNotIn("EiemReloadMods();", hotkey_setup)
         self.assertNotIn("EiemReloadMods();", hotkey_body)
@@ -421,12 +468,57 @@ class RuntimeHookContracts(unittest.TestCase):
         self.assertIn("EiemPhysicsRuntimeRetireChangedAssets", body)
         self.assertNotIn("mod reload before renderer restore", body)
         self.assertIn("EiemRestoreRenderOverrides(affected)", body)
-        self.assertIn("EiemReloadMods()", body)
+        self.assertIn("EiemPrepareModReload(&reloadProgram", body)
+        self.assertIn("rejected before mutation", body)
+        self.assertIn("EiemPublishPreparedModReload(std::move(reloadProgram))", body)
+        self.assertLess(body.index("EiemPrepareModReload(&reloadProgram"),
+                        body.index('EiemPhysicsRuntimeBoundary("mod reconcile begin")'))
+        self.assertLess(body.index("EiemRestoreRenderOverrides(affected)"),
+                        body.index("EiemPublishPreparedModReload(std::move(reloadProgram))"))
         visibility = body.index("if (submeshVisibilityOnly")
         boundary = body.index('EiemPhysicsRuntimeBoundary("mod reconcile begin")')
         self.assertLess(visibility, boundary)
+        visibility_end = body.index("      affected = &affectedMods;", visibility)
+        visibility_body = body[visibility:visibility_end]
+        self.assertIn("EiemReapplySubmeshVisibility", visibility_body)
+        self.assertNotIn("EiemApplyStandaloneRenderRules(", visibility_body)
         entry = (ROOT / "src" / "eiem.cpp").read_text(encoding="utf-8")
         self.assertNotIn("EiemReloadMods();", entry)
+
+    def test_submesh_key_mutates_only_the_bound_mesh_indices(self):
+        start = self.trace.index("static uint32_t EiemReapplySubmeshVisibility")
+        end = self.trace.index("static void EiemRunModReconcile()", start)
+        body = self.trace[start:end]
+        self.assertIn("EiemBuildMeshResource", body)
+        self.assertNotIn("EiemSetSharedMesh", body)
+        self.assertNotIn("EiemRememberReplacement", body)
+        self.assertNotIn("EiemApplyStandaloneRenderRules", body)
+        self.assertNotIn("EiemPreserveSourceSkinning", body)
+        self.assertNotIn("EiemAssignRendererMaterials", body)
+        self.assertNotIn("EiemPhysics", body)
+
+    def test_mesh_cache_keeps_one_identity_across_submesh_visibility(self):
+        self.assertIn("uint64_t variant = 0;", self.backend)
+        build_start = self.backend.index("static bool EiemBuildMeshResource")
+        build_end = self.backend.index("static bool EiemResolveResourceDiskPath", build_start)
+        build = self.backend[build_start:build_end]
+        self.assertIn("rule.hiddenSubmeshMask", build)
+        self.assertIn("EiemApplyMeshSubmeshVisibility", build)
+        self.assertNotIn("fileStamp ^= (uint64_t)rule.hiddenSubmeshMask", build)
+        self.assertNotIn("rule.hiddenSubmeshMask)) return false", build)
+
+    def test_static_baseline_uses_minimal_mod_window_dispatcher(self):
+        start = self.dispatcher.index("static LRESULT CALLBACK EiemModWndProc")
+        end = self.dispatcher.index("static DWORD WINAPI HotkeyThread", start)
+        body = self.dispatcher[start:end]
+        self.assertIn("WM_EIEM_MOD_RECONCILE", body)
+        self.assertIn("WM_EIEM_MOD_KEY", body)
+        self.assertIn("EiemRunModReconcile", body)
+        self.assertNotIn("PhysicsAutoTrace", body)
+        self.assertNotIn("ApplyMmdPose", body)
+        init = self.init[self.init.index("static DWORD WINAPI InitThread") :]
+        self.assertLess(init.index("CreateThread(NULL, 0, HotkeyThread"),
+                        init.index("if (kEiemEnableLegacyWorkers)"))
 
     def test_reconcile_wakeup_is_coalesced_and_physics_is_boundary_driven(self):
         queue = self.trace[self.trace.index("static bool EiemPostPendingModUpdate") :
@@ -477,7 +569,9 @@ class RuntimeHookContracts(unittest.TestCase):
     def test_reconcile_begin_and_end_share_the_generation_trace(self):
         self.assertIn("EiemRegistrationTraceReconcile", self.trace)
         body = self.trace[self.trace.index("static void EiemRunModReconcile") :]
-        self.assertIn("if (!requests) return;", body[:500])
+        self.assertIn("s_eiemDeferredModReplayPending", body[:700])
+        self.assertIn("if (!requests) return;", body[:1000])
+        self.assertIn("kEiemDeferredReplayRequest", body[:700])
         self.assertIn('EiemRegistrationTraceReconcile("begin"', body)
         self.assertIn('EiemRegistrationTraceReconcile(\n      "end"', body)
         self.assertIn("inputs.size()", body)

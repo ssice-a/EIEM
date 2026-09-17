@@ -7,7 +7,7 @@
 目录只需要：
 
 - `__init__.py`：插件发现和注册入口，包含 Blender 要求的 `bl_info`。
-- `eiem_blender_addon.py`：导入、编辑、导出入口，仓库源码版本 0.30.3。
+- `eiem_blender_addon.py`：导入、编辑、导出入口，仓库源码版本 0.31.0。
 - `eiem_blender_controls.py`：形态键与网格切换的作者数据、预览和导出计划，必须一起分发。
 - `eiem_physics_authoring.py`、`eiem_physics_document.py`：Physics 面板、辅助体和资源读写，必须一起分发。
 - `eiem_physics_native.py`、`eiem_physics_source.py`：源物理图保留、编辑和独立 v2 导出，必须一起分发。
@@ -152,7 +152,7 @@ MOVE 骨段的半角为 `limitAngle.value × curve(depth)`。这里的 depth 与
 
 原生源球体/胶囊现在可转为作者 v5 碰撞记录并进入组合 Mod；无限平面与完整原生 v2 图仍只用于导入、可视化、
 复制和独立保存。常规 Mesh 与作者物理均按选择增量输出，不以 PFB 限定消费者。
-0.30.3 的运行文件同步后，已运行的 Blender 会话需要执行 **Blender: Reload Addons** 才会载入新版。
+0.31.0 的运行文件同步后，已运行的 Blender 会话需要执行 **Blender: Reload Addons** 才会载入新版。
 旧 ZIP 和已经打开的 `.blend` 不会自行改写；旧场景可用上面的整理操作迁移物理集合。
 
 ## UV 接缝与导出顶点（0.8.2）

@@ -201,6 +201,7 @@ shape_variable = declarations[0][0]
 assert "imgui.SliderFloat" in ui and ('mod.get("' + shape_variable + '")') in ui
 assert text.count("[Render") == 1
 assert "submesh_visible." in text
+assert "partner." not in text
 payloads = [addon.read_mesh(p) for p in (package / "meshes").glob("*.mesh")]
 assert len(payloads) == 1 and len(payloads[0]["indices"]) == 18
 for p in payloads:

@@ -155,6 +155,8 @@ int main(int argc, char **argv) {
     CHECK(!parse("[Constants]\n$a=0\n[KeyA]\nkey=F6\ntype=cycle\n$a=0\n", p, error));
     CHECK(!parse("[Constants]\n$a=0\n[KeyA]\nkey=F6\n$a=0,1\n", p, error));
     CHECK(!parse("[Constants]\n$a=0\n[KeyA]\nkey=F6\ntype=hold\n$a=0,1\n", p, error));
+    CHECK(!parse("[Constants]\n$a=0\n[KeyA]\nkey=F6\ntype=hold\n$a=1\n", p, error));
+    CHECK(parse("[Constants]\n$a=0\n[KeyA]\nkey=F6\ntype=hold\nspeed=2\n$a=1\n", p, error));
     CHECK(!parse("[Constants]\n$a=0\n[KeyA]\nkey=F6\ntype=cycle\n$b=0,1\n", p, error));
   } else if (scenario == "ordered_and_scope") {
     const std::string text = "[Constants]\n$a=0\n$b=0\n[KeyA]\nkey=F6\ntype=cycle\n$a=0,1\n$b=0,2\n"
@@ -172,6 +174,21 @@ int main(int argc, char **argv) {
     CHECK(!p.rules[2].hasMesh && p.rules[2].materialCount == 1 && p.rules[2].partnerCount == 0);
     EiemCycleModKey(p, chord);
     CHECK(!p.rules[0].hasMesh && p.rules[0].materialCount == 1 && !p.rules[0].partnerCount);
+  } else if (scenario == "hold") {
+    CHECK(parse("[Constants]\n$shape=0\n[KeyShape]\nkey=F6\ntype=hold\n"
+                "speed=2\n$shape=1\n[RenderShape]\nasset=Body\n"
+                "shape.Inflate=$shape\n", p, error));
+    EiemKeyChord chord; CHECK(EiemParseKeyChord("F6", &chord));
+    CHECK(EiemApplyModKey(p, chord, false, nullptr, nullptr, true, .25).size() == 1);
+    CHECK(std::abs(p.states[0].variables.at("$shape") - .5) < 1e-9);
+    CHECK(EiemApplyModKey(p, chord, false, nullptr, nullptr, true, .5).size() == 1);
+    CHECK(std::abs(p.states[0].variables.at("$shape") - 1.0) < 1e-9);
+    // A hold tick must never advance a cycle key sharing the same chord.
+    EiemModProgram cycle;
+    CHECK(parse("[Constants]\n$x=0\n[KeyCycle]\nkey=F7\ntype=cycle\n$x=0,1\n", cycle, error));
+    EiemKeyChord cycleChord; CHECK(EiemParseKeyChord("F7", &cycleChord));
+    EiemApplyModKey(cycle, cycleChord, false, nullptr, nullptr, true, .25);
+    CHECK(cycle.states[0].variables.at("$x") == 0);
   } else if (scenario == "chords") {
     EiemKeyChord chord;
     CHECK(EiemParseKeyChord("Ctrl+Shift+F12", &chord));
@@ -221,6 +238,7 @@ class ModProgramTests(unittest.TestCase):
     def test_expression_precedence_short_circuit_and_validation(self): self.run_case("expressions")
     def test_inactive_branch_errors_never_partially_publish(self): self.run_case("condition_errors")
     def test_ordered_fields_mod_local_variables_and_static_partner_scope(self): self.run_case("ordered_and_scope")
+    def test_hold_key_moves_toward_target_without_cycle_repeat(self): self.run_case("hold")
     def test_key_chords_are_explicit_and_strict(self): self.run_case("chords")
 
     def test_directory_loading_is_deterministic(self):

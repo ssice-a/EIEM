@@ -130,16 +130,78 @@ int main(int argc, char **argv) {
     CHECK(EiemModParseStream(input, "a/mod.ini", program, &error));
     EiemPublishModState(program); s_eiemModGeneration = 7;
     EiemModProgram next; std::vector<std::string> affected;
-    CHECK(!EiemPrepareInputUpdate({{{VK_F6,0},6}}, &next, &affected));
-    CHECK(EiemPrepareInputUpdate({{{VK_F6,0},7}, {{VK_F6,0},7}}, &next, &affected));
+    CHECK(!EiemPrepareInputUpdate({{{VK_F6,0},6,"a/mod.ini"}}, &next, &affected));
+    CHECK(EiemPrepareInputUpdate({{{VK_F6,0},7,"a/mod.ini"},
+                                  {{VK_F6,0},7,"a/mod.ini"}},
+                                 &next, &affected));
     CHECK(next.states[0].variables.at("$a") == 2);
     CHECK(s_eiemModProgram.states[0].variables.at("$a") == 0); // not published until restore
     EiemPublishModState(next);
     CHECK(s_eiemModProgram.states[0].variables.at("$a") == 2 && s_eiemModGeneration == 7);
-    CHECK(EiemPrepareInputUpdate({{{VK_F6,0},7}}, &next, &affected));
+    CHECK(EiemPrepareInputUpdate({{{VK_F6,0},7,"a/mod.ini"}}, &next, &affected));
     CHECK(next.states[0].variables.at("$a") == 0 && !next.rules[0].handling[0]);
     EiemPublishModState(program); // F10 replacement resets to parsed defaults
     CHECK(s_eiemModProgram.states[0].variables.at("$a") == 0);
+  } else if (scenario == "selected_mod_scope") {
+    EiemModProgram first, second, program;
+    std::istringstream inputA(
+      "[Constants]\n$value=0\n[KeyMode]\nkey=F6\ntype=cycle\n$value=0,1\n"
+      "[RenderA]\nasset=BodyA\nif $value == 1\nhandling=skip\nendif\n");
+    std::istringstream inputB(
+      "[Constants]\n$value=0\n[KeyMode]\nkey=F6\ntype=cycle\n$value=0,1\n"
+      "[RenderB]\nasset=BodyB\nif $value == 1\nhandling=skip\nendif\n");
+    CHECK(EiemModParseStream(inputA, "mods/a/mod.ini", first, &error));
+    CHECK(EiemModParseStream(inputB, "mods/b/mod.ini", second, &error));
+    EiemAppendModDocument(program, std::move(first));
+    EiemAppendModDocument(program, std::move(second));
+    EiemPublishModState(program); s_eiemModGeneration = 11;
+    CHECK(EiemSelectControlledMod("mods/b/mod.ini"));
+    LONG generation = -1, controlGeneration = -1;
+    std::string selected;
+    auto chords = EiemGetModKeyChords(&generation, &controlGeneration,
+                                      &selected, false);
+    CHECK(generation == 11 && controlGeneration > 0);
+    CHECK(selected == "mods/b/mod.ini");
+    CHECK(chords.size() == 1 && chords[0].vk == VK_F6);
+    EiemModProgram next; std::vector<std::string> affected;
+    EiemModInputEvent event{{VK_F6,0},11};
+    event.modPath = selected;
+    CHECK(EiemPrepareInputUpdate({event}, &next, &affected));
+    CHECK(next.states[0].variables.at("$value") == 0);
+    CHECK(next.states[1].variables.at("$value") == 1);
+    CHECK(affected.size() == 1 && affected[0] == "mods/b/mod.ini");
+    auto controls = EiemGetModControls(&generation, &controlGeneration);
+    CHECK(controls.size() == 2 && !controls[0].selected && controls[1].selected);
+    CHECK(controls[1].keys.size() == 1 && controls[1].keys[0].section == "KeyMode");
+  } else if (scenario == "selection_survives_reload") {
+    EiemModProgram first, second, both;
+    std::istringstream inputA("[Constants]\n$a=0\n[KeyA]\nkey=F6\ntype=cycle\n$a=0,1\n");
+    std::istringstream inputB("[Constants]\n$b=0\n[KeyB]\nkey=F7\ntype=cycle\n$b=0,1\n");
+    CHECK(EiemModParseStream(inputA, "mods/a/mod.ini", first, &error));
+    CHECK(EiemModParseStream(inputB, "mods/b/mod.ini", second, &error));
+    EiemModProgram onlyA = first;
+    EiemAppendModDocument(both, std::move(first));
+    EiemAppendModDocument(both, std::move(second));
+    EiemPublishPreparedModReload(both);
+    CHECK(EiemSelectControlledMod("mods/b/mod.ini"));
+    EiemPublishPreparedModReload(both);
+    CHECK(EiemGetSelectedModPath() == "mods/b/mod.ini");
+    EiemPublishPreparedModReload(std::move(onlyA));
+    CHECK(EiemGetSelectedModPath() == "mods/a/mod.ini");
+  } else if (scenario == "manager_key_section") {
+    EiemModProgram program;
+    std::istringstream input(
+      "[Constants]\n$a=0\n$b=0\n"
+      "[KeyA]\nkey=F6\ntype=cycle\n$a=0,1\n"
+      "[KeyB]\nkey=F6\ntype=cycle\n$b=0,1\n");
+    CHECK(EiemModParseStream(input, "mods/a/mod.ini", program, &error));
+    EiemPublishModState(program); s_eiemModGeneration = 12;
+    EiemModInputEvent event{{VK_F6,0},12,"mods/a/mod.ini"};
+    event.keySection = "KeyB";
+    EiemModProgram next; std::vector<std::string> affected;
+    CHECK(EiemPrepareInputUpdate({event}, &next, &affected));
+    CHECK(next.states[0].variables.at("$a") == 0);
+    CHECK(next.states[0].variables.at("$b") == 1);
   } else if (scenario == "partner_links_only") {
     EiemModProgram program;
     std::istringstream input(
@@ -156,7 +218,7 @@ int main(int argc, char **argv) {
     CHECK(std::string(potential[0].section) == "RenderPart");
     EiemModProgram next; std::vector<std::string> affected;
     bool shapesOnly = false, partnerLinksOnly = false;
-    CHECK(EiemPrepareInputUpdate({{{VK_F6,0},9}}, &next, &affected,
+    CHECK(EiemPrepareInputUpdate({{{VK_F6,0},9,"a/mod.ini"}}, &next, &affected,
                                  &shapesOnly, &partnerLinksOnly));
     CHECK(!shapesOnly);
     CHECK(partnerLinksOnly);
@@ -177,14 +239,21 @@ int main(int argc, char **argv) {
     EiemModProgram next; std::vector<std::string> affected;
     bool shapesOnly = false, partnerLinksOnly = false;
     bool submeshVisibilityOnly = false;
-    CHECK(EiemPrepareInputUpdate({{{VK_F6,0},10}}, &next, &affected,
+    std::vector<EiemSubmeshVisibilityChange> visibilityChanges;
+    CHECK(EiemPrepareInputUpdate({{{VK_F6,0},10,"a/mod.ini"}}, &next, &affected,
                                  &shapesOnly, &partnerLinksOnly,
-                                 &submeshVisibilityOnly));
+                                 &submeshVisibilityOnly,
+                                 &visibilityChanges));
     CHECK(!shapesOnly);
     CHECK(!partnerLinksOnly);
     CHECK(submeshVisibilityOnly);
     CHECK(next.rules.size() == 1 && next.rules[0].hiddenSubmeshMask == (1u << 2));
     CHECK(affected.size() == 1 && affected[0] == "a/mod.ini");
+    CHECK(visibilityChanges.size() == 1);
+    CHECK(visibilityChanges[0].modPath == "a/mod.ini");
+    CHECK(visibilityChanges[0].section == "RenderMain");
+    CHECK(visibilityChanges[0].beforeMask == 0);
+    CHECK(visibilityChanges[0].afterMask == (1u << 2));
   } else if (scenario == "default_off_instances") {
     EiemModProgram program;
     std::istringstream input("[RenderMain]\nasset=Body\n");
@@ -238,6 +307,9 @@ class ModControlsTests(unittest.TestCase):
     def test_global_config_default_edit_and_invalid_transaction(self): self.run_case("global")
     def test_only_owned_slots_restore_and_only_owned_tail_removed(self): self.run_case("slots")
     def test_press_order_stale_generation_and_publish_after_restore(self): self.run_case("events")
+    def test_key_events_only_change_the_selected_mod(self): self.run_case("selected_mod_scope")
+    def test_reload_preserves_or_falls_back_selected_mod(self): self.run_case("selection_survives_reload")
+    def test_manager_button_targets_one_key_section(self): self.run_case("manager_key_section")
     def test_partner_visibility_is_a_lightweight_link_update(self): self.run_case("partner_links_only")
     def test_submesh_visibility_is_a_lightweight_mesh_update(self): self.run_case("submesh_visibility_only")
     def test_actual_runtime_registers_default_off_multi_instances(self): self.run_case("default_off_instances")

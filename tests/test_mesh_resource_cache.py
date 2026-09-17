@@ -26,7 +26,7 @@ def production_cache():
     source = (ROOT / "src/eiem_resource_backend.h").read_text(encoding="utf-8")
     lifetime = (ROOT / "src/eiem_unity_lifetime.h").read_text(encoding="utf-8")
     ref = lifetime[lifetime.index("class EiemUnityRef {"):lifetime.index("static void EiemInitUnityLifetime")]
-    return ref + source[source.index("struct EiemObjectResourceCacheEntry {"):source.index("static void *EiemFindMethodWithParamTypes(")]
+    return ref + source[source.index("struct EiemMeshSubmeshVisibilityState {"):source.index("static void *EiemFindMethodWithParamTypes(")]
 
 
 FIXTURE = r'''
@@ -66,7 +66,7 @@ static std::map<uint32_t, void *> targets;
 static std::vector<uint32_t> freed;
 static int tokens[32];
 static int buildCalls = 0;
-static uint32_t lastHiddenSubmeshMask = 0;
+static int visibilityCalls = 0;
 static uint32_t nextHandle = 100;
 static bool failBuild = false;
 static void *deadNative = nullptr;
@@ -108,10 +108,18 @@ static unsigned GetFullPathNameA(const char *path, size_t size, char *out, void 
     strncpy_s(out, size, path, _TRUNCATE); return (unsigned)std::strlen(out);
 }
 static uint64_t EiemMeshResourceFileStamp(const char *) { return 10; }
-static void *EiemBuildNativeMesh(const char *, void *, char *, size_t, std::shared_ptr<const EiemSkinIdentity> *identity, uint32_t hiddenMask) {
+static bool EiemApplyMeshSubmeshVisibility(
+    void *, const std::shared_ptr<EiemMeshSubmeshVisibilityState> &visibility,
+    uint32_t mask, char *, size_t) {
+    if (!visibility) return false;
+    visibility->appliedMask = mask; ++visibilityCalls; return true;
+}
+static void *EiemBuildNativeMesh(const char *, void *, char *, size_t,
+                                 std::shared_ptr<const EiemSkinIdentity> *identity,
+                                 std::shared_ptr<EiemMeshSubmeshVisibilityState> *visibility) {
     if (s_eiemMeshResourceCacheLock.held) std::abort();
     if(identity) { auto value=std::make_shared<EiemSkinIdentity>(); value->paths={"Root/Foot"}; *identity=value; }
-    lastHiddenSubmeshMask = hiddenMask;
+    if(visibility) { auto value=std::make_shared<EiemMeshSubmeshVisibilityState>(); value->triangles.resize(3); *visibility=value; }
     ++buildCalls; return failBuild ? nullptr : &tokens[6 + buildCalls];
 }
 // PRODUCTION_BUILDER
@@ -125,6 +133,8 @@ static void Add(uint32_t handle, void *object, uint64_t stamp = 10,
     entry.object = EiemUnityRef::Capture(object ? object : &tokens[6], false);
     entry.fileStamp = EiemMeshCacheStamp(stamp);
     auto identity=std::make_shared<EiemSkinIdentity>(); identity->paths={"Root/Foot"}; entry.skin=identity;
+    entry.submeshVisibility=std::make_shared<EiemMeshSubmeshVisibilityState>();
+    entry.submeshVisibility->triangles.resize(3);
     strcpy_s(entry.modPath, "mod.ini");
     strncpy_s(entry.section, section, _TRUNCATE);
     targets[handle] = object; s_eiemMeshResourceCache.push_back(entry);
@@ -179,8 +189,17 @@ int main(int argc, char **argv) {
         CHECK(identity && identity->paths==std::vector<std::string>{"Root/Foot"});
         CHECK(again == mesh);
         CHECK(buildCalls == (hit || deadThenHit ? 0 : 1));
-        CHECK(lastHiddenSubmeshMask == rule.hiddenSubmeshMask);
+        CHECK(visibilityCalls == 2);
         CHECK(s_eiemMeshResourceCacheLock.acquired == s_eiemMeshResourceCacheLock.released);
+    }
+    if (std::strcmp(scenario, "hidden") == 0) {
+        void *before = mesh;
+        rule.hiddenSubmeshMask = 0;
+        CHECK(EiemBuildMeshResource(rule, &mesh, error, sizeof(error)));
+        CHECK(mesh == before && buildCalls == 1 && visibilityCalls == 3);
+        CHECK(s_eiemMeshResourceCache.size() == 1);
+        CHECK(s_eiemMeshResourceCache[0].variant == 0);
+        CHECK(s_eiemMeshResourceCache[0].submeshVisibility->appliedMask == 0);
     }
     if (std::strcmp(scenario, "cycles") == 0) {
         for (int cycle = 0; cycle < 3; ++cycle) {

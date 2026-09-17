@@ -1618,7 +1618,6 @@ static DWORD WINAPI GuiThread(LPVOID) {
 
   MSG msg;
   ZeroMemory(&msg, sizeof(msg));
-  EiemUiHost modUi;
   while (g_guiRunning && !g_shutdownRequested) {
     while (PeekMessage(&msg, nullptr, 0U, 0U, PM_REMOVE)) {
       TranslateMessage(&msg);
@@ -1636,7 +1635,6 @@ static DWORD WINAPI GuiThread(LPVOID) {
       break;
     }
 
-    modUi.Tick();
     static bool s_panelShown = false;
 
     if (!g_guiVisible) {
@@ -1714,7 +1712,6 @@ static DWORD WINAPI GuiThread(LPVOID) {
   }
 
   Log("[GUI] Shutting down...");
-  modUi.Shutdown();
   ImGui_ImplDX11_Shutdown();
   ImGui_ImplWin32_Shutdown();
   ImGui::DestroyContext(s_eiemPanelContext);

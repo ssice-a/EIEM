@@ -54,6 +54,10 @@ static void WriteMod(bool enabled) {
   if(enabled) file << "[MeshBody]\npath=meshes/body.mesh\n[RenderBody]\nasset=Body\nmesh=MeshBody\n";
   else file << "; disabled\n";
 }
+static void WriteInvalidMod() {
+  std::ofstream file("plugin/mods/test/mod.ini");
+  file << "[RenderBody]\nasset=Body\nmesh=MissingMesh\n";
+}
 static void Reload() { s_eiemModUpdates.Request(EiemModUpdate::Reload); EiemRunModReconcile(); }
 int main() {
   WriteMod(false); EiemReloadMods();
@@ -71,6 +75,11 @@ int main() {
   CHECK(s_eiemModelInstances.size()==2);
   WriteMod(true); Reload();
   CHECK(appliedModels==std::vector<void *>({(void *)12,(void *)13}));
+  const LONG validGeneration=s_eiemModGeneration;
+  const auto validApplied=appliedModels;
+  WriteInvalidMod(); Reload();
+  CHECK(s_eiemModGeneration==validGeneration && appliedModels==validApplied);
+  WriteMod(true);
   // A disappeared native model must be pruned even if no release hook arrived.
   objectStatus[(void *)12]=0;
   Reload(); CHECK(appliedModels==std::vector<void *>({(void *)13}));

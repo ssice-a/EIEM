@@ -74,6 +74,16 @@ bpy.context.scene.eiem_ui_template = False
 addon.export_package(output / "no-ui", [obj], [])
 assert "[UIMod]" not in (output / "no-ui/mod.ini").read_text(encoding="utf-8")
 assert not (output / "no-ui/ui.lua").exists()
+# Directional shape keys are continuous hold bindings, not duplicate cycle
+# endpoints. The runtime advances the variable while the key is down.
+control.hotkey_increase = "F7"
+control.hotkey_speed = 0.5
+hold_package = output / "hold"
+addon.export_package(hold_package, [obj], [])
+hold_ini = (hold_package / "mod.ini").read_text(encoding="utf-8")
+assert "[KeyShape1]" in hold_ini and "type=hold" in hold_ini
+assert "speed=0.5" in hold_ini and "\n" + variable + "=1\n" in hold_ini
+control.hotkey_increase = ""
 bpy.context.scene.eiem_ui_template = True
 bpy.context.scene.eiem_ui_key = ""
 addon.export_package(output / "always-ui", [obj], [])
@@ -81,12 +91,13 @@ always_ini = (output / "always-ui/mod.ini").read_text(encoding="utf-8")
 assert "[UIMod]" in always_ini and "[KeyModUI]" not in always_ini and "$ui_open" not in always_ini
 bpy.context.scene.eiem_ui_key = "F9"
 
-# Split/partner authoring must bind shape control on the partner template.
+# A switched Mesh stays on the source Renderer; visibility changes its submesh.
 addon.create_switch_group("Cloth", "F6", [obj])
-addon.export_package(output / "partner", [obj], [])
-ini = (output / "partner/mod.ini").read_text(encoding="utf-8")
-assert "handling=skip" in ini and "partner.0=" in ini
-assert ("shape.Inflate=" + variable) in ini.split("[RenderSourcePart0]")[1]
+addon.export_package(output / "switched", [obj], [])
+ini = (output / "switched/mod.ini").read_text(encoding="utf-8")
+render = ini.split("[RenderSource]", 1)[1]
+assert "partner." not in ini and "submesh_visible.0" in render
+assert ("shape.Inflate=" + variable) in render
 
 # Shared resource controls are emitted once; distinct resources remain independent.
 copy = obj.copy()

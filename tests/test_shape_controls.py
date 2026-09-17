@@ -39,13 +39,15 @@ int main() {
         p.rules[0].shapeSpeeds[0]==.5f);
   EiemPublishModState(p); s_eiemModGeneration=7;
   EiemModInputEvent slider{{},7,"a/mod.ini","UISize",{{"$size",.6}}};
+  EiemModInputEvent keyA{{VK_F6,0},7,"a/mod.ini"};
+  EiemModInputEvent keyB{{VK_F6,0},7,"b/mod.ini"};
   EiemModProgram next; std::vector<std::string> affected; bool shapesOnly=false;
   CHECK(EiemPrepareInputUpdate({slider},&next,&affected,&shapesOnly));
   CHECK(shapesOnly && affected.size()==1 && next.rules[0].shapeWeights[0]==.6f);
   CHECK(next.rules[1].shapeWeights[0]==0 && s_eiemModProgram.rules[0].shapeWeights[0]==0);
-  CHECK(EiemPrepareInputUpdate({slider,{{VK_F6,0},7}},&next,&affected));
+  CHECK(EiemPrepareInputUpdate({slider,keyA},&next,&affected));
   CHECK(next.rules[0].shapeWeights[0]==0); // unmatched cycle value starts at 0
-  CHECK(EiemPrepareInputUpdate({{{VK_F6,0},7},slider},&next,&affected));
+  CHECK(EiemPrepareInputUpdate({keyB,slider},&next,&affected));
   CHECK(next.rules[0].shapeWeights[0]==.6f && next.rules[1].shapeWeights[0]==1);
   slider.generation=6;
   CHECK(!EiemPrepareInputUpdate({slider},&next,&affected));

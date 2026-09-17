@@ -540,11 +540,6 @@ def plan_switch_export(mesh_objects, scene=None):
                 + identity[2])
         selectors[identity[2]] = identity
         grouped.setdefault(identity, []).append(obj)
-    for objects in grouped.values():
-        if sum(obj not in hidden for obj in objects) > 16:
-            raise ValueError(
-                "源 Mesh %s 超过运行时 16 个 partner 的上限"
-                % objects[0].name)
     return {
         "objects": [obj for objects in grouped.values() for obj in objects],
         "sources": list(grouped.values()),
@@ -607,8 +602,6 @@ def plan_shape_controls(objects):
                     if not math.isfinite(speed) or speed <= 0:
                         raise ValueError(
                             "形态键 %s 的变化速度必须大于 0" % key.name)
-                    actions.append(
-                        "shape_speed.%s=%.9g" % (channel_name, speed))
                 for direction_label, hotkey, target in configured_hotkeys:
                     if not hotkey:
                         continue
@@ -618,9 +611,9 @@ def plan_shape_controls(objects):
                         "label": "%s：%s" % (direction_label, label),
                         "key": validate_switch_key(hotkey),
                         "variable": variable,
-                        # Runtime Key sections require a cycle list. Repeating
-                        # one endpoint makes this an idempotent directional set.
-                        "values": [target, target],
+                        "type": "hold",
+                        "speed": speed,
+                        "target": target,
                     })
             shared[identity] = actions
         bindings[obj] = shared[identity]

@@ -8,6 +8,10 @@
 // Stable static-replacement profile. Legacy animation, camera, face and MMD
 // workers stay out of the process so resource assembly has one owner.
 static constexpr bool kEiemStaticReplacementBaseline = true;
+// Mod cycles and F10 use their own minimal window dispatcher. Legacy GUI,
+// animation and update workers remain outside the static replacement profile.
+static constexpr bool kEiemEnableLegacyWorkers =
+    !kEiemStaticReplacementBaseline;
 // Resource-level material replacement is independent from the baseline.
 // Keep legacy animation/Partner/physics paths disabled while allowing the
 // game's RendererInfo controller to restore the declared material array after
@@ -26,7 +30,9 @@ static constexpr bool kEiemValidationVfsCapture = false;
 // on Unity's main thread. Keep this outside the game's WM_USER range.
 #define WM_EIEM_MOD_RECONCILE (WM_APP + 0x316)
 #define WM_EIEM_MOD_KEY (WM_APP + 0x317)
+#define WM_EIEM_MOD_HOLD (WM_APP + 0x318)
 static constexpr UINT_PTR kEiemModRetryTimer = 0xE13A;
+static constexpr UINT_PTR kEiemModReplayTimer = 0xE13B;
 
 static HANDLE g_logHandle = INVALID_HANDLE_VALUE;
 static CRITICAL_SECTION g_logLock;
@@ -340,6 +346,7 @@ static volatile LONG g_shutdownWndProcDone = 0;
 // Worker handles are retained for diagnostics and orderly shutdown. The
 // plugin must never wait for these handles from the game's window procedure.
 static HANDLE g_hotkeyThread = nullptr;
+static HANDLE g_modUiThread = nullptr;
 static HANDLE g_animationThread = nullptr;
 static HANDLE g_guiThread = nullptr;
 static HANDLE g_updateThread = nullptr;

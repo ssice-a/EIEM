@@ -155,120 +155,7 @@ static DWORD WINAPI AnimationWorkerThread(LPVOID) {
   return 0;
 }
 
-static DWORD WINAPI HotkeyThread(LPVOID) {
-  Log("[OK] Hotkey thread started");
-
-  void *domain = il2cpp_domain_get();
-  if (domain)
-    il2cpp_thread_attach(domain);
-
-  HWND hwnd = nullptr;
-  while (!hwnd && !g_shutdownRequested) {
-    hwnd = FindGameWindow();
-    if (!hwnd) Sleep(200);
-  }
-  if (g_shutdownRequested) return 0;
-  g_gameHwnd = hwnd;
-  Log("[OK] Game window found: %p (pid=%lu)", hwnd, GetCurrentProcessId());
-
-  g_origWndProc =
-      (WNDPROC)SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)MmdWndProc);
-  if (g_origWndProc) {
-    Log("[OK] Game window subclassed for main-thread MMD execution");
-  } else {
-    Log("[WARN] Failed to subclass game window (err=%lu)", GetLastError());
-  }
-  EiemPostPendingModUpdate("game window attached");
-
-  // Key edges only. Registration and foreground gating are shared by global
-  // controls and mod cycles; no polling fallback or repeat-driven toggles.
-  enum class KeyAction { Gui, Reload, Cycle };
-  struct Binding { int id; EiemKeyChord chord; KeyAction action; LONG generation; };
-  std::vector<Binding> registered;
-  LONG boundModGeneration = -1, boundConfigGeneration = -1;
-  HWND boundForeground = nullptr;
-  MSG message = {};
-  PeekMessageW(&message, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
-  auto clearBindings = [&] {
-    for (const auto &binding : registered) UnregisterHotKey(nullptr, binding.id);
-    registered.clear();
-  };
-  while (g_guiRunning && !g_shutdownRequested && IsWindowAlive(hwnd)) {
-    s_eiemPersistentStates.Flush(); // batched writes only; no disk polling or Unity calls
-    HWND foreground = GetForegroundWindow();
-    LONG modGeneration = InterlockedCompareExchange(&s_eiemModGeneration, 0, 0);
-    LONG configGeneration = InterlockedCompareExchange(&s_eiemGlobalConfigGeneration, 0, 0);
-    if (foreground != boundForeground || modGeneration != boundModGeneration ||
-        configGeneration != boundConfigGeneration) {
-      clearBindings();
-      // Discard messages from the old registration before reusing OS IDs.
-      while (PeekMessageW(&message, nullptr, WM_HOTKEY, WM_HOTKEY, PM_REMOVE)) {}
-      EiemGlobalConfig config = EiemGetGlobalConfig();
-      std::vector<EiemKeyChord> modKeys = EiemGetModKeyChords(&modGeneration, foreground != hwnd);
-      int nextId = 1;
-      auto bind = [&](EiemKeyChord chord, KeyAction action) {
-        int id = nextId++;
-        if (id > 0xBFFF || !RegisterHotKey(nullptr, id, chord.modifiers | MOD_NOREPEAT, chord.vk)) {
-          Log("[HOTKEY] registration failed vk=%u modifiers=%u err=%lu; change key in INI",
-              chord.vk, chord.modifiers, GetLastError());
-          return;
-        }
-        registered.push_back({id, chord, action, modGeneration});
-      };
-      const bool ownedForeground = foreground == hwnd || (g_guiHwnd && foreground == g_guiHwnd) ||
-                                  (g_modUiHwnd && foreground == g_modUiHwnd);
-      if (ownedForeground)
-        bind(config.gui, KeyAction::Gui);
-      if (ownedForeground) {
-        bind(config.reload, KeyAction::Reload);
-        for (const auto &chord : modKeys) {
-          if (chord == config.reload || chord == config.gui) {
-            Log("[HOTKEY] mod key conflicts with global shortcut vk=%u modifiers=%u; mod shortcut disabled",
-                chord.vk, chord.modifiers);
-            continue;
-          }
-          bind(chord, KeyAction::Cycle);
-        }
-      }
-      boundForeground = foreground;
-      boundModGeneration = modGeneration;
-      boundConfigGeneration = configGeneration;
-      Log("[HOTKEY] bindings updated count=%zu modGeneration=%ld configGeneration=%ld",
-          registered.size(), modGeneration, configGeneration);
-    }
-    while (PeekMessageW(&message, nullptr, WM_HOTKEY, WM_HOTKEY, PM_REMOVE)) {
-      if (!g_pluginActive) continue;
-      for (const auto &binding : registered) {
-        if (binding.id != (int)message.wParam) continue;
-        HWND currentForeground = GetForegroundWindow();
-        if (binding.action == KeyAction::Gui) {
-          if (currentForeground == hwnd || currentForeground == g_guiHwnd || currentForeground == g_modUiHwnd) ToggleGui();
-        } else if (currentForeground == hwnd || currentForeground == g_guiHwnd || currentForeground == g_modUiHwnd) {
-          if (binding.action == KeyAction::Reload)
-            EiemRequestModUpdate(EiemModUpdate::Reload, "global reload hotkey");
-          else if (!PostMessageW(hwnd, WM_EIEM_MOD_KEY,
-                                 MAKEWPARAM(binding.chord.vk, binding.chord.modifiers),
-                                 binding.generation))
-            Log("[HOTKEY] could not queue mod key err=%lu", GetLastError());
-        }
-        break;
-      }
-    }
-    Sleep(20);
-  }
-  clearBindings();
-
-  // The game owns this window. Restore its original procedure before the
-  // plugin thread exits so late close/destroy messages bypass EIEM.
-  if (g_origWndProc && IsWindow(hwnd)) {
-    SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)g_origWndProc);
-    g_origWndProc = nullptr;
-  }
-  s_eiemPersistentStates.Flush(true);
-  g_guiRunning = false;
-  Log("[INFO] Game window closed, hotkey thread exiting");
-  return 0;
-}
+#include "eiem_mod_dispatcher.h"
 
 static void DumpTransformHierarchy(void *transform, int depth, FILE *dumpFile) {
   if (!transform || depth > 15)
@@ -578,7 +465,7 @@ static DWORD WINAPI InitThread(LPVOID) {
       (unsigned long)GetCurrentProcessId(), (unsigned long)GetCurrentThreadId(),
       (unsigned long long)GetTickCount64(),
       InterlockedCompareExchange(&s_eiemModGeneration, 0, 0));
-  Log("[BUILD] static-resource-baseline-20260917 dll=%s %s", __DATE__,
+  Log("[BUILD] assembly-complete-mesh-20260917 dll=%s %s", __DATE__,
       __TIME__);
 
   if (!Resolve()) {
@@ -1478,19 +1365,20 @@ static DWORD WINAPI InitThread(LPVOID) {
   Log("\n=== Phase 2 Init Complete ===");
   Log("Hooks installed. Use the GUI Dump tab for resource capture.");
 
-  if (!kEiemStaticReplacementBaseline) {
+  g_guiRunning = true;
+  g_hotkeyThread = CreateThread(NULL, 0, HotkeyThread, NULL, 0, NULL);
+  g_modUiThread = CreateThread(NULL, 0, EiemModUiThread, NULL, 0, NULL);
+
+  if (kEiemEnableLegacyWorkers) {
     DumpCursorMethods();
 
-    g_guiRunning = true;
-    // Set the run flag before creating the worker. Otherwise a fast-scheduled
-    // worker can observe the initial false value and exit before polling keys.
-    g_hotkeyThread = CreateThread(NULL, 0, HotkeyThread, NULL, 0, NULL);
     g_animationThread =
         CreateThread(NULL, 0, AnimationWorkerThread, NULL, 0, NULL);
     g_guiThread = CreateThread(NULL, 0, GuiThread, NULL, 0, NULL);
     g_updateThread = CreateThread(NULL, 0, UpdateCheckThread, NULL, 0, NULL);
   } else {
-    Log("[VALIDATION] Hotkey/animation/GUI/update workers disabled");
+    Log("[VALIDATION] Mod hotkey/reload/manager workers enabled; "
+        "animation/legacy-GUI/update workers disabled");
   }
 
   return 0;

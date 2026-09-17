@@ -85,7 +85,7 @@ path=meshes/accessory.mesh
 - `submesh.N=M` 可将 submesh N 映射到材质槽 M。槽号是资源布局，
   删除槽 0 的全部面不能把槽 1 自动重编号为 0。
 - `submesh_visible.N=true|false` 控制合并 Mesh 中第 N 个 submesh 的显隐。
-  隐藏状态使用同一 Mesh 的空索引变体，保持原 Renderer、骨骼数组和 LOD
+  隐藏状态在同一 Mesh 对象上写入空索引，保持原 Renderer、骨骼数组和 LOD
   成员不变，适合由 `[Key...]` 条件分支切换。
 - `match.vertices/indices/submeshes` 是可选附加条件，不是必须写的身份。
 - 同一规则集合按配置顺序采用第一条命中的规则。文件夹按不区分大小写排序，
