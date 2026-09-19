@@ -1,6 +1,6 @@
 # 历史设计与实验记录（截至 v30）
 
-本文保留当时的假设、实现与实验结果，不是当前规范。文内出现的 “Current” 仅表示当时状态；后续结论可能推翻前文。当前职责、格式与风险以 [模型替换设计](../model-replacement-design.md) 为准。
+本文保留当时的假设、实现与实验结果，不是当前规范。文内出现的 “Current” 仅表示当时状态；后续结论可能推翻前文。当前职责、格式与风险以 [资源替换设计](../refactor-resource-replacement.md) 为准。
 
 # EIEM Model Replacement Design
 

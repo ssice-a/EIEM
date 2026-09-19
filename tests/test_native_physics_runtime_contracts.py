@@ -19,12 +19,15 @@ class NativePhysicsRuntimeContracts(unittest.TestCase):
             ROOT / "src" / "eiem_registration_trace.h"
         ).read_text(encoding="utf-8")
         cls.mods = (ROOT / "src" / "eiem_mods.h").read_text(encoding="utf-8")
+        cls.features = (ROOT / "src" / "eiem_runtime_features.h").read_text(encoding="utf-8")
         cls.diagnostic = (
             ROOT / "src" / "eiem_native_physics_diagnostic.h"
         ).read_text(encoding="utf-8")
         cls.trojan = (ROOT / "src" / "trojan.h").read_text(encoding="utf-8")
 
     def test_resource_runtime_is_automatic_and_separate_from_dump_ui(self):
+        self.assertIn("kEiemEnableExperimentalPhysicsRuntime = false", self.features)
+        self.assertIn("kEiemEnableNativePhysicsObservation = false", self.features)
         self.assertIn('#include "eiem_native_physics_runtime.h"', self.trace)
         self.assertNotIn('eiem_native_physics_factory_probe.h', self.trace)
         self.assertNotIn("EiemPhysicsRuntimePeriodic", self.trojan)
@@ -33,6 +36,23 @@ class NativePhysicsRuntimeContracts(unittest.TestCase):
         self.assertIn("EiemPhysicsRuntimeRetireChangedAssets", self.runtime)
         self.assertNotIn("ImGui", self.runtime)
         self.assertNotIn("scene_dump", self.runtime)
+
+    def test_production_physics_is_frozen_with_two_independent_gates(self):
+        self.assertIn("if (!kEiemEnableExperimentalPhysicsRuntime) return true;", self.mods)
+        build = self.runtime[
+            self.runtime.index("static bool EiemPhysicsRuntimeBuild") :
+            self.runtime.index("static void EiemReconcileModelPhysics")
+        ]
+        self.assertIn("if (!kEiemEnableExperimentalPhysicsRuntime) return false;", build)
+        reconcile = self.runtime[
+            self.runtime.index("static void EiemReconcileModelPhysics") :
+            self.runtime.index("static size_t EiemPhysicsRuntimeRetireChangedAssets")
+        ]
+        self.assertIn("if (!kEiemEnableExperimentalPhysicsRuntime) return;", reconcile)
+        self.assertIn("if (!kEiemEnableNativePhysicsObservation) return;", self.diagnostic)
+
+    def test_physics_mode_is_reported_once_at_resource_trace_start(self):
+        self.assertIn("[PHYSICS-MODE] experimentalRuntime=%s nativeObservation=%s", self.trace)
 
     def test_runtime_consumes_renderer_hits_and_selects_one_animator(self):
         self.assertIn("intent.matchedRenderers", self.runtime)

@@ -6,9 +6,29 @@
 
 // Immutable resource identity, never instance Transform pointers.
 struct EiemSkinIdentity {
+  struct Source {
+    std::string meshPath;
+    std::string meshAsset;
+    uint32_t slot = 0;
+  };
   std::vector<std::string> paths;
   std::vector<uint32_t> hashes;
+  std::vector<std::string> indexPaths;
+  std::vector<Source> sources;
 };
+
+struct EiemLiveSkinSource {
+  std::string source;
+  std::string asset;
+  void *renderer = nullptr;
+  void *bones = nullptr;
+};
+
+// A replacement slot is resolved by this resource identity, never by the
+// target LOD's local array index. A lower LOD may omit slots present in LOD0;
+// the resolver must search the same model instance's native source renderers.
+// Missing identities are hard failures, because guessing an index produces a
+// valid-looking but incorrectly skinned mesh.
 
 static bool EiemSkinPathSuffix(const std::string &full, const std::string &path) {
   return !path.empty() && (full == path ||

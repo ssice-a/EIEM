@@ -1,9 +1,9 @@
 # 物理骨骼与碰撞体：三端设计契约
 
-状态：目标设计。当前实现范围以[文档索引](README.md)、[Physics 作者 v1/v3/v4/v5](physics-authoring-v1.md)及[源作者 v2](physics-authoring-v2.md)为准。
+状态：目标设计。当前实现范围以[文档索引](README.md)、[Physics 运行时重构边界](physics-runtime-redesign.md)、[Physics 作者 v1/v3/v4/v5](physics-authoring-v1.md)及[源作者 v2](physics-authoring-v2.md)为准。
 原生研究证据统一放在[原生物理调查归档](archive/native-physics-investigation.md)。
 本文描述完整链路要求，不把设计目标、源码草稿或宿主测试当作游戏能力。
-沿用[模型替换职责](model-replacement-design.md)、[共享骨架绑定](shared-skeleton-binding.md)和[作者状态](author-state-materials.md)。
+沿用[资源替换职责](refactor-resource-replacement.md)、[共享骨架绑定](shared-skeleton-binding.md)和[作者状态](author-state-materials.md)。
 
 ## 1. 结论与范围
 
@@ -146,7 +146,7 @@ INI 只组织引用，不要求用户填写骨骼索引、team ID 或 AB 包哈�
 
 ### 5.3 Skeleton 文件需先修好的内容
 
-此节中的增量新增骨骼已进入 v48 实现，线格式、明确支持范围与验证结果以 [骨架驱动](skeleton-driving.md) 为准。
+本节描述后续原生 Skeleton/Physics 装配目标。当前静态 Mesh 阶段只复用游戏已装配骨骼，明确支持范围以[共享骨架绑定](shared-skeleton-binding.md)为准。
 Physics 引用闭包与整套骨架/动画重绑定仍未完成。
 
 保留同一个资源格式和一套读写语义，但补齐：

@@ -108,24 +108,36 @@ int wmain(int argc, wchar_t **argv) {
     EiemModRule first=program.rules[0];
     void *rendererA=reinterpret_cast<void *>(1);
     void *rendererB=reinterpret_cast<void *>(2);
-    CHECK(EiemCollectPhysicsIntent(first,&intents,rendererA));
-    CHECK(intents.size()==1 && intents[0].rendererMatches==1);
-    CHECK(intents[0].matchedRenderers.size()==1 && intents[0].matchedRenderers[0]==rendererA);
-    CHECK(std::string(intents[0].resourceSection)=="PhysicsOne");
-    CHECK(std::string(intents[0].firstRenderSection)=="RenderMain");
-    CHECK(std::string(intents[0].firstRule.section)=="RenderMain");
+     CHECK(EiemCollectPhysicsIntent(first,&intents,rendererA));
+     if (!kEiemEnableExperimentalPhysicsRuntime) {
+       CHECK(intents.empty());
+     } else {
+       CHECK(intents.size()==1 && intents[0].rendererMatches==1);
+       CHECK(intents[0].matchedRenderers.size()==1 && intents[0].matchedRenderers[0]==rendererA);
+       CHECK(std::string(intents[0].resourceSection)=="PhysicsOne");
+       CHECK(std::string(intents[0].firstRenderSection)=="RenderMain");
+       CHECK(std::string(intents[0].firstRule.section)=="RenderMain");
+     }
     EiemModRule alias=first;
     strcpy_s(alias.physics,"PhysicsTwo");
     strcpy_s(alias.section,"RenderLod");
-    CHECK(EiemCollectPhysicsIntent(alias,&intents,rendererB));
-    CHECK(intents.size()==1 && intents[0].rendererMatches==2);
-    CHECK(intents[0].matchedRenderers.size()==2 && intents[0].matchedRenderers[1]==rendererB);
+     CHECK(EiemCollectPhysicsIntent(alias,&intents,rendererB));
+     if (kEiemEnableExperimentalPhysicsRuntime) {
+       CHECK(intents.size()==1 && intents[0].rendererMatches==2);
+       CHECK(intents[0].matchedRenderers.size()==2 && intents[0].matchedRenderers[1]==rendererB);
+     } else {
+       CHECK(intents.empty());
+     }
     EiemModRule cleared=first;
     cleared.hasPhysics=false; cleared.physics[0]='\0';
-    CHECK(EiemCollectPhysicsIntent(cleared,&intents) && intents.size()==1);
+     CHECK(EiemCollectPhysicsIntent(cleared,&intents) &&
+           intents.size()==(kEiemEnableExperimentalPhysicsRuntime ? 1u : 0u));
     EiemModRule missing=first;
     strcpy_s(missing.physics,"Missing");
-    CHECK(!EiemCollectPhysicsIntent(missing,&intents) && intents.size()==1);
+     if (kEiemEnableExperimentalPhysicsRuntime)
+       CHECK(!EiemCollectPhysicsIntent(missing,&intents) && intents.size()==1);
+     else
+       CHECK(EiemCollectPhysicsIntent(missing,&intents) && intents.empty());
     EiemModRule changed=first;
     strcpy_s(changed.physics,"PhysicsTwo");
     CHECK(!EiemSameRenderAssembly(first,changed));

@@ -1,6 +1,6 @@
 # 换图残留 Mod：v39 诊断记录
 
-> 状态：历史档案。这是 v39～v42 的调查与修正时间线。后文可能推翻前文；当前行为见[模型替换设计](../model-replacement-design.md)。
+> 状态：历史档案。这是 v39～v42 的调查与修正时间线。后文可能推翻前文；当前行为见[资源替换设计](../refactor-resource-replacement.md)。
 
 日期：2026-09-06。构建标记：`resource-runtime-v39-residue-probe`。
 

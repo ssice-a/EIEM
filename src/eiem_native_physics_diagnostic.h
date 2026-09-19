@@ -1,4 +1,5 @@
 #pragma once
+#include "eiem_runtime_features.h"
 #include "eiem_native_physics_probe.h"
 #include "eiem_native_physics_trace.h"
 
@@ -52,6 +53,7 @@ static bool EiemWriteNativePhysicsDiagnostic() {
 }
 
 static void EiemStartPhysicsAutoTraceOnUnityThread() {
+  if (!kEiemEnableNativePhysicsObservation) return;
   if (s_eiemPhysicsAutoTraceAttempted) return;
   s_eiemPhysicsAutoTraceAttempted=true;
   std::string error;

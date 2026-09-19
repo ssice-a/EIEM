@@ -52,19 +52,19 @@ set_sharedMesh
 
 三条规则的调用次数一致，没有 `binding failed`、槽位不匹配或漏装配证据。用户已确认当前静态版本稳定。
 
-### 2.3 既有骨骼槽位按索引继承
+### 2.3 既有骨骼槽位按源 Mesh 身份继承
 
 Unity 蒙皮使用 Mesh 内的骨骼索引、Renderer 的 `bones[]` 数组和 bindpose，不使用 Blender 顶点组名称在运行时查找 Transform。
 
-Blender 导出器必须保留源 Mesh 的全部骨骼槽位及顺序，只在末尾追加新槽位。DLL 遵守以下规则：
+Blender 导出器必须为 EIEMESH v5 的每个局部槽保存来源 Mesh 身份和原始槽号。DLL 遵守以下规则：
 
-1. 替换数据的槽位数少于源 Renderer 时拒绝。
-2. 槽位数等于源 Renderer 时直接复用原 `bones[]` 数组。
-3. 槽位数更多时保留源槽位前缀，只按作者路径解析追加槽位。
-4. 不因世界、UI、NPC 中同一槽位的 Transform 名称不同而重建源槽位。
-5. 不为角色或 PFB 建立特殊名称映射。
+1. 修改任何 Renderer 前，快照当前模型实例内所有原生 SkinnedMeshRenderer 的 Mesh 身份和原始 `bones[]`。
+2. replacement 的每个槽按“源 Mesh 身份 + 原始槽号”读取当前实例 Transform，不按目标 Renderer 的同序号猜测。
+3. 世界、UI、NPC 各自解析自己的实例 Transform，不跨模型实例共享数组。
+4. 完整 v5 来源表不依赖 Transform 名称或层级；路径和层级索引只作为旧格式回退。
+5. 缺失、越界或歧义时拒绝替换，不为角色、PFB 或骨骼名称增加特殊映射。
 
-这允许修改后的 Mesh 使用源骨架已有的其他部位骨骼，也覆盖三个 PFB 中 skirt 叶节点名称不同的情况。
+这允许修改后的 Mesh 使用同一原生模型中其他源 Mesh 已装配的骨骼，也覆盖不同 PFB 对同一骨骼改名的情况。完整契约见[共享骨架绑定](shared-skeleton-binding.md)。
 
 ### 2.4 合并 Mesh 取代 Partner
 
@@ -83,7 +83,7 @@ Blender 导出器必须保留源 Mesh 的全部骨骼槽位及顺序，只在末
 
 当前生产路径在游戏已经创建 Renderer、尚处于原生装配回调的边界应用 Mesh 和材质。它不是理想化的全局 AssetBundle 缓存替换，但已证明世界、UI 和 NPC 能得到一致结果，并继续由游戏的 skin、Animator、LOD 和 owner 生命周期管理。
 
-Mesh-only 规则不得修改 Animator 数据。源骨骼槽位只按 2.3 的前缀契约处理，不能按名称重新绑定整个数组。
+Mesh-only 规则不得修改 Animator 数据。源骨骼槽位按 2.3 的 v5 来源记录处理，不能按名称重建整个数组，也不能借用另一个模型实例的 Transform。
 
 材质和贴图按声明的材质槽提交。未声明槽位保留游戏值；不能直接污染游戏或其他 Mod 共用的材质对象。
 

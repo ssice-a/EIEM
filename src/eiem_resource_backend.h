@@ -75,6 +75,17 @@ struct EiemNativeMeshDocument {
   // node addressed by each Mesh-local bone index. Each instance resolves
   // these paths against its shared skeleton; no new skeleton is created.
   std::vector<std::string> bonePaths;
+  // EIEMESH v4 stable identity. Each string is a slash-separated sequence of
+  // Transform child indices relative to the shared skeleton root. Unlike a
+  // name path, it remains valid when equivalent prefabs rename a bone.
+  std::vector<std::string> boneIndexPaths;
+  // EIEMESH v5: immutable origin for every local palette slot.
+  struct BoneSlotSource {
+    std::string meshPath;
+    std::string meshAsset;
+    uint32_t slot = 0;
+  };
+  std::vector<BoneSlotSource> boneSources;
   std::vector<EiemNativeBlendShapeVertex> blendShapeVertices;
   std::vector<EiemNativeBlendShapeFrame> blendShapeFrames;
   std::vector<EiemNativeBlendShapeChannel> blendShapeChannels;
@@ -240,7 +251,8 @@ static bool EiemReadNativeMesh(const char *path, EiemNativeMeshDocument *out,
   int32_t version = 0;
   if (!reader.Good() || !reader.Bytes(magic, sizeof(magic)) ||
       memcmp(magic, "EIEMESH\0", sizeof(magic)) != 0 || !reader.Value(&version) ||
-      (version != 2 && version != 3) || !reader.String(&out->coordinateSpace) ||
+      (version != 2 && version != 3 && version != 4 && version != 5) ||
+      !reader.String(&out->coordinateSpace) ||
       !reader.String(&out->source) || !reader.String(&out->name) ||
       !reader.Value(&out->vertexCount) || out->vertexCount < 0 ||
       out->vertexCount > 10000000 ||
@@ -290,6 +302,26 @@ static bool EiemReadNativeMesh(const char *path, EiemNativeMeshDocument *out,
     if (!out->bonePaths.empty() &&
         out->bonePaths.size() != out->bindPoses.size())
       goto invalid;
+  }
+  if (version >= 4) {
+    if (!reader.Count(&count, 1000000)) goto invalid;
+    out->boneIndexPaths.resize(count);
+    for (auto &path : out->boneIndexPaths) {
+      if (!reader.String(&path)) goto invalid;
+    }
+    if (!out->boneIndexPaths.empty() &&
+        out->boneIndexPaths.size() != out->bindPoses.size())
+      goto invalid;
+  }
+  if (version >= 5) {
+    if (!reader.Count(&count, 1000000)) goto invalid;
+    out->boneSources.resize(count);
+    for (auto &source : out->boneSources) {
+      if (!reader.String(&source.meshPath) || !reader.String(&source.meshAsset) ||
+          !reader.Value(&source.slot)) goto invalid;
+    }
+    if (!out->boneSources.empty() &&
+        out->boneSources.size() != out->bindPoses.size()) goto invalid;
   }
   if (!EiemReadBlendShapes(reader, out) || !reader.End()) goto invalid;
   if (out->vertices.size() != (size_t)out->vertexCount || out->subMeshes.empty()) goto invalid;
@@ -1200,6 +1232,10 @@ static void *EiemBuildNativeMesh(const char *path, void *templateMesh,
       auto identity = std::make_shared<EiemSkinIdentity>();
       identity->paths = document.bonePaths;
       identity->hashes = document.boneHashes;
+      identity->indexPaths = document.boneIndexPaths;
+      identity->sources.reserve(document.boneSources.size());
+      for (const auto &source : document.boneSources)
+        identity->sources.push_back({source.meshPath, source.meshAsset, source.slot});
       *skin = identity;
     }
   }

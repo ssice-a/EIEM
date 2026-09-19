@@ -1,4 +1,5 @@
 #pragma once
+#include "eiem_runtime_features.h"
 
 // Per-model execution of validated Physics author resources. Matching and
 // immutable resource preparation stay in the Mod program; this adapter owns
@@ -707,6 +708,7 @@ static bool EiemPhysicsRuntimeActivateColliders(
 
 static void EiemPhysicsRuntimeRequestDestroyOwned(
     EiemPhysicsRuntimeInstance &instance) {
+  if (!kEiemEnableExperimentalPhysicsRuntime) return;
   if (!instance.destroyNeeded || !EiemOnUnityThread() || !g_object_destroy)
     return;
   if (!instance.destroyRequested && instance.hostRef.Status() == 1) {
@@ -728,6 +730,7 @@ static void EiemPhysicsRuntimeRequestDestroyOwned(
 static void EiemPhysicsRuntimeBeginRetire(
     const std::shared_ptr<EiemPhysicsRuntimeInstance> &instance,
     bool destroyHost, const char *stage) {
+  if (!kEiemEnableExperimentalPhysicsRuntime) return;
   if (!instance) return;
   instance->destroyNeeded = instance->destroyNeeded || destroyHost;
   if (instance->retiring) return;
@@ -756,6 +759,7 @@ static bool EiemPhysicsRuntimeDead(
 }
 
 static size_t EiemPhysicsRuntimeCollect() {
+  if (!kEiemEnableExperimentalPhysicsRuntime) return 0;
   size_t retiredCount = 0;
   if (!EiemOnUnityThread()) return retiredCount;
   for (size_t index = 0; index < s_eiemPhysicsRuntimeInstances.size();) {
@@ -808,6 +812,10 @@ static bool EiemPhysicsRuntimeBuild(const EiemPhysicsIntent &intent,
                                     void *model, const char *stage,
                                     bool &retryable) {
   retryable = false;
+  // Defense in depth: intent collection is normally frozen first, but this
+  // adapter must also reject direct or future call sites before it resolves
+  // APIs, creates hosts/colliders, AddComponents, or calls BuildAndRun.
+  if (!kEiemEnableExperimentalPhysicsRuntime) return false;
   const bool reloadTrace = stage && strcmp(stage, "global reload") == 0;
   const ULONGLONG buildStarted = reloadTrace ? GetTickCount64() : 0;
   if (reloadTrace)
@@ -1030,6 +1038,7 @@ static bool EiemPhysicsRuntimeBuild(const EiemPhysicsIntent &intent,
 static void EiemReconcileModelPhysics(
     void *model, const std::vector<EiemPhysicsIntent> &intents, bool active,
     const char *stage) {
+  if (!kEiemEnableExperimentalPhysicsRuntime) return;
   if (!model || !EiemOnUnityThread()) return;
   s_eiemPhysicsRuntimeFailures.erase(
       std::remove_if(s_eiemPhysicsRuntimeFailures.begin(),
@@ -1098,6 +1107,7 @@ static void EiemReconcileModelPhysics(
 // Physics or Skeleton dependency changed before Renderer restoration starts;
 // unchanged instances continue to share the game's live model generation.
 static size_t EiemPhysicsRuntimeRetireChangedAssets(const char *stage) {
+  if (!kEiemEnableExperimentalPhysicsRuntime) return 0;
   if (!EiemOnUnityThread()) return 0;
   size_t changed = 0;
   for (const auto &instance : s_eiemPhysicsRuntimeInstances) {
@@ -1115,6 +1125,7 @@ static size_t EiemPhysicsRuntimeRetireChangedAssets(const char *stage) {
 
 static void EiemPhysicsRuntimeReleaseOnUnityThread(void *model,
                                                    const char *stage) {
+  if (!kEiemEnableExperimentalPhysicsRuntime) return;
   if (!model) return;
   s_eiemPhysicsRuntimeFailures.erase(
       std::remove_if(s_eiemPhysicsRuntimeFailures.begin(),
@@ -1129,6 +1140,7 @@ static void EiemPhysicsRuntimeReleaseOnUnityThread(void *model,
 }
 
 static void EiemReleaseModelPhysics(void *model, const char *stage) {
+  if (!kEiemEnableExperimentalPhysicsRuntime) return;
   if (!model) return;
   if (EiemOnUnityThread()) {
     EiemPhysicsRuntimeReleaseOnUnityThread(model, stage);
@@ -1141,6 +1153,7 @@ static void EiemReleaseModelPhysics(void *model, const char *stage) {
 }
 
 static void EiemPhysicsRuntimeDrainReleases() {
+  if (!kEiemEnableExperimentalPhysicsRuntime) return;
   std::vector<EiemPhysicsPendingRelease> pending;
   AcquireSRWLockExclusive(&s_eiemPhysicsPendingReleaseLock);
   pending.swap(s_eiemPhysicsPendingReleases);
@@ -1210,6 +1223,7 @@ static void EiemPhysicsRuntimeLogPartnerBinding(
 // rather than polling every window message. A false result is diagnostic only;
 // it is never used as a destruction/completion fence.
 static void EiemPhysicsRuntimeCheckReady() {
+  if (!kEiemEnableExperimentalPhysicsRuntime) return;
   for (size_t index = 0; index < s_eiemPhysicsRuntimePendingReady.size();) {
     const auto &instance = s_eiemPhysicsRuntimePendingReady[index];
     if (instance->retiring || instance->ready) {
@@ -1278,6 +1292,7 @@ static void EiemPhysicsRuntimeCheckReady() {
 // notices, collect objects whose Unity destruction has completed, and perform
 // one readiness observation. No candidate scan or timer is involved.
 static void EiemPhysicsRuntimeBoundary(const char *stage) {
+  if (!kEiemEnableExperimentalPhysicsRuntime) return;
   if (!EiemOnUnityThread()) return;
   const ULONGLONG started = GetTickCount64();
   EiemPhysicsRuntimeDrainReleases();

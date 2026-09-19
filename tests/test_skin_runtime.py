@@ -24,6 +24,7 @@ struct Box { char pad[16]{}; int value=0; } box;
 static constexpr size_t IL2CPP_ARRAY_DATA=32;
 static int method[8],writes=0;
 static bool failSetter=false, s_eiemApplyingModMeshAssignment=false;
+static volatile LONG s_traceHierarchyIndexFailureCount=0;
 static void *g_smr_get_bones=&method[0], *g_transform_get_parent=&method[1], *g_object_get_name=&method[2];
 static void *g_transform_get_childCount=&method[3], *g_transform_GetChild=&method[4], *g_transformClass=&method[5], *g_smr_set_bones=&method[6];
 static std::vector<std::unique_ptr<Array>> arrays;
@@ -60,11 +61,30 @@ static std::vector<State> s_eiemOverrides(1);
 static SRWLOCK s_eiemOverrideLock=SRWLOCK_INIT;
 static size_t EiemFindOverrideLocked(void *) { return 0; }
 static void Log(const char *,...) {}
+static bool EiemModEquals(const char *a,const char *b) {
+ return a && b && _stricmp(a,b)==0;
+}
+static bool EiemModSameLogicalPath(const char *a,const char *b) {
+ return EiemModEquals(a,b);
+}
+static thread_local const std::vector<EiemLiveSkinSource> *s_eiemLiveSkinSources=nullptr;
+static bool EiemResolveMeshBonesFromAssembly(
+    const EiemSkinIdentity &, void *, void **, char *, size_t) { return false; }
 // FUNCTIONS
 int main() {
  Node scene{"Scene"},actor{"ActorA",&scene},root{"Root",&actor},chest{"Chest",&root},pelvis{"Pelvis",&root},foot{"Foot",&pelvis};
  scene.children={&actor}; actor.children={&root}; root.children={&chest,&pelvis}; pelvis.children={&foot};
  Array source; source.count=1; source.items[0]=&chest; Renderer renderer{&source};
+ EiemSkinIdentity v5;
+ v5.paths={"AuthorRoot/CompletelyRenamedChest"};
+ v5.hashes={1};
+ v5.sources={{"assets/character/chest.asset","MeshChest",0}};
+ std::vector<EiemLiveSkinSource> liveA={{"assets/character/chest.asset","MeshChest",&renderer,&source}};
+ s_eiemLiveSkinSources=&liveA;
+ void *v5Out=nullptr; char v5Error[256]{};
+ // A complete v5 source palette does not need any matching Transform name.
+ assert(EiemResolveMeshBonesFromNativeInstance(v5,&renderer,&v5Out,v5Error,sizeof(v5Error)));
+ assert(((Array *)v5Out)->count==1 && ((Array *)v5Out)->items[0]==&chest);
  EiemSkinIdentity renamed; renamed.paths={"Root/RenamedChest"}; renamed.hashes={1};
  void *renamedOut=nullptr; char renamedError[256]{};
  // NPC/UI may rename an existing Transform while keeping the Mesh palette
@@ -84,6 +104,24 @@ int main() {
  Node otherActor{"ActorB",&scene},otherRoot{"Root",&otherActor},otherChest{"Chest",&otherRoot},otherPelvis{"Pelvis",&otherRoot},otherFoot{"Foot",&otherPelvis};
  otherActor.children={&otherRoot}; otherRoot.children={&otherChest,&otherPelvis}; otherPelvis.children={&otherFoot};
  Array otherSource; otherSource.count=1; otherSource.items[0]=&otherChest; Renderer other{&otherSource};
+ std::vector<EiemLiveSkinSource> liveB={{"assets/character/chest.asset","MeshChest",&other,&otherSource}};
+ s_eiemLiveSkinSources=&liveB;
+ v5Out=nullptr;
+ assert(EiemResolveMeshBonesFromNativeInstance(v5,&other,&v5Out,v5Error,sizeof(v5Error)));
+ assert(((Array *)v5Out)->items[0]==&otherChest);
+ assert(((Array *)v5Out)->items[0]!=&chest); // never borrow another model instance
+ Array footSource; footSource.count=1; footSource.items[0]=&otherFoot;
+ Renderer footRenderer{&footSource};
+ liveB.push_back({"assets/character/foot.asset","MeshFoot",&footRenderer,&footSource});
+ EiemSkinIdentity merged;
+ merged.paths={"AuthorRoot/Chest","AuthorRoot/Foot"};
+ merged.hashes={1,2};
+ merged.sources={{"assets/character/chest.asset","MeshChest",0},
+                 {"assets/character/foot.asset","MeshFoot",0}};
+ void *mergedOut=nullptr;
+ assert(EiemResolveMeshBonesFromNativeInstance(merged,&other,&mergedOut,v5Error,sizeof(v5Error)));
+ assert(((Array *)mergedOut)->items[0]==&otherChest &&
+        ((Array *)mergedOut)->items[1]==&otherFoot); // same numeric slot, different source Mesh
  assert(EiemResolveMeshBones(identity,&other,&out,error,sizeof(error)) && ((Array *)out)->items[1]==&otherFoot);
  assert(((Array *)out)->items[1]!=expanded->items[1]); // never borrow actor A's transforms
  Node extra{"Extra",&otherPelvis}; otherPelvis.children={&otherFoot,&extra};
@@ -103,8 +141,9 @@ int main() {
  void *removedOut=(void *)1;
  assert(!EiemResolveMeshBones(removesSourceSlot,&addedRenderer,&removedOut,
                               error,sizeof(error)) && !removedOut);
- identity.paths[1]="Root/Missing"; out=(void *)1;
- assert(!EiemResolveMeshBones(identity,&renderer,&out,error,sizeof(error)) && !out && renderer.bones==expanded);
+ identity.paths[1]="Root/Missing"; out=nullptr;
+ assert(EiemResolveMeshBones(identity,&renderer,&out,error,sizeof(error)) &&
+        out==renderer.bones); // equal native palettes retain game slot identity
  foot.alive=false;
  assert(!EiemPreserveSourceSkinning(&renderer,expanded,error,sizeof(error)) && writes==2 && handles.size()==1);
  foot.alive=true; failSetter=true; renderer.bones=&source;
@@ -117,7 +156,10 @@ class SkinRuntimeTests(unittest.TestCase):
     def test_actual_resolver_and_assignment(self):
         if not shutil.which('cl'): self.skipTest('Requires MSVC')
         trace=(ROOT/'src/il2cpp_trace.h').read_text(encoding='utf-8')
-        funcs='\n'.join(function(trace,s) for s in ['static bool EiemResolveMeshBones(', 'static bool EiemPreserveSourceSkinning('])
+        funcs='\n'.join(function(trace,s) for s in [
+            'static bool EiemResolveMeshBones(',
+            'static bool EiemResolveMeshBonesFromNativeInstance(',
+            'static bool EiemPreserveSourceSkinning('])
         with tempfile.TemporaryDirectory(prefix='eiem-skin-runtime-') as directory:
             folder=Path(directory); cpp=folder/'skin.cpp'; cpp.write_text(SOURCE.replace('// FUNCTIONS',funcs),encoding='utf-8'); exe=folder/'skin.exe'
             build=subprocess.run(['cl','/nologo','/EHsc','/std:c++17','/utf-8',f'/I{ROOT/"src"}',str(cpp),f'/Fe{exe}'],cwd=folder,capture_output=True,text=True,encoding='utf-8',errors='replace')

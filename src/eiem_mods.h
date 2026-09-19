@@ -1,5 +1,6 @@
 #pragma once
 
+#include "eiem_runtime_features.h"
 #include "eiem_mod_document.h"
 #include "eiem_persistent_state.h"
 #include <utility>
@@ -444,6 +445,11 @@ static bool EiemCollectPhysicsIntent(
     const EiemModRule &rule, std::vector<EiemPhysicsIntent> *out,
     void *matchedRenderer = nullptr) {
   if (!rule.hasPhysics) return true;
+  // P0 freeze: Physics resources remain part of the parsed authoring
+  // document, but the production Render path must not hand them to the
+  // historical self-owned runtime adapter.  Returning success preserves the
+  // winning Mesh/material/texture replacement.
+  if (!kEiemEnableExperimentalPhysicsRuntime) return true;
   if (!out) return false;
   EiemModResource resource = {};
   if (!EiemFindModResource(rule.modPath, rule.physics, "Physics", &resource) ||

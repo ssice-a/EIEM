@@ -1,6 +1,6 @@
 # v29：进入角色 UI 闪退（v30 修复）
 
-> 状态：历史档案。这是 v29 崩溃与 v30 修复的历史证据；当前回调契约见[模型替换设计](../model-replacement-design.md)。
+> 状态：历史档案。这是 v29 崩溃与 v30 修复的历史证据；当前回调契约见[资源替换设计](../refactor-resource-replacement.md)。
 
 ## 症状和范围
 

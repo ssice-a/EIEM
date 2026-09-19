@@ -1,5 +1,6 @@
 #pragma once
 #include <atomic>
+#include "eiem_runtime_features.h"
 
 #define EIEM_VERSION_MAJOR 1
 #define EIEM_VERSION_MINOR 0

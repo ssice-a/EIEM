@@ -61,16 +61,21 @@ class RuntimeHookContracts(unittest.TestCase):
             self.assertIn(f'"get_{property_name}"', self.init)
             self.assertIn(f'"set_{property_name}"', self.init)
 
-    def test_render_matching_excludes_inactive_lod_siblings(self):
+    def test_model_scan_replaces_inactive_authored_lod_siblings(self):
         start = self.trace.index("static bool EiemApplyRenderRuleSetToRenderer")
         end = self.trace.index("static bool EiemApplyRenderRuleSet(", start)
         matcher = self.trace[start:end]
-        self.assertIn("EiemRendererEligibleForRule(meshOwner, drawRenderer)", matcher)
+        self.assertIn("EiemRendererEligibleForRule(meshOwner, drawRenderer,", matcher)
+        self.assertIn("includeGameHidden", matcher)
 
         scan_start = self.trace.index("static bool EiemApplyRenderRuleSet(")
         scan_end = self.trace.index("static bool EiemApplyStandaloneRenderRules(", scan_start)
         scan = self.trace[scan_start:scan_end]
-        self.assertIn("bool includeInactive = false", scan)
+        self.assertIn("bool includeInactive = true", scan)
+        self.assertIn("allowPartnerCreation, true", scan)
+        self.assertIn('"inactive-authored-lod"', self.trace)
+        self.assertIn('"force-off-authored-lod"', self.trace)
+        self.assertIn('"disabled-authored-lod"', self.trace)
         self.assertIn("EiemRegistrationTraceEligibility", self.trace)
         self.assertIn('"force-off"', self.trace)
         self.assertIn('"disabled-unowned"', self.trace)
@@ -436,6 +441,33 @@ class RuntimeHookContracts(unittest.TestCase):
         self.assertLess(material, restore)
         self.assertIn("rendererEnabledBeforeCommit", body)
         self.assertIn("EiemReadRendererEnabled(drawRenderer, &actual)", body)
+
+    def test_cross_prefab_bone_rename_uses_model_local_source_slot(self):
+        resolver_start = self.trace.index(
+            "static bool EiemResolveMeshBonesFromNativeInstance")
+        resolver_end = self.trace.index(
+            "static bool EiemPreserveSourceSkinning", resolver_start)
+        resolver = self.trace[resolver_start:resolver_end]
+        source_palette = resolver.index(
+            "if (identity.sources.size() == identity.paths.size())")
+        hierarchy_api = resolver.index("if (!g_transform_get_parent")
+        self.assertLess(source_palette, hierarchy_api)
+        self.assertIn("binding=instance-source", resolver)
+        self.assertIn("s_eiemLiveSkinSources", resolver)
+        self.assertIn("Replacement bone source is ambiguous", resolver)
+        for character_specific in (
+                "typhoe", "cloth_", "body_", "skirt_", "actor_"):
+            self.assertNotIn(character_specific, resolver.lower())
+
+        model_start = self.trace.index("static bool EiemApplyRenderRuleSet(")
+        model_end = self.trace.index(
+            "static bool EiemApplyStandaloneRenderRules(", model_start)
+        model_pass = self.trace[model_start:model_end]
+        snapshot = model_pass.index("liveSkinSources.push_back")
+        mutation = model_pass.index("visitType(g_skinnedMeshRendererClass")
+        self.assertLess(snapshot, mutation)
+        self.assertIn("originalBonesHandle", model_pass)
+        self.assertIn("s_eiemLiveSkinSources = previousLiveSkinSources", model_pass)
 
     def test_initial_mod_rules_load_before_resource_hooks_are_enabled(self):
         start = self.init.index("static DWORD WINAPI InitThread")

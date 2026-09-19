@@ -5,7 +5,7 @@
 
 | 档案 | 范围及后续入口 |
 |---|---|
-| [早期模型替换实验](model-replacement-experiments.md) | 截至 v30 的假设、观测和被替代路径；现行[模型契约](../model-replacement-design.md) |
+| [早期模型替换实验](model-replacement-experiments.md) | 截至 v30 的假设、观测和被替代路径；现行[资源替换契约](../refactor-resource-replacement.md) |
 | [v31 架构审查](architecture-review-v1.md) | 当时缺陷快照，不是当前待办清单 |
 | [UI 回调崩溃](ui-callback-crash-v29.md) | v29 崩溃、v30 修复证据；原回调必须原样传递 |
 | [换图与重载残留](map-reload-residue-diagnosis.md) | v39～v42 逐步定位实例登记、缓存有效性及材质源表污染 |
