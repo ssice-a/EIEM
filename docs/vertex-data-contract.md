@@ -6,7 +6,7 @@
 同一个网格中也按数据区分：保留有效源值，仅为缺失部分生成。旧解码调查、当时的待办和回归数量
 均在历史档案，不描述当前导出器状态。本文不配置 IDE/宿主的审查或提示行为。
 
-当前解包源码 `tools/AnimeStudio/AnimeStudio/Classes/Mesh.cs` 的压缩 NORMAL 分支调用
+当前解包源码 [AnimeStudio/Classes/Mesh.cs](https://github.com/ssice-a/AnimeStudio/blob/master/AnimeStudio/Classes/Mesh.cs) 的压缩 NORMAL 分支调用
 `DecompressEndfieldFrame`，同时填充 `m_Normals` 和 `m_Tangents`；Blender 导入将切线向量和符号
 保存到对应 Mesh 属性。当前不使用“只解码法线，再统一重算源切线”的流程。
 

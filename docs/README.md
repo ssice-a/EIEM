@@ -1,6 +1,6 @@
 # EIEM 文档索引与当前状态
 
-核对日期：2026-09-18。本文只记录 v1.0.0 当前能力及明确的实机验收边界。版本试验、探针部署和旧问题诊断统一保存在[历史档案](archive/README.md)。
+核对日期：2026-09-19。本文只记录 v1.0.0 当前能力及明确的实机验收边界。版本试验、探针部署和旧问题诊断统一保存在[历史档案](archive/README.md)。
 
 ## 当前状态
 
@@ -10,7 +10,7 @@
 | LOD 模板导出 | Blender 从已导入资源发现 LOD0-4；按勾选复制选中 Mesh 模板；每个 LOD 生成独立 Mesh/Render，缺失级别不生成规则 | 真实 Blender 5.0.1 回归通过；Typhoea 资源已确认存在 LOD0-3，LOD0 独立 asset path 也已覆盖 |
 | 多 submesh / 多材质 | Blender 选择导出生成一个合并 Mesh，保留多个 submesh 和对应材质槽 | 当前 Typhoea 测试包已实机显示；材质和贴图随静态替换生效 |
 | 三端实例 | 世界、角色 UI、NPC 共享资源规则，各自沿游戏原生 owner、装配和 LOD 生命周期运行 | 三条目标 Render 在同类实例中均经过 `set_sharedMesh -> MOD-SKIN -> 材质 -> RendererInfo._Init -> NPC AssignSkin -> LOD`；没有发现某条 Render 漏装配 |
-| 蒙皮槽位 | 保留源 Renderer 的既有 `bones[]` 槽位顺序；只有追加骨骼槽位才按作者路径解析 | 已覆盖世界、UI、NPC PFB 中同槽位骨骼名称不同的情况；禁止按角色名硬编码映射 |
+| 蒙皮槽位 | EIEMESH v5 逐槽记录“源 Mesh 身份 + 原始槽号”；每个模型实例复用游戏已装配的原生 Transform | 已覆盖世界、UI、NPC PFB 中同槽位骨骼名称不同的情况；完整 v5 映射不依赖角色名、骨骼名或层级路径 |
 | 诊断 Hook | 身份与装配探针默认关闭；NPC 只保留注册和释放所需的生命周期适配器 | 完整本地测试与 DLL 构建通过 |
 | 按键显隐 | Mod 按键使用独立的最小窗口调度器；在同一 Mesh 对象上原地隐藏/恢复目标 submesh 索引，不进入 Partner/Physics 生命周期 | 世界、角色 UI、NPC 实机通过；Mesh、Renderer、骨骼与 LOD 身份保持不变 |
 | 按住形态键 | `[Key] type=hold` 按独立采样节奏向目标值连续移动；`type=cycle` 仍是一按一切换 | DLL、INI 解析和 Blender 形态键导出已实现，见 [按住按键](hold-keys.md) |
@@ -25,8 +25,8 @@
 |---|---|---|
 | 项目术语 | [CONTEXT](../CONTEXT.md) | 核心对象与跨模块约束 |
 | 代码架构 | [DLL 代码模块](code-architecture.md) | 模块职责、依赖方向和分阶段整理顺序 |
+| 仓库边界 | [三仓库架构](repository-architecture.md) | DLL、Blender、AnimeStudio 的所有权、协议和发布关系 |
 | 重构基线 | [资源替换重构](refactor-resource-replacement.md) | 目标架构、验证顺序、禁止事项和当前进度 |
-| Mod 装配 | [模型替换](model-replacement-design.md) | 资源、Render、实例和恢复契约 |
 | 原生装配链 | [模型创建链路](model-assembly-chain.md) | 世界、UI、NPC 的装配边界与蒙皮条件 |
 | 合并边界 | [合并的边界](merged-part-renderer-boundaries.md) | 合并 Mesh、submesh、UV、材质槽和 LOD 约束 |
 | Blender LOD 导出 | [LOD 导出](blender-lod-export.md) | 从已导入资源发现 LOD；按勾选复制模板；每级独立 Render/合并，共享切换状态 |
@@ -34,15 +34,15 @@
 | Blender 网格工具 | [切换作者流程](blender-switches.md) | 选择、显隐、状态和导出 |
 | Blender Mesh-only | [Mesh-only 导出](blender-mesh-only.md) | 只导出选中的 Mesh、材质和贴图，跳过骨架、物理及其他作者控制检查 |
 | 顶点通道 | [顶点数据契约](vertex-data-contract.md) | 原生通道保留与缺失切线生成 |
-| 蒙皮 | [共享骨架绑定](shared-skeleton-binding.md) | 源骨骼槽位、追加路径、bind pose 和权重 |
-| 骨架扩展 | [骨架驱动](skeleton-driving.md) | 新增节点、Skeleton 文件和实例持有 |
+| 蒙皮 | [共享骨架绑定](shared-skeleton-binding.md) | EIEMESH v5 源 Mesh/槽位身份、bind pose、实例隔离和回退边界 |
 | 形态键 | [形态键控制](shape-controls.md) | 作者通道、实例权重与游戏通道归属 |
 | 作者状态 | [默认值、持久化与材质](author-state-materials.md) | `.blend` 数据、`state.ini` 和材质导入 |
 | Mod UI | [Lua UI](lua-ui.md) | 脚本 API、窗口和变量事务 |
 | 相机 | [反虚化契约](camera-fade.md) | CameraMono 原评估后清理 |
 | 物理设计 | [三端物理契约](physics-authoring-design.md) | 解包、Blender、DLL 的完整链路要求 |
 | 物理文件 | [作者格式](physics-authoring-v1.md)、[源图格式](physics-authoring-v2.md) | 新增作者数据与原生源图的格式和限制 |
-| 工具运行 | [资源浏览器](../tools/README.md)、[Blender 插件](../tools/Blender/README.md) | 启动、安装和开发操作 |
+| 物理运行时边界 | [Physics 运行时重构](physics-runtime-redesign.md) | 所有权边界、禁止操作、P0-P5 取证与实施计划 |
+| 工具运行 | [资源浏览器](../tools/README.md)、[Blender 插件](https://github.com/ssice-a/EIEM-blender/blob/main/README.md) | 启动、安装和开发操作 |
 
 ## 维护规则
 

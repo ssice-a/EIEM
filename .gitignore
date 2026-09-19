@@ -14,7 +14,10 @@ bin/
 # Local game indexes and one-off investigation artifacts
 /Maps/
 /tmp_*
+/_tmp-*/
+/%SystemDrive%/
 /tools/_inspect_skel.py
+/tools/_blender_split_cache/
 
 # Blender and test runs export real resource packages here. They are local
 # fixtures/probes, not source-controlled assets.
@@ -27,7 +30,6 @@ bin/
 /backups/
 
 # AnimeStudio keeps its own source-control history.
-/tools/AnimeStudio/
 
 !deps/**/*.lib
 !deps/**/*.dll

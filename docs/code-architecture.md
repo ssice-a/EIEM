@@ -11,8 +11,8 @@
 | Mod 前端与更新协调 | INI 解析、表达式、变量、按键、F10、状态持久化；发布 Reconcile/Reapply/Reload | 解析模块已独立；主线程事务仍需从 `il2cpp_trace.h` 提取 |
 | Camera fade | 独立控制游戏相机的透明/淡化结果 | 已独立为 `eiem_camera_fade.h`，只保留小型 Hook adapter |
 | UI、Shape、Skeleton、Physics | Mod UI 和尚未全部验收的作者功能 | 已按主题拆文件；不得阻塞静态资源替换 |
-| Blender 作者端 | 选择、编辑、合并、材质贴图及资源导出 | 位于 `tools/Blender/`，继续与 DLL 格式契约对接 |
-| 解包与资源索引 | VFS 提取、AnimeStudio/索引查询、离线检查 | 位于 `tools/` 和独立 C# 工具，不进入 DLL 运行时 |
+| Blender 作者端 | 选择、编辑、合并、材质贴图及资源导出 | 独立仓库 `ssice-a/EIEM-blender`；本仓库只固定验证过的 submodule 提交 |
+| 解包与资源索引 | VFS 提取、AnimeStudio/索引查询、离线检查 | 独立仓库 `ssice-a/AnimeStudio`；不进入 DLL 运行时 |
 | ImGui | 内置诊断/管理页面及 Mod UI 宿主 | `gui.h`、`eiem_ui_host.h`、`eiem_lua_ui.h`；后续拆页面，不与 Render executor 混合 |
 | Legacy runtime | 旧 MMD、动画、Partner 和上游资源实验 | 暂时保留；核心链验收完成后统一隔离、删除或迁移 |
 

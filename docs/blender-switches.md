@@ -140,7 +140,9 @@ endif
 
 开发插件目录：`E:\vscode\EIEM_Blender`，用 VS Code 打开该目录后运行 **Blender: Start**。
 包入口 `__init__.py`、实现 `eiem_blender_addon.py` 和切换逻辑 `eiem_blender_controls.py`
-来自仓库 `tools/Blender/`；部署时连同 Physics 模块一起同步，完整清单见[插件说明](../tools/Blender/README.md)。
+来自独立仓库 [EIEM-blender](https://github.com/ssice-a/EIEM-blender)；本仓库的
+`tools/Blender` 只是集成测试固定版本。部署时连同 Physics 模块一起同步，完整清单见
+[插件说明](https://github.com/ssice-a/EIEM-blender/blob/main/README.md)。
 本机该目录的 `.vscode/settings.json` 开启了 `blender.addon.reloadOnSave`；保存后自动重载，也可手动
 运行 **Blender: Reload Addons**。入口在 **文件 → 导入/导出 → EIEM package** 和
 **3D 视图 → N → EIEM → 网格切换**。不要同时运行旁边的单文件副本，以免重复注册。

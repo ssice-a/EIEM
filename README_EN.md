@@ -36,8 +36,12 @@ v1.0.0 is the first resource-replacement release. Mesh, material, and texture ru
 Release packages:
 
 - `EIEM_v1.0.0_dll.zip`: DLL, proxy loaders, and configuration template.
-- `EIEM_Blender_v0.32.0.zip`: Blender add-on.
-- `EIEM_Extractor_v1.0.0_win-x64.zip`: AnimeStudio extractor and EIEM extraction helpers.
+- [EIEM-blender](https://github.com/ssice-a/EIEM-blender): independently versioned Blender import, editing, and Mod export add-on.
+- [AnimeStudio fork](https://github.com/ssice-a/AnimeStudio): independently versioned Endfield VFS browser, extractor, and EIEM source-package exporter.
+
+The repositories communicate through versioned EIEM file formats. This repository owns the DLL runtime,
+normative contracts, and cross-repository integration tests. Tool revisions are pinned as submodules without
+duplicating their source or release artifacts. See [repository boundaries](docs/repository-architecture.md).
 
 ## User Agreement & Disclaimer
 
@@ -80,7 +84,7 @@ Release packages:
 
 ## Download
 
-You can download the latest release from [Releases](https://github.com/Sasye/EIEM/releases) or compile it yourself from source.
+You can download the latest DLL release from [Releases](https://github.com/ssice-a/EIEM/releases) or compile it yourself from source.
 
 > Use [Applepie Manager](https://github.com/Sasye/ApplepieManager) to easily manage and configure this plugin.
 

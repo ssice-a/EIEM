@@ -2,7 +2,13 @@
 
 Current authoring/runtime scope: [documentation index](../docs/README.md).
 
-EIEM ships a pinned AnimeStudio fork with a direct Endfield VFS data source.
+EIEM pins [ssice-a/AnimeStudio](https://github.com/ssice-a/AnimeStudio) as a
+submodule with a direct Endfield VFS data source. Initialize it after cloning:
+
+```powershell
+git submodule update --init tools/AnimeStudio
+```
+
 It does not require a 53 GB decrypted `.ab` tree or a separately generated
 AssetMap.
 
@@ -89,14 +95,18 @@ colliders** is enabled.
 
 ## Build
 
-The source is pinned under `tools\AnimeStudio`. The local release targets
+The independently maintained source is pinned under `tools\AnimeStudio`. The local release targets
 .NET 9 and is self-contained:
 
 ```powershell
+dotnet restore .\tools\AnimeStudio\AnimeStudio\AnimeStudio.csproj `
+  -p:TargetFrameworks=net9.0
 dotnet build .\tools\AnimeStudio\AnimeStudio\AnimeStudio.csproj `
   -c Release -p:TargetFramework=net9.0 -p:TargetFrameworks=net9.0 --no-restore
+dotnet restore .\tools\AnimeStudio\AnimeStudio.GUI\AnimeStudio.GUI.csproj `
+  -p:TargetFrameworks=net9.0-windows
 dotnet publish .\tools\AnimeStudio\AnimeStudio.GUI\AnimeStudio.GUI.csproj `
   -c Release -f net9.0-windows -r win-x64 --self-contained true `
-  --no-restore -p:BuildProjectReferences=false `
+  --no-restore -p:TargetFrameworks=net9.0-windows `
   -o .\tools\AnimeStudio\dist\win-x64-vfs-next
 ```

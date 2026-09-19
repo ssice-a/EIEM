@@ -37,8 +37,12 @@ v1.0.0 是资源替换第一阶段的发布版本。它把 Mesh、材质和贴�
 发布包：
 
 - `EIEM_v1.0.0_dll.zip`：DLL、代理加载器和配置模板。
-- `EIEM_Blender_v0.32.0.zip`：Blender 插件。
-- `EIEM_Extractor_v1.0.0_win-x64.zip`：AnimeStudio 解包程序与 EIEM 解包辅助脚本。
+- [EIEM-blender](https://github.com/ssice-a/EIEM-blender)：Blender 导入、编辑与 Mod 导出插件，独立版本和发布。
+- [AnimeStudio fork](https://github.com/ssice-a/AnimeStudio)：Endfield VFS 浏览、解包与 EIEM 源包导出，独立版本和发布。
+
+三个仓库通过版本化的 EIEM 文件格式连接。本仓库负责 DLL 运行时、格式规范和跨端集成测试；
+两个工具仓库以 submodule 固定到已验证提交，源码与发布不再重复维护。详见
+[仓库边界](docs/repository-architecture.md)。
 
 ## 用户协议与免责声明
 
@@ -81,7 +85,7 @@ v1.0.0 是资源替换第一阶段的发布版本。它把 Mesh、材质和贴�
 
 ## 下载
 
-您可以在 [Releases](https://github.com/Sasye/EIEM/releases) 下载最新发布版或从源代码自行编译。
+您可以在 [Releases](https://github.com/ssice-a/EIEM/releases) 下载最新 DLL 发布版或从源代码自行编译。
 
 > 使用 [Applepie Manager](https://github.com/Sasye/ApplepieManager) 来便捷地管理和配置此插件。
 

@@ -1,6 +1,8 @@
 [submodule "tools/AnimeStudio"]
 	path = tools/AnimeStudio
 	url = https://github.com/ssice-a/AnimeStudio.git
+	branch = master
 [submodule "tools/Blender"]
 	path = tools/Blender
 	url = https://github.com/ssice-a/EIEM-blender.git
+	branch = main
