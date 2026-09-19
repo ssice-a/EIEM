@@ -44,13 +44,15 @@ struct Node { std::string name; Node *parent=nullptr; std::vector<Node *> childr
 struct Renderer { Array *bones; };
 struct Box { char pad[16]{}; int value=0; } box;
 static constexpr size_t IL2CPP_ARRAY_DATA=32;
-static int methods[16], creates=0, destroys=0, sourceWrites=0;
+static int methods[20], creates=0, destroys=0, sourceWrites=0;
 static bool unityThread=true, failPosition=false, failDestroy=false;
 static void *g_smr_get_bones=&methods[0],*g_transform_get_parent=&methods[1],*g_object_get_name=&methods[2];
 static void *g_transform_get_childCount=&methods[3],*g_transform_GetChild=&methods[4],*g_transformClass=&methods[5];
 static void *g_gameObjectClass=&methods[6],*g_gameObject_ctor=&methods[7],*g_gameObject_get_transform=&methods[8];
 static void *g_transform_set_parent=&methods[9],*g_object_destroy=&methods[10];
 static void *g_transform_set_localPosition=&methods[11],*g_transform_set_localRotation=&methods[12],*g_transform_set_localScale=&methods[13];
+static void *g_transform_get_localPosition=&methods[14],*g_transform_get_localRotation=&methods[15],*g_transform_get_localScale=&methods[16];
+struct TrsBox { char pad[16]{}; float value[4]{}; } trsBox;
 static std::vector<std::unique_ptr<Node>> created;
 static std::vector<std::unique_ptr<Array>> arrays;
 static std::vector<std::unique_ptr<std::string>> strings;
@@ -85,6 +87,9 @@ static bool InvokeChecked(void *m,void *p,void **args,void **out) {
  } else if(m==g_object_destroy) {
    if(failDestroy)return false;
    ((Node *)args[0])->alive=false; ++destroys;
+ } else if(m==g_transform_get_localPosition || m==g_transform_get_localRotation || m==g_transform_get_localScale) {
+   const float *source=m==g_transform_get_localPosition?n->p:m==g_transform_get_localRotation?n->q:n->s;
+   memcpy(trsBox.value,source,m==g_transform_get_localRotation?16:12); *out=&trsBox;
  } else if(m==g_transform_set_localPosition || m==g_transform_set_localRotation || m==g_transform_set_localScale) {
    if(n->name.rfind("EIEM_Bone_",0)!=0)++sourceWrites;
    if(m==g_transform_set_localPosition && failPosition)return false;
@@ -101,6 +106,7 @@ static bool EiemFindModResource(const char *mod,const char *section,const char *
 }
 static bool EiemResolveResourceDiskPath(const EiemModResource &,char *p,size_t n) { strcpy_s(p,n,disk.c_str()); return true; }
 static uint64_t EiemMeshResourceFileStamp(const char *) { return stamp; }
+static constexpr bool kEiemValidationIdentityProbe=false;
 #include "eiem_skeleton_runtime.h"
 int main(int argc,char **argv) {
  assert(argc==5); disk=argv[1]; std::string error;

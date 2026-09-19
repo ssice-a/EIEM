@@ -35,12 +35,16 @@ PFB 实例。DLL 不重建作者数据；它只消费完整、已验证的资源
 
 ## Submodule 的含义
 
-`tools/AnimeStudio` 与 `tools/Blender` 是集成测试使用的固定版本，不是本仓库内的源码副本。
+两个目录都是独立 Git 仓库的 submodule，不会把源码历史并入 EIEM。当前本机约定为：
+
+- `tools/Blender` 直接作为 Blender 的日常开发工作树，修改后先在该目录提交到 EIEM-blender，再更新 EIEM 的 gitlink。
+- `tools/AnimeStudio` 仅作为集成固定版本；AnimeStudio 的日常开发和发布工作树位于同级目录 `E:\vscode\AnimeStudio`。
+
 克隆后执行：
 
 ```powershell
 git submodule update --init --recursive
 ```
 
-工具仓库各自提交和发布；更新固定版本使用 `git submodule update --remote` 后，在 EIEM 提交新的
-gitlink。EIEM 的 Release workflow 只发布 DLL，不再把工具产物混入同一版本号。
+工具仓库各自提交和发布。更新固定版本后，在 EIEM 提交新的 gitlink。EIEM 的 Release workflow
+只发布 DLL，不把工具产物混入同一版本号。

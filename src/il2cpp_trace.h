@@ -12,6 +12,7 @@ static bool EiemOnUnityThread();
 #include "eiem_unity_lifetime.h"
 #include "eiem_native_physics_parameters.h"
 #include "eiem_native_physics_config.h"
+#include "eiem_model_lifecycle.h"
 #include "eiem_resource_backend.h"
 static size_t EiemManagedArrayLength(void *array);
 #include "eiem_skeleton_runtime.h"
@@ -48,8 +49,7 @@ static volatile LONG s_traceBonesSetterCount = 0;
 // records only tracked replacement Renderers; it does not mutate Unity state.
 static volatile LONG s_eiemSkinTimelineCount = 0;
 static volatile LONG64 s_eiemLastSkinCommitTick = 0;
-// Bounds the skinned-mesh measurements, which transform a sample of vertices
-// and therefore must not run unbounded on the Unity thread.
+// Legacy Partner diagnostics still use this counter inside quarantined code.
 static volatile LONG s_traceSkinProbeCount = 0;
 // Short diagnostic pass for resource replacements. It compares the game's
 // source skin with the generated Mesh only for the first few cloth instances,
@@ -57,9 +57,6 @@ static volatile LONG s_traceSkinProbeCount = 0;
 // Bounded evidence for EIEMESH v4 hierarchy-index rejection. This records the
 // exact divergent slot without changing the binding decision.
 static volatile LONG s_traceHierarchyIndexFailureCount = 0;
-// Armed after an in-place replacement is committed, which is above the
-// per-frame driver that consumes it. Defined next to that driver.
-static void EiemArmSkinProbeSweep();
 static volatile LONG s_traceMaterialCommitCount = 0;
 
 // The manager often returns the same cached proxy repeatedly. Keep the first
@@ -118,7 +115,7 @@ static void TraceRememberPendingBundleRequest(void *request, void *path);
 static void TraceResolvePendingBundleRequest(void *request, void *bundle);
 static void TraceDescribeObject(void *object, char *out, int outSize);
 static void TraceDescribeString(void *stringObject, char *out, int outSize);
-static bool TraceIdentityTextMatchesTyphoea(const char *text);
+static bool TraceIdentityTextMatchesConfiguredRule(const char *text);
 static bool TraceTakeTargetBudget(volatile LONG *counter, LONG limit,
                                   const char *primary,
                                   const char *secondary = nullptr);
@@ -342,23 +339,6 @@ static bool TraceBasePartLoadUseHandleFinish(void *self, bool success,
                                              void *methodInfo);
 static void TraceBasePartReleaseModel(void *self, void *methodInfo);
 static void TraceBasePartOnRelease(void *self, void *methodInfo);
-enum class EiemModelOwnerKind : uint8_t {
-  PrefabProxy,
-  UIModelLoader,
-  BaseModelPart,
-  CharUIModel,
-  NpcAvatar,
-};
-static const char *EiemModelOwnerKindName(EiemModelOwnerKind kind) {
-  switch (kind) {
-    case EiemModelOwnerKind::PrefabProxy: return "PrefabProxy";
-    case EiemModelOwnerKind::UIModelLoader: return "UIModelLoader";
-    case EiemModelOwnerKind::BaseModelPart: return "BaseModelPart";
-    case EiemModelOwnerKind::CharUIModel: return "CharUIModel";
-    case EiemModelOwnerKind::NpcAvatar: return "NpcAvatar";
-  }
-  return "unknown";
-}
 static bool EiemRegisterAndApplyModelInstance(
     EiemModelOwnerKind ownerKind, void *owner, void *model,
     const char *prefabPath, uint32_t instanceUid, const char *stage);
@@ -371,12 +351,10 @@ static bool EiemReapplyRegisteredModelInstance(void *model,
 static bool EiemApplyStandaloneRenderRules(void *model, const char *stage,
                                            bool *matched = nullptr,
                                            const std::vector<std::string> *affected = nullptr,
-                                           std::vector<EiemPhysicsIntent> *physicsIntents = nullptr,
-                                           bool allowPartnerCreation = false);
+                                           std::vector<EiemPhysicsIntent> *physicsIntents = nullptr);
 static bool EiemApplyStandaloneRenderRulesToRenderer(
     void *meshOwner, void *drawRenderer, void *mesh,
-    const char *rendererType, void *methodInfo, const char *stage,
-    bool allowPartnerCreation = false);
+    const char *rendererType, void *methodInfo, const char *stage);
 static bool EiemResolveMeshBonesFromAssembly(
     const EiemSkinIdentity &identity, void *renderer, void **out,
     char *error, size_t errorSize);
@@ -2491,74 +2469,6 @@ static void TraceSkinnedMeshSetBones(void *self, void *bones,
   EiemLogSkinSetterTimeline("bones-game", self, nullptr, nullptr, bones,
                             gameAfterBones);
 
-  // Measure the skinning result at the one boundary where the bone palette
-  // changes. `localBounds` cannot answer this: it is authored data and does not
-  // move when the binding breaks, whereas the skinned extent does.
-  //
-  // The guard is written out rather than routed through TraceTakeBudget: that
-  // function is a stub returning a constant false (asset-path exploration is
-  // finished), so MSVC folds `budget(...)` to false and deletes the whole block
-  // as dead code at /O2. A diagnostic that silently compiles away is worse than
-  // no diagnostic, so this block must stay on a real condition.
-  if (InterlockedIncrement(&s_traceSkinProbeCount) <= 200) {
-    const EiemSkinProbe::Result measurement = EiemSkinProbe::Measure(self);
-    EiemSkinProbe::LogResult(
-        EiemIsPartnerRenderer(self) ? "[SKIN-PROBE] phase=setBones partner=1"
-                                    : "[SKIN-PROBE] phase=setBones partner=0",
-        measurement);
-  }
-
-  // A Partner is intentionally not treated as a source override.  Observe
-  // its game-owned setter calls separately so a later skin/Animator refresh
-  // that replaces the extended palette cannot be mistaken for a successful
-  // public bones assignment.  This probe has no write side effects.
-  EiemPartnerBonesSnapshot partnerSnapshot;
-  if (EiemSnapshotPartnerBones(self, &partnerSnapshot)) {
-    const size_t incomingCount = EiemManagedArrayLength(bones);
-    void *afterBones = nullptr;
-    bool afterRead = false;
-    if (g_smr_get_bones && EiemOnUnityThread()) {
-      afterBones = Invoke(g_smr_get_bones, self);
-      afterRead = true;
-    }
-    const size_t afterCount = EiemManagedArrayLength(afterBones);
-    const bool expectedKnown = partnerSnapshot.expectedBoneCount != 0;
-    const bool incomingMatches =
-        expectedKnown && incomingCount == partnerSnapshot.expectedBoneCount;
-    const bool afterMatches =
-        expectedKnown && afterRead &&
-        afterCount == partnerSnapshot.expectedBoneCount;
-    if (EiemRegistrationTraceFirst("partner-set-bones", "game", self,
-                                   partnerSnapshot.sourceRenderer, nullptr,
-                                   partnerSnapshot.generation)) {
-      Log("[PARTNER-BONES-v101] event=set partner=%p source=%p section=%s "
-          "generation=%ld incoming=%p incomingCount=%zu after=%p "
-          "afterCount=%zu afterRead=%d expected=%zu incomingMatches=%d "
-          "afterMatches=%d visible=%d tid=%lu",
-          self, partnerSnapshot.sourceRenderer,
-          partnerSnapshot.section[0] ? partnerSnapshot.section : "<unknown>",
-          partnerSnapshot.generation, bones, incomingCount, afterBones,
-          afterCount, afterRead ? 1 : 0, partnerSnapshot.expectedBoneCount,
-          incomingMatches ? 1 : 0, afterMatches ? 1 : 0,
-          partnerSnapshot.controlVisible ? 1 : 0,
-          (unsigned long)GetCurrentThreadId());
-    }
-    if (expectedKnown &&
-        (!incomingMatches || (afterRead && !afterMatches)) &&
-        EiemRegistrationTraceFirst("partner-set-bones-mismatch", "game",
-                                   self, partnerSnapshot.sourceRenderer,
-                                   nullptr, partnerSnapshot.generation)) {
-      Log("[PARTNER-BONES-v101] event=mismatch partner=%p source=%p "
-          "section=%s generation=%ld expected=%zu incomingCount=%zu "
-          "afterCount=%zu afterRead=%d incomingSameAfter=%d",
-          self, partnerSnapshot.sourceRenderer,
-          partnerSnapshot.section[0] ? partnerSnapshot.section : "<unknown>",
-          partnerSnapshot.generation, partnerSnapshot.expectedBoneCount,
-          incomingCount, afterCount, afterRead ? 1 : 0,
-          afterRead && afterBones == bones ? 1 : 0);
-    }
-  }
-
   bool tracked = false;
   uint32_t binding = 0;
   AcquireSRWLockShared(&s_eiemOverrideLock);
@@ -2581,7 +2491,6 @@ static void TraceSkinnedMeshSetBones(void *self, void *bones,
   void *finalBones = g_smr_get_bones ? Invoke(g_smr_get_bones, self) : nullptr;
   EiemLogSkinSetterTimeline("bones-final", self, nullptr, nullptr, bones,
                             finalBones);
-  if (tracked) EiemProbePartnerBoneBindings(self, "source-set-bones");
   if (!tracked || !TraceTakeBudget(&s_traceBonesSetterCount, 80)) return;
 
   const size_t count = EiemManagedArrayLength(bones);
@@ -4000,7 +3909,6 @@ static void *EiemCreatePartnerRenderer(void *sourceMeshOwner,
     EiemSkinProbe::LogResult("[SKIN-PROBE] phase=create partner=1", partnerSide);
     // Ask for one sweep of the settled state. Only the first creation arms it,
     // so the measurement lands after the whole model is assembled.
-    EiemArmSkinProbeSweep();
   }
 
   size_t expectedBoneCount = 0;
@@ -4763,7 +4671,9 @@ static bool TraceLookupLoadedModelPath(void *model, char *out, size_t outSize) {
 // call out of the window that verifies it.
 static void TraceDumpPrefabRenderers(const char *path, void *model) {
   if (!kEiemValidationIdentityProbe) return;
-  if (!model || !path || !path[0] || strstr(path, "typhoea") == nullptr ||
+  std::vector<EiemModPrefab> configuredPrefabs;
+  if (path && path[0]) EiemFindModPrefabs(path, &configuredPrefabs);
+  if (!model || !path || !path[0] || configuredPrefabs.empty() ||
       !g_gameObject_GetComponentsInChildren || !g_skinnedMeshRendererClass ||
       !il2cpp_class_get_type || !il2cpp_type_get_object)
     return;
@@ -5063,21 +4973,13 @@ static void TraceBasePartFinish(void *self, bool success, void *methodInfo) {
         self, "BaseModelViewPart.OnLoadFinish-before-original");
   auto original = (TraceBasePartFinishFn)s_origBasePartFinish;
   if (original) original(self, success, methodInfo);
-  if (success) {
-    EiemTraceBaseModelPartnerArrays(self, "OnLoadFinish-before-register");
+  if (success)
     EiemRegisterBaseModelViewPartInstance(
         self, "BaseModelViewPart.OnLoadFinish");
-    EiemTracePartnerWorldBounds(
-        self, "BaseModelViewPart.OnLoadFinish",
-        InterlockedCompareExchange(&s_eiemModGeneration, 0, 0));
-    EiemTraceBaseModelPartnerArrays(self, "OnLoadFinish-after-register");
-  }
 }
 
-// PostDealLoadedModel is the game's model-assembly boundary. Create configured
-// Partner renderers before the original scans the hierarchy, then inspect the
-// exact BaseModel arrays it published. Per-renderer initialization callbacks
-// must not grow the hierarchy while the game is already walking it.
+// PostDealLoadedModel is the game's model-assembly boundary. Commit direct
+// resource replacement before the original scans the completed hierarchy.
 static void TraceBasePartPostDeal(void *self, void *methodInfo) {
   void *model = TraceReadObjectField(self, s_basePartModelOffset);
   EiemAdoptUnityThreadFromAssemblyHook("BaseModelViewPart.PostDealLoadedModel");
@@ -5086,10 +4988,6 @@ static void TraceBasePartPostDeal(void *self, void *methodInfo) {
         model, "BaseModelViewPart.PostDealLoadedModel-before");
   auto original = (TraceBasePartPostDealFn)s_origBasePartPostDeal;
   if (original) original(self, methodInfo);
-  EiemTracePartnerWorldBounds(
-      self, "BaseModelViewPart.PostDealLoadedModel-after",
-      InterlockedCompareExchange(&s_eiemModGeneration, 0, 0));
-  EiemTraceBaseModelPartnerArrays(self, "PostDealLoadedModel-after");
 }
 
 // ComplexModelViewPart overrides the virtual method, so a base-class hook is
@@ -5103,8 +5001,6 @@ static void TraceComplexPartPostDeal(void *self, void *methodInfo) {
         model, "ComplexModelViewPart.PostDealLoadedModel-before");
   auto original = (TraceBasePartPostDealFn)s_origComplexPartPostDeal;
   if (original) original(self, methodInfo);
-  EiemTraceBaseModelPartnerArrays(
-      self, "ComplexModelViewPart.PostDealLoadedModel-after");
 }
 
 static void TraceBasePartLoadFinishCallback(void *self, int32_t requestId,
@@ -5176,8 +5072,7 @@ static bool EiemApplyResolvedRenderRule(void *renderer, void *drawRenderer,
                                         const char *rendererType,
                                         void *methodInfo,
                                         const EiemResolvedRenderRule &resolved,
-                                        bool allowMeshReplacement = true,
-  bool allowPartnerCreation = false) {
+                                        bool allowMeshReplacement = true) {
   (void)methodInfo;
   if (!renderer || !mesh) return false;
   if (!drawRenderer) drawRenderer = renderer;
@@ -5190,8 +5085,9 @@ static bool EiemApplyResolvedRenderRule(void *renderer, void *drawRenderer,
   // game's setter unchanged.
   const bool skipOriginal = EiemModEquals(rule.handling, "skip");
   const bool applyMesh = allowMeshReplacement && rule.hasMesh;
-  if (!applyMesh && !(allowMeshReplacement && rule.hasSkeleton) && !skipOriginal && !rule.materialCount && !rule.submeshCount && !rule.shapeCount &&
-      !(allowPartnerCreation && rule.partnerCount))
+  if (!applyMesh && !(allowMeshReplacement && rule.hasSkeleton) &&
+      !skipOriginal && !rule.materialCount && !rule.submeshCount &&
+      !rule.shapeCount)
     return false;
 
   if (!EiemCaptureOriginal(renderer, drawRenderer, mesh, rendererType, applyMesh, nullptr, rule.shapeCount != 0)) return false;
@@ -5252,8 +5148,7 @@ static bool EiemApplyResolvedRenderRule(void *renderer, void *drawRenderer,
   }
 
   // `mesh=` replaces the source Renderer’s shared Mesh in place. It does not
-  // create another Renderer; an additional Renderer must be declared and
-  // referenced explicitly through `partner.N`.
+  // create another Renderer or take ownership of game lifecycle state.
   bool meshApplied = false;
   bool rendererDisabledForCommit = false;
   bool rendererEnabledBeforeCommit = true;
@@ -5330,11 +5225,6 @@ static bool EiemApplyResolvedRenderRule(void *renderer, void *drawRenderer,
       if (EiemModEquals(rendererType, "SkinnedMeshRenderer")) {
         InterlockedExchange64(&s_eiemLastSkinCommitTick,
                               (LONG64)GetTickCount64());
-        Log("[DEBUG-GROUND-v1] phase=commit renderer=%p section=%s "
-            "asset=%s replacement=%p",
-            renderer, rule.section, asset, assignedMesh);
-        EiemLogRendererBoneFingerprint("commit", renderer);
-        EiemArmSkinProbeSweep();
       }
       EiemSetReplacementDrawBounds(renderer, rendererType, assignedMesh,
                                    hasSourceBounds ? &sourceBounds : nullptr);
@@ -5412,8 +5302,6 @@ static bool EiemApplyResolvedRenderRule(void *renderer, void *drawRenderer,
         readEnabled ? (currentEnabled ? "true" : "false") : "unknown",
         readVisible ? (currentVisible ? "true" : "false") : "unknown");
   }
-  if (allowPartnerCreation)
-    EiemApplyPartners(renderer, drawRenderer, mesh, rendererType, rule);
   return true;
 }
 
@@ -5441,9 +5329,8 @@ static bool EiemApplyRenderRuleSetToRenderer(
     bool *referenced = nullptr, bool *matched = nullptr,
     const std::vector<std::string> *affected = nullptr,
     std::vector<EiemPhysicsIntent> *physicsIntents = nullptr,
-    bool allowPartnerCreation = false, bool includeGameHidden = false) {
+    bool includeGameHidden = false) {
   if (!meshOwner || !drawRenderer || !mesh || !rendererType) return false;
-  if (s_eiemCreatingPartner || EiemIsPartnerRenderer(drawRenderer)) return false;
   if (!EiemRendererEligibleForRule(meshOwner, drawRenderer,
                                    includeGameHidden))
     return false;
@@ -5491,7 +5378,7 @@ static bool EiemApplyRenderRuleSetToRenderer(
     strncpy_s(resolved.asset, sizeof(resolved.asset), asset, _TRUNCATE);
     return EiemApplyResolvedRenderRule(meshOwner, drawRenderer, identityMesh,
                                        rendererType, methodInfo, resolved,
-                                       true, allowPartnerCreation);
+                                       true);
   }
   return false;
 }
@@ -5502,8 +5389,7 @@ static bool EiemApplyRenderRuleSet(void *model,
                                     const char *stage, bool *referenced = nullptr,
                                     bool *matched = nullptr,
                                     const std::vector<std::string> *affected = nullptr,
-                                    std::vector<EiemPhysicsIntent> *physicsIntents = nullptr,
-                                    bool allowPartnerCreation = false) {
+                                    std::vector<EiemPhysicsIntent> *physicsIntents = nullptr) {
   if (!model || rules.empty() || !EiemOnUnityThread() ||
       !g_gameObject_GetComponentsInChildren || !il2cpp_class_get_type ||
       !il2cpp_type_get_object)
@@ -5517,74 +5403,77 @@ static bool EiemApplyRenderRuleSet(void *model,
   const uintptr_t previousOwner = s_eiemActivePrefabInstance;
   const auto *previousLiveSkinSources = s_eiemLiveSkinSources;
   std::vector<EiemLiveSkinSource> liveSkinSources;
+  std::vector<void *> skinnedRenderers;
+  std::vector<void *> meshFilters;
   s_eiemActivePrefabInstance = (uintptr_t)model;
+
+  auto snapshotType = [&](void *componentClass,
+                          std::vector<void *> *components) {
+    if (!componentClass || !components) return false;
+    void *type = il2cpp_class_get_type(componentClass);
+    void *typeObject = type ? il2cpp_type_get_object(type) : nullptr;
+    if (!typeObject) return false;
+    bool includeInactive = true;
+    void *params[] = {typeObject, &includeInactive};
+    void *array = Invoke(g_gameObject_GetComponentsInChildren, model, params);
+    const size_t count = EiemManagedArrayLength(array);
+    if (!array || count > 8192) return false;
+    void **items = (void **)((char *)array + IL2CPP_ARRAY_DATA);
+    components->assign(items, items + count);
+    return true;
+  };
+
+  // Snapshot each component class once. The source-palette capture and the
+  // rule executor consume the same concrete Renderer pointers, so one model
+  // transaction cannot observe two different hierarchy states and does not
+  // pay for a second GetComponentsInChildren<SkinnedMeshRenderer> traversal.
+  snapshotType(g_skinnedMeshRendererClass, &skinnedRenderers);
+  snapshotType(g_meshFilterClass, &meshFilters);
 
   // Capture every source palette as one model-local transaction before the
   // first replacement changes sharedMesh or bones[]. Repeated lifecycle calls
   // read the retained original palette from the override state.
-  if (g_skinnedMeshRendererClass && g_smr_get_bones) {
-    void *type = il2cpp_class_get_type(g_skinnedMeshRendererClass);
-    void *typeObject = type ? il2cpp_type_get_object(type) : nullptr;
-    if (typeObject) {
-      bool includeInactive = true;
-      void *params[] = {typeObject, &includeInactive};
-      void *array = Invoke(g_gameObject_GetComponentsInChildren, model, params);
-      const size_t count = EiemManagedArrayLength(array);
-      if (array && count <= 8192) {
-        void **items = (void **)((char *)array + IL2CPP_ARRAY_DATA);
-        liveSkinSources.reserve(count);
-        for (size_t index = 0; index < count; ++index) {
-          void *renderer = items[index];
-          if (!renderer) continue;
-          void *mesh = EiemReadSharedMesh(renderer, "SkinnedMeshRenderer");
-          if (!mesh) continue;
-          void *identityMesh = mesh;
-          EiemPrepareRenderInput(renderer, mesh, "SkinnedMeshRenderer",
-                                 &identityMesh);
-          char source[768] = {};
-          char asset[192] = {};
-          if (!identityMesh ||
-              !EiemReadLiveMeshIdentity(identityMesh, source, sizeof(source),
-                                        asset, sizeof(asset)))
-            continue;
-          void *bones = EiemBackendInvokeNoThrow(g_smr_get_bones, renderer);
-          AcquireSRWLockShared(&s_eiemOverrideLock);
-          const size_t overrideIndex = EiemFindOverrideLocked(renderer);
-          if (overrideIndex != SIZE_MAX &&
-              s_eiemOverrides[overrideIndex].originalBonesHandle &&
-              il2cpp_gchandle_get_target) {
-            void *original = il2cpp_gchandle_get_target(
-                s_eiemOverrides[overrideIndex].originalBonesHandle);
-            if (original) bones = original;
-          }
-          ReleaseSRWLockShared(&s_eiemOverrideLock);
-          if (!bones || !EiemManagedArrayLength(bones)) continue;
-          liveSkinSources.push_back({source, asset, renderer, bones});
-        }
+  if (g_smr_get_bones) {
+    liveSkinSources.reserve(skinnedRenderers.size());
+    for (void *renderer : skinnedRenderers) {
+      if (!renderer) continue;
+      void *mesh = EiemReadSharedMesh(renderer, "SkinnedMeshRenderer");
+      if (!mesh) continue;
+      void *identityMesh = mesh;
+      EiemPrepareRenderInput(renderer, mesh, "SkinnedMeshRenderer",
+                             &identityMesh);
+      char source[768] = {};
+      char asset[192] = {};
+      if (!identityMesh ||
+          !EiemReadLiveMeshIdentity(identityMesh, source, sizeof(source),
+                                    asset, sizeof(asset)))
+        continue;
+      void *bones = EiemBackendInvokeNoThrow(g_smr_get_bones, renderer);
+      AcquireSRWLockShared(&s_eiemOverrideLock);
+      const size_t overrideIndex = EiemFindOverrideLocked(renderer);
+      if (overrideIndex != SIZE_MAX &&
+          s_eiemOverrides[overrideIndex].originalBonesHandle &&
+          il2cpp_gchandle_get_target) {
+        void *original = il2cpp_gchandle_get_target(
+            s_eiemOverrides[overrideIndex].originalBonesHandle);
+        if (original) bones = original;
       }
+      ReleaseSRWLockShared(&s_eiemOverrideLock);
+      if (!bones || !EiemManagedArrayLength(bones)) continue;
+      liveSkinSources.push_back({source, asset, renderer, bones});
     }
   }
   s_eiemLiveSkinSources = &liveSkinSources;
 
-  auto visitType = [&](void *componentClass, const char *rendererType) {
-    if (!componentClass) return;
-    void *type = il2cpp_class_get_type(componentClass);
-    void *typeObject = type ? il2cpp_type_get_object(type) : nullptr;
-    if (!typeObject) return;
+  auto visitType = [&](const std::vector<void *> &components,
+                       const char *rendererType) {
     // Custom LOD controllers keep authored Renderer GameObjects inactive until
     // the level is selected.  Replace every authored level after the model's
     // assembly boundary; the game remains responsible only for activating the
     // selected level.  Waiting for an inactive level to become visible misses
     // controllers that toggle GameObjects without calling a Mesh setter.
-    bool includeInactive = true;
-    void *params[] = {typeObject, &includeInactive};
-    void *array = Invoke(g_gameObject_GetComponentsInChildren, model, params);
-    const size_t count = EiemManagedArrayLength(array);
-    if (!array || count > 8192) return;
-    visited += count;
-    void **items = (void **)((char *)array + IL2CPP_ARRAY_DATA);
-    for (size_t index = 0; index < count; ++index) {
-      void *meshOwner = items[index];
+    visited += components.size();
+    for (void *meshOwner : components) {
       if (!meshOwner) continue;
       void *drawRenderer = EiemModEquals(rendererType, "SkinnedMeshRenderer")
                                ? meshOwner
@@ -5594,13 +5483,13 @@ static bool EiemApplyRenderRuleSet(void *model,
       if (mesh && EiemApplyRenderRuleSetToRenderer(
                       root, meshOwner, drawRenderer, mesh, rendererType,
                       nullptr, rules, sourceLabel, referenced, matched, affected,
-                      physicsIntents, allowPartnerCreation, true))
+                      physicsIntents, true))
         ++applied;
     }
   };
 
-  visitType(g_skinnedMeshRendererClass, "SkinnedMeshRenderer");
-  visitType(g_meshFilterClass, "MeshFilter");
+  visitType(skinnedRenderers, "SkinnedMeshRenderer");
+  visitType(meshFilters, "MeshFilter");
   s_eiemLiveSkinSources = previousLiveSkinSources;
   s_eiemActivePrefabInstance = previousOwner;
   if (applied)
@@ -5611,13 +5500,11 @@ static bool EiemApplyRenderRuleSet(void *model,
 
 static bool EiemApplyStandaloneRenderRules(void *model, const char *stage,
                                            bool *matched, const std::vector<std::string> *affected,
-                                           std::vector<EiemPhysicsIntent> *physicsIntents,
-                                           bool allowPartnerCreation) {
+                                           std::vector<EiemPhysicsIntent> *physicsIntents) {
   std::vector<EiemModRule> rules;
   EiemFindStandaloneRenderRules(&rules);
-  return EiemApplyRenderRuleSet(model, rules, "<mesh identity>", stage, nullptr,
-                                matched, affected, physicsIntents,
-                                allowPartnerCreation);
+  return EiemApplyRenderRuleSet(model, rules, "<mesh identity>", stage,
+                                nullptr, matched, affected, physicsIntents);
 }
 
 // EntityRenderHelper is the common game-owned assembly boundary for the
@@ -5670,35 +5557,15 @@ static void TraceEntityRenderHelperInitRenderAndMaterial(void *self,
 
 static bool EiemApplyStandaloneRenderRulesToRenderer(
     void *meshOwner, void *drawRenderer, void *mesh,
-    const char *rendererType, void *methodInfo, const char *stage,
-    bool allowPartnerCreation) {
+    const char *rendererType, void *methodInfo, const char *stage) {
   (void)stage;
   if (!EiemOnUnityThread()) return false;
   std::vector<EiemModRule> rules;
   EiemFindStandaloneRenderRules(&rules);
   return EiemApplyRenderRuleSetToRenderer(
       nullptr, meshOwner, drawRenderer, mesh, rendererType, methodInfo, rules,
-      "<mesh setter>", nullptr, nullptr, nullptr, nullptr,
-      allowPartnerCreation);
+      "<mesh setter>", nullptr, nullptr, nullptr, nullptr);
 }
-
-struct EiemModelOwnerRef {
-  EiemModelOwnerKind kind = EiemModelOwnerKind::PrefabProxy;
-  void *owner = nullptr;
-  bool active = true;
-};
-
-struct EiemModelInstanceState {
-  void *model = nullptr;
-  EiemUnityRef modelRef;
-  uint32_t instanceUid = 0;
-  char path[768] = {};
-  EiemModelOwnerRef owners[4] = {};
-  uint32_t ownerCount = 0;
-  // Declarative snapshots only. Native component handles and retirement
-  // state live in the Physics runtime adapter, not in this match plan.
-  std::vector<EiemPhysicsIntent> physicsIntents;
-};
 
 // One native skin assembly call supplies the complete bone table through its
 // rootBones argument while each Renderer keeps only a local palette. Keep the
@@ -6186,7 +6053,6 @@ static bool EiemRegisterAndApplyModelInstance(
     EiemRegistrationTraceRelease(
         EiemModelOwnerKindName(ownerKind), owner, (void *)released,
         "owner moved to another model", generationSnapshot);
-    EiemDestroyPartnerObjects(released);
     EiemForgetRenderOverrides(released);
   }
   // Existence is recorded before consulting the current program. An empty
@@ -6228,11 +6094,6 @@ static bool EiemRegisterBaseModelViewPartInstance(void *part,
   const bool applied = EiemRegisterAndApplyModelInstance(
       EiemModelOwnerKind::BaseModelPart, part, model,
       path[0] ? path : nullptr, 0, stage);
-  // Publish all Partners into the same parallel caches that the game uses for
-  // the source model. This runs after resource application because that pass
-  // is what creates the Partners; the surrounding completion hook retries it
-  // after the game has populated its arrays.
-  EiemRegisterPartnersInBaseModelArrays(part, stage);
   if (applied || kEiemValidationIdentityProbe)
     Log("[MOD-MODEL-PART] completed part=%p path=%s model=%p applied=%d stage=%s",
         part, path, model, applied ? 1 : 0, stage ? stage : "unknown");
@@ -6320,7 +6181,6 @@ static void EiemForgetModelOwner(EiemModelOwnerKind ownerKind, void *owner,
     EiemRegistrationTraceRelease(
         EiemModelOwnerKindName(ownerKind), owner, (void *)modelOwner, stage,
         InterlockedCompareExchange(&s_eiemModGeneration, 0, 0));
-    EiemDestroyPartnerObjects(modelOwner);
     EiemForgetRenderOverrides(modelOwner);
   }
   for (const auto &physics : physicsStates)
@@ -6348,7 +6208,6 @@ static void EiemForgetModelInstance(void *model, const char *stage) {
   EiemRegistrationTraceRelease(
       "model", nullptr, model, stage,
       InterlockedCompareExchange(&s_eiemModGeneration, 0, 0));
-  EiemDestroyPartnerObjects(modelOwner);
   EiemForgetRenderOverrides(modelOwner);
   Log("[MOD-LIFECYCLE] released model=%p stage=%s", model,
       stage ? stage : "unknown");
@@ -6565,15 +6424,14 @@ static void TraceMaterialInfoInit(void *self, void *renderer, void *configs, voi
     if (s_eiemEntityRenderHelperInitGuard) return;
     // Without an enclosing helper this per-Renderer callback is the completed
     // boundary available to direct NPC/UI construction. Apply in-place
-    // resource/material actions here, while still deferring hierarchy-growing
-    // Partner creation to a model assembly boundary.
+    // resource/material actions here.
     bool applied = false;
     if (EiemIsSkinnedRenderer(renderer)) {
       void *mesh = EiemReadSharedMesh(renderer, "SkinnedMeshRenderer");
       if (mesh)
         applied = EiemApplyStandaloneRenderRulesToRenderer(
             renderer, renderer, mesh, "SkinnedMeshRenderer", methodInfo,
-            "RendererInfo._Init", false);
+            "RendererInfo._Init");
     }
     // Path-qualified rules cannot be newly resolved without a model root, but
     // a previously bound Renderer still needs its material slots restored
@@ -6622,9 +6480,8 @@ static bool TraceRendererInfoTryReplaceSharedMaterials(void *self,
   return result;
 }
 
-// Observe both game-owned and EIEM-owned LOD array writes. The hook is
-// read-only: the original setter runs first, then the resulting array size is
-// recorded at the same boundary as the partner membership trace.
+// Legacy LOD-group observation retained only for archived diagnostics. The
+// production hook is no longer installed.
 static void TraceLodGroupSetLODs(void *self, void *lods, void *methodInfo) {
   auto original = (TraceLodGroupSetLodsFn)s_origLodGroupSetLODs;
   if (original)
@@ -6639,11 +6496,9 @@ static void TraceLodGroupSetLODs(void *self, void *lods, void *methodInfo) {
 }
 
 // Read-only evidence for the concrete Renderer objects that the world skin
-// assembly passes to CreateSMSGO/AssignSkinGo. The existing membership probe
-// compares only exact pointers against the Partner table; that is insufficient
-// when the game has a duplicate/intermediate Renderer carrying the same Mesh.
-// Keep this bounded and de-duplicated so ordinary world traffic cannot turn the
-// diagnostic DLL into a per-frame logger.
+// assembly passes to CreateSMSGO/AssignSkinGo. Keep this validation-only,
+// bounded and de-duplicated so normal world traffic cannot become a per-frame
+// logger.
 static void EiemTraceSkinArrayItems(const char *boundary, void *owner,
                                     void *array, int32_t lod,
                                     LONG generation) {
@@ -6675,7 +6530,7 @@ static void EiemTraceSkinArrayItems(const char *boundary, void *owner,
       TraceBuildRendererHierarchy(renderer, hierarchy, sizeof(hierarchy));
       Log("%s event=skin-array-item boundary=%s owner=%p array=%p lod=%d "
           "index=%zu renderer=%p type=%s rendererName=%s mesh=%p "
-          "asset=%s meshDescription=%s sourceKnown=%d partnerKnown=%d "
+          "asset=%s meshDescription=%s sourceKnown=%d "
           "hierarchy=%s generation=%ld",
           EiemRegistrationTraceTag, boundary ? boundary : "unknown", owner,
           array, lod, index, renderer,
@@ -6684,7 +6539,6 @@ static void EiemTraceSkinArrayItems(const char *boundary, void *owner,
           asset[0] ? asset : "<unknown>",
           meshDescription[0] ? meshDescription : "<unknown>",
           EiemIsKnownSourceRenderer(renderer) ? 1 : 0,
-          EiemIsPartnerRenderer(renderer) ? 1 : 0,
           hierarchy[0] ? hierarchy : "<unknown>", generation);
     }
   } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -6704,11 +6558,6 @@ static void TraceAssignSkinGo(int32_t lod, void *renderers,
                               void *methodInfo) {
   const LONG generation =
       InterlockedCompareExchange(&s_eiemModGeneration, 0, 0);
-  // The world path must remain observational here. In particular, do not
-  // append Partners or rewrite root-bone data before proving that this is the
-  // game's own skin assembly boundary.
-  EiemTraceKnownPartnerParallelArrays("AssignSkinGoPre", renderers, rootBones,
-                                      generation);
   EiemRegistrationTraceArrayBoundary(
       "AssignSkinGoPre", nullptr, renderers, EiemManagedArrayLength(renderers),
       generation, lod);
@@ -6730,9 +6579,6 @@ static void TraceAssignSkinGo(int32_t lod, void *renderers,
       EiemManagedArrayLength(renderers), afterGeneration, lod);
   EiemTraceSkinArrayItems("AssignSkinGoPost", nullptr, renderers, lod,
                           afterGeneration);
-  EiemTraceKnownPartnerArrayMembers(
-      "AssignSkinGoPost", nullptr, renderers,
-      EiemManagedArrayLength(renderers), afterGeneration);
   if (resourcesApplied)
     Log("[MOD-ASSEMBLY-v114] boundary=AssignSkinGoPost resourcesApplied=%zu",
         resourcesApplied);
@@ -6741,10 +6587,6 @@ static void TraceAssignSkinGo(int32_t lod, void *renderers,
 static void TraceAssignSkinPost(int32_t lod, void *renderers,
                                 void *rootBones, void *closure,
                                 void *methodInfo) {
-  const LONG generation =
-      InterlockedCompareExchange(&s_eiemModGeneration, 0, 0);
-  EiemTraceKnownPartnerParallelArrays("AssignSkinPre", renderers, rootBones,
-                                      generation);
   auto original = (TraceAssignSkinPostFn)s_origAssignSkinPost;
   if (original)
     original(lod, renderers, rootBones, closure, methodInfo);
@@ -6757,13 +6599,8 @@ static void TraceAssignSkinPost(int32_t lod, void *renderers,
   EiemRegistrationTraceArrayBoundary(
       "AssignSkinPost", nullptr, renderers, EiemManagedArrayLength(renderers),
       InterlockedCompareExchange(&s_eiemModGeneration, 0, 0), lod);
-  EiemTraceKnownPartnerArrayMembers(
-      "AssignSkinPost", nullptr, renderers, EiemManagedArrayLength(renderers),
-      InterlockedCompareExchange(&s_eiemModGeneration, 0, 0));
   EiemRememberGameSourceSkinningFromArray(
       renderers, true, true, "AssignSkinPost");
-  EiemSyncPartnerRootBonesFromArray(renderers);
-  EiemProbePartnerBoneBindings(nullptr, "assign-skin");
   if (resourcesApplied)
     Log("[MOD-ASSEMBLY-v114] boundary=AssignSkinPost resourcesApplied=%zu",
         resourcesApplied);
@@ -6771,29 +6608,17 @@ static void TraceAssignSkinPost(int32_t lod, void *renderers,
 
 static void TraceSetSmrRootBone(void *animator, void *renderers,
                                 void *rootBoneInfos, void *methodInfo) {
-  const LONG generation =
-      InterlockedCompareExchange(&s_eiemModGeneration, 0, 0);
-  EiemTraceKnownPartnerParallelArrays("SetSMRRootBonePre", renderers,
-                                      rootBoneInfos, generation);
   auto original = (TraceSetSmrRootBoneFn)s_origSetSmrRootBone;
   if (original) original(animator, renderers, rootBoneInfos, methodInfo);
   EiemRegistrationTraceArrayBoundary(
       "SetSMRRootBone", animator, renderers, EiemManagedArrayLength(renderers),
       InterlockedCompareExchange(&s_eiemModGeneration, 0, 0), -1);
-  EiemTraceKnownPartnerArrayMembers(
-      "SetSMRRootBone", animator, renderers, EiemManagedArrayLength(renderers),
-      InterlockedCompareExchange(&s_eiemModGeneration, 0, 0));
   EiemRememberGameSourceSkinningFromArray(
       renderers, false, true, "SetSMRRootBone");
-  EiemSyncPartnerRootBonesFromArray(renderers);
-  EiemProbePartnerBoneBindings(nullptr, "set-root-bone");
 }
 
 // CreateSMS returns the exact SkinnedMeshRenderer array for one NPC model and
-// one LOD. Apply Mesh-identity rules to those concrete source instances before
-// extending that same array with their Partners. The caller continues into
-// AssignSkin only after this hook returns, so every new Renderer enters the
-// game's normal skin assembly as part of the owning instance.
+// one LOD. Resource writes wait for AssignSkin to finish the native palette.
 static size_t EiemApplyStandaloneRenderRulesToSkinArray(
     void *renderers, const char *stage) {
   const size_t count = EiemManagedArrayLength(renderers);
@@ -6802,11 +6627,11 @@ static size_t EiemApplyStandaloneRenderRulesToSkinArray(
   size_t applied = 0;
   for (size_t index = 0; index < count; ++index) {
     void *renderer = items[index];
-    if (!renderer || EiemIsPartnerRenderer(renderer)) continue;
+    if (!renderer) continue;
     void *mesh = EiemReadSharedMesh(renderer, "SkinnedMeshRenderer");
     if (mesh && EiemApplyStandaloneRenderRulesToRenderer(
                     renderer, renderer, mesh, "SkinnedMeshRenderer", nullptr,
-                    stage, false))
+                    stage))
       ++applied;
   }
   if (applied)
@@ -6830,22 +6655,11 @@ static void TraceCreateSmsGo(void *assetLoader, void *meshAssets, int32_t lod,
   // CreateSMS has produced the Renderer objects, but AssignSkin has not yet
   // supplied their final bones/root state.  Keep this boundary observational;
   // the resource transaction runs after AssignSkin returns.
-  EiemRegisterPartnersInSkinArrays(
-      renderers, rootBones,
-      InterlockedCompareExchange(&s_eiemModGeneration, 0, 0),
-      "CreateSMSGO");
-  array = renderers ? *renderers : nullptr;
-  EiemTraceKnownPartnerParallelArrays(
-      "CreateSMSGOPost", array, rootBones ? *rootBones : nullptr,
-      InterlockedCompareExchange(&s_eiemModGeneration, 0, 0));
   EiemRegistrationTraceArrayBoundary(
       "CreateSMSGO", meshAssets, array, EiemManagedArrayLength(array),
       InterlockedCompareExchange(&s_eiemModGeneration, 0, 0), lod);
   EiemTraceSkinArrayItems(
       "CreateSMSGO", meshAssets, array, lod,
-      InterlockedCompareExchange(&s_eiemModGeneration, 0, 0));
-  EiemTraceKnownPartnerArrayMembers(
-      "CreateSMSGO", meshAssets, array, EiemManagedArrayLength(array),
       InterlockedCompareExchange(&s_eiemModGeneration, 0, 0));
 }
 
@@ -6861,23 +6675,10 @@ static void TraceCreateSmsPost(void *meshAssets, int32_t lod, void *goPool,
              rootBones, flag, methodInfo);
   void *array = renderers ? *renderers : nullptr;
   // Defer resource writes until the game's AssignSkin boundary completes.
-  EiemRegisterPartnersInSkinArrays(
-      renderers, rootBones,
-      InterlockedCompareExchange(&s_eiemModGeneration, 0, 0),
-      "CreateSMSInfoForPostModel");
-  array = renderers ? *renderers : nullptr;
-  EiemTraceKnownPartnerParallelArrays(
-      "CreateSMSInfoForPostModelPost", array,
-      rootBones ? *rootBones : nullptr,
-      InterlockedCompareExchange(&s_eiemModGeneration, 0, 0));
   EiemRegistrationTraceArrayBoundary(
       "CreateSMSInfoForPostModel", meshAssets, array,
       EiemManagedArrayLength(array),
       InterlockedCompareExchange(&s_eiemModGeneration, 0, 0), lod);
-  EiemTraceKnownPartnerArrayMembers(
-      "CreateSMSInfoForPostModel", meshAssets, array,
-      EiemManagedArrayLength(array),
-      InterlockedCompareExchange(&s_eiemModGeneration, 0, 0));
 }
 
 // Mesh observations are fixed-size metadata records. They intentionally keep
@@ -7085,33 +6886,10 @@ static void EiemReapplyShapeControls(const std::vector<std::string> &affected) {
       EiemUpdateRendererShapes(state.renderer, state.rendererType, rule, state.shapes);
   }
   ReleaseSRWLockExclusive(&s_eiemOverrideLock);
-  AcquireSRWLockExclusive(&s_eiemPartnerLock);
-  for (auto &state : s_eiemPartners) {
-    EiemModRule rule = {};
-    if (EiemModAffected(state.modPath, &affected) &&
-        EiemFindRenderRuleBySection(state.modPath, state.section, &rule))
-      EiemUpdateRendererShapes(state.partnerRenderer, state.rendererType, rule, state.shapes);
-  }
-  ReleaseSRWLockExclusive(&s_eiemPartnerLock);
 }
 
 static constexpr UINT_PTR kEiemShapeTransitionTimer = 0xE153;
 static ULONGLONG s_eiemShapeTransitionTick = 0;
-// A replacement can look structurally valid at commit time and still lie on
-// the ground after animation/physics initialization. Revisit only the existing
-// game Renderers whose sharedMesh EIEM replaced; no Partner is involved.
-static ULONGLONG s_eiemSkinProbeArmTick = 0;
-static bool s_eiemSkinProbeSweepDone = false;
-static constexpr ULONGLONG kEiemSkinProbeSettleMs = 1500;
-static volatile LONG s_traceSkinProbeSweepCount = 0;
-
-static void EiemArmSkinProbeSweep() {
-  if (s_eiemSkinProbeArmTick && !s_eiemSkinProbeSweepDone) return;
-  s_eiemSkinProbeArmTick = GetTickCount64();
-  s_eiemSkinProbeSweepDone = false;
-  if (g_gameHwnd && IsWindow(g_gameHwnd))
-    SetTimer(g_gameHwnd, kEiemShapeTransitionTimer, 16, nullptr);
-}
 
 static bool EiemAnyShapeTransitions() {
   bool active = false;
@@ -7119,18 +6897,12 @@ static bool EiemAnyShapeTransitions() {
   for (const auto &state : s_eiemOverrides)
     if (EiemShapeStateAnimating(state.shapes)) { active = true; break; }
   ReleaseSRWLockShared(&s_eiemOverrideLock);
-  if (active) return true;
-  AcquireSRWLockShared(&s_eiemPartnerLock);
-  for (const auto &state : s_eiemPartners)
-    if (EiemShapeStateAnimating(state.shapes)) { active = true; break; }
-  ReleaseSRWLockShared(&s_eiemPartnerLock);
   return active;
 }
 
 static void EiemRefreshShapeTransitionTimer() {
   if (!g_gameHwnd || !IsWindow(g_gameHwnd)) return;
-  // The probe sweep needs the same frame pacing as an animating shape.
-  if (EiemAnyShapeTransitions() || !s_eiemSkinProbeSweepDone) {
+  if (EiemAnyShapeTransitions()) {
     if (!s_eiemShapeTransitionTick) s_eiemShapeTransitionTick = GetTickCount64();
     SetTimer(g_gameHwnd, kEiemShapeTransitionTimer, 16, nullptr);
   } else {
@@ -7139,42 +6911,7 @@ static void EiemRefreshShapeTransitionTimer() {
   }
 }
 
-// Measure each in-place replacement again after the game's skin/Animator and
-// physics initialization have had time to run. This observes the architecture
-// used by current Mesh replacement rather than the retired Partner path.
-static void EiemRunSkinProbeSweep() {
-  if (s_eiemSkinProbeSweepDone || !s_eiemSkinProbeArmTick) return;
-  if (GetTickCount64() - s_eiemSkinProbeArmTick < kEiemSkinProbeSettleMs) return;
-  s_eiemSkinProbeSweepDone = true;
-  std::vector<EiemRenderOverrideState> replacements;
-  AcquireSRWLockShared(&s_eiemOverrideLock);
-  replacements.reserve(s_eiemOverrides.size());
-  for (const auto &state : s_eiemOverrides)
-    if (!state.restorePending && state.ownsMesh && state.replacementMesh &&
-        EiemModEquals(state.rendererType, "SkinnedMeshRenderer"))
-      replacements.push_back(state);
-  ReleaseSRWLockShared(&s_eiemOverrideLock);
-  Log("[DEBUG-GROUND-v1] phase=settled-sweep replacements=%zu",
-      replacements.size());
-  for (const auto &state : replacements) {
-    if (InterlockedIncrement(&s_traceSkinProbeSweepCount) > 400) break;
-    void *renderer = state.rendererRef.Target();
-    if (!renderer || state.rendererRef.Status() != 1) continue;
-    void *current = EiemReadSharedMesh(renderer, state.rendererType);
-    Log("[DEBUG-GROUND-v1] phase=settled renderer=%p section=%s "
-        "original=%p replacement=%p current=%p replacementActive=%d",
-        renderer, state.renderSection[0] ? state.renderSection : "<unknown>",
-        state.originalMesh, state.replacementMesh, current,
-        current == state.replacementMesh ? 1 : 0);
-    EiemLogRendererBoneFingerprint("settled", renderer);
-    const EiemSkinProbe::Result measurement = EiemSkinProbe::Measure(renderer);
-    EiemSkinProbe::LogResult("[DEBUG-GROUND-v1] phase=settled-pose",
-                             measurement);
-  }
-}
-
 static void EiemRunShapeTransitions() {
-  EiemRunSkinProbeSweep();
   const ULONGLONG now = GetTickCount64();
   const float elapsed = s_eiemShapeTransitionTick
       ? (float)(now - s_eiemShapeTransitionTick) / 1000.0f : 0.0f;
@@ -7188,15 +6925,6 @@ static void EiemRunShapeTransitions() {
                                state.shapes, elapsed);
   }
   ReleaseSRWLockExclusive(&s_eiemOverrideLock);
-  AcquireSRWLockExclusive(&s_eiemPartnerLock);
-  for (auto &state : s_eiemPartners) {
-    if (!EiemShapeStateAnimating(state.shapes)) continue;
-    EiemModRule rule = {};
-    if (EiemFindRenderRuleBySection(state.modPath, state.section, &rule))
-      EiemUpdateRendererShapes(state.partnerRenderer, state.rendererType, rule,
-                               state.shapes, elapsed);
-  }
-  ReleaseSRWLockExclusive(&s_eiemPartnerLock);
   EiemRefreshShapeTransitionTimer();
 }
 
@@ -7424,13 +7152,12 @@ static void EiemRunModReconcile() {
   EiemModProgram next;
   std::vector<std::string> affectedMods;
   const std::vector<std::string> *affected = nullptr;
-  bool partnerLinksOnly = false;
   bool submeshVisibilityOnly = false;
   std::vector<EiemSubmeshVisibilityChange> visibilityChanges;
   if (!reload && !inputs.empty()) {
     bool shapesOnly = false;
     if (EiemPrepareInputUpdate(inputs, &next, &affectedMods, &shapesOnly,
-                               &partnerLinksOnly, &submeshVisibilityOnly,
+                               &submeshVisibilityOnly,
                                &visibilityChanges)) {
       if (shapesOnly && !(requests & (uint32_t)EiemModUpdate::Reconcile)) {
         EiemPublishModState(std::move(next));
@@ -7481,17 +7208,7 @@ static void EiemRunModReconcile() {
       Log("[MOD-RELOAD-TRACE] Physics remains owned by model generation; "
           "only changed intents retire during replay");
     }
-    if (partnerLinksOnly) {
-      EiemApplyPartnerControlVisibility(affected, next);
-    } else {
-      // F10 changes resource/config generations while the game's model and
-      // skin instances remain alive. Keep existing Partners in place; the
-      // replay path refreshes them in place so their internal skin/LOD
-      // registration is not lost. Owner teardown still destroys them through
-      // EiemForgetModelOwner/EiemForgetModelInstance.
-      if (!reload) EiemDestroyPartnerObjects(affected);
-      EiemRestoreRenderOverrides(affected);
-    }
+    EiemRestoreRenderOverrides(affected);
     EiemCollectSkeletonInstances();
     // Configuration reload must not release Unity Mesh objects that may still
     // be referenced by a Renderer. The resource backend reuses unchanged files
@@ -7529,14 +7246,7 @@ static void EiemRunModReconcile() {
      Log("[MOD-RELOAD-TRACE] phase=replay begin models=%zu", instances.size());
    uint32_t matched = 0;
    size_t replayIndex = 0;
-   // A partner-link key transaction changes only Renderer.enabled.  Replaying
-   // every model here would also re-store Physics intents and can start a
-   // native Physics generation merely because a hidden Partner was shown.
-   // Resource/Physics replay remains owned by F10 or a lifecycle boundary.
-   if (partnerLinksOnly) {
-     Log("[MOD] Reconcile partner visibility only: skipped model resource/Physics replay");
-   } else {
-     for (const auto &instance : instances) {
+   for (const auto &instance : instances) {
        if (!instance.model) continue;
        if (reload)
          Log("[MOD-RELOAD-TRACE] model=%zu/%zu begin ptr=%p path=%s",
@@ -7558,7 +7268,6 @@ static void EiemRunModReconcile() {
              replayIndex + 1, instances.size(), instance.model, applied ? 1 : 0,
              GetTickCount64() - reconcileStarted);
        ++replayIndex;
-     }
    }
   const ULONGLONG elapsed = GetTickCount64() - started;
   Log("[MOD] Reconcile complete: registeredModels=%zu matchedModels=%u elapsed=%llums",
@@ -8532,7 +8241,7 @@ static void *TraceAssetProxyHandleGetAssetProxy(void *self, void *methodInfo) {
     if (pathGetter) {
       TraceDescribeString(pathGetter(self, nullptr), pathText, sizeof(pathText));
     }
-    if (pathText[0] && strstr(pathText, "typhoea") != nullptr) {
+    if (TraceIdentityTextMatchesConfiguredRule(pathText)) {
       Log("[RES-TRACE] ProxyGet handle=%p proxy=%p type=%s path=\"%s\"", self,
           result, name ? name : "?", pathText);
     }
@@ -8541,16 +8250,33 @@ static void *TraceAssetProxyHandleGetAssetProxy(void *self, void *methodInfo) {
   return result;
 }
 
-static bool TraceIdentityTextMatchesTyphoea(const char *text) {
-  return text && (strstr(text, "typhoea") || strstr(text, "Typhoea"));
+static bool TraceIdentityTextMatchesConfiguredRule(const char *text) {
+  if (!text || !text[0]) return false;
+  std::string identity(text);
+  std::transform(identity.begin(), identity.end(), identity.begin(),
+                 [](unsigned char value) { return (char)std::tolower(value); });
+  std::vector<EiemModRule> rules;
+  EiemFindStandaloneRenderRules(&rules);
+  for (const auto &rule : rules) {
+    for (const char *selector : {rule.asset, rule.path}) {
+      if (!selector || !selector[0]) continue;
+      std::string candidate(selector);
+      std::transform(candidate.begin(), candidate.end(), candidate.begin(),
+                     [](unsigned char value) {
+                       return (char)std::tolower(value);
+                     });
+      if (identity.find(candidate) != std::string::npos) return true;
+    }
+  }
+  return false;
 }
 
 static bool TraceTakeTargetBudget(volatile LONG *counter, LONG limit,
                                   const char *primary,
                                   const char *secondary) {
   if (!kEiemValidationIdentityProbe ||
-      (!TraceIdentityTextMatchesTyphoea(primary) &&
-       !TraceIdentityTextMatchesTyphoea(secondary)))
+      (!TraceIdentityTextMatchesConfiguredRule(primary) &&
+       !TraceIdentityTextMatchesConfiguredRule(secondary)))
     return false;
   return InterlockedIncrement(counter) <= limit;
 }
@@ -8562,7 +8288,7 @@ static void TraceSubMeshInfoIdentity(void *info, const char *event,
     void *nameObject = *(void **)((char *)info + 0x30);
     char name[192] = {};
     if (nameObject) ReadStrUtf8(nameObject, name, sizeof(name));
-    if (!TraceIdentityTextMatchesTyphoea(name)) return;
+    if (!TraceIdentityTextMatchesConfiguredRule(name)) return;
     void *mesh = meshOverride ? meshOverride
                               : *(void **)((char *)info + 0x10);
     const int64_t pathHash = *(int64_t *)((char *)info + 0x28);
@@ -8600,7 +8326,7 @@ static void *TraceLodMeshAssetsGetSubMeshInfo(void *self, int32_t lod, bool gpu,
     void *nameObject = *(void **)((char *)self + 0x10);
     char ownerName[192] = {};
     if (nameObject) ReadStrUtf8(nameObject, ownerName, sizeof(ownerName));
-    if (!TraceIdentityTextMatchesTyphoea(ownerName)) return result;
+    if (!TraceIdentityTextMatchesConfiguredRule(ownerName)) return result;
     const size_t count = EiemManagedArrayLength(result);
     Log("[V1.1-DESCRIPTOR] event=NPCAvatarLodMeshAssets.GetSubMeshInfo "
         "owner=%p ownerName=%s lod=%d gpu=%d array=%p count=%zu",
@@ -8631,11 +8357,11 @@ static void *TraceMeshAssetsListGetter(void *self, void *methodInfo,
     void *pathObject = *(void **)((char *)self + 0x20);
     char path[768] = {};
     if (pathObject) ReadStrUtf8(pathObject, path, sizeof(path));
-    if (!TraceIdentityTextMatchesTyphoea(path)) {
+    if (!TraceIdentityTextMatchesConfiguredRule(path)) {
       void *nameObject = *(void **)((char *)self + 0x50);
       if (nameObject) ReadStrUtf8(nameObject, path, sizeof(path));
     }
-    if (TraceIdentityTextMatchesTyphoea(path))
+    if (TraceIdentityTextMatchesConfiguredRule(path))
       Log("[V1.1-DESCRIPTOR] event=%s assets=%p identity=%s list=%p count=%d",
           event ? event : "mesh-assets", self, path[0] ? path : "<empty>",
           result, TraceManagedListCount(result));
@@ -8673,8 +8399,8 @@ static void *TraceAssetProxyLoaderHandleGet(void *self, void *methodInfo) {
                                        sizeof(path));
   char objectName[192] = {};
   TraceReadUnityObjectName(result, objectName, sizeof(objectName));
-  if (TraceIdentityTextMatchesTyphoea(path) ||
-      TraceIdentityTextMatchesTyphoea(objectName))
+  if (TraceIdentityTextMatchesConfiguredRule(path) ||
+      TraceIdentityTextMatchesConfiguredRule(objectName))
     Log("[V1.1-LOADER] event=FAssetProxyLoaderHandle.Get handle=%p "
         "path=%s object=%p objectName=%s",
         self, path[0] ? path : "<none>", result,
@@ -8691,7 +8417,7 @@ static void TraceAssetProxyLoaderHandleLoadImmediate(void *self,
   char path[768] = {};
   if (pathGetter) TraceDescribeString(pathGetter(self, nullptr), path,
                                       sizeof(path));
-  if (TraceIdentityTextMatchesTyphoea(path))
+  if (TraceIdentityTextMatchesConfiguredRule(path))
     Log("[V1.1-LOADER] event=FAssetProxyLoaderHandle.LoadImmediate "
         "handle=%p path=%s", self, path);
 }
@@ -8706,7 +8432,7 @@ static void TraceAssetProxyLoaderHandleAddOnProxyCompleted(
   char path[768] = {};
   if (pathGetter) TraceDescribeString(pathGetter(self, nullptr), path,
                                       sizeof(path));
-  if (TraceIdentityTextMatchesTyphoea(path))
+  if (TraceIdentityTextMatchesConfiguredRule(path))
     Log("[V1.1-LOADER] event=FAssetProxyLoaderHandle.AddOnProxyCompleted "
         "handle=%p path=%s callback=%p", self, path, callback);
 }
@@ -9408,8 +9134,8 @@ static void *TraceCachedPathAssetLoaderLoadDirect(void *self, void *path,
   TraceDescribeObject(type, typeText, sizeof(typeText));
   char resultText[512] = {};
   TraceDescribeObject(result, resultText, sizeof(resultText));
-  if (!TraceIdentityTextMatchesTyphoea(pathText) &&
-      !TraceIdentityTextMatchesTyphoea(resultText))
+  if (!TraceIdentityTextMatchesConfiguredRule(pathText) &&
+      !TraceIdentityTextMatchesConfiguredRule(resultText))
     return result;
   Log("[RES-TRACE] CachedPathAssetLoader.LoadDirect(string,type): "
       "loader=%p path=\"%s\" type=%s result=%s", self,
@@ -9431,7 +9157,7 @@ static bool TraceCachedPathAssetLoaderTryLoad(void *self, void *path,
     return result;
   char pathText[768] = {};
   TraceDescribeString(path, pathText, sizeof(pathText));
-  if (!TraceIdentityTextMatchesTyphoea(pathText)) return result;
+  if (!TraceIdentityTextMatchesConfiguredRule(pathText)) return result;
   char typeText[512] = {};
   TraceDescribeObject(type, typeText, sizeof(typeText));
   Log("[RES-TRACE] CachedPathAssetLoader.TryLoad(string,type,out): "
@@ -9471,7 +9197,7 @@ static void *TraceAssetBundleLoadAsset2(void *self, void *path, void *type,
     s_traceReentrant = true;
     char pathText[512] = {};
     TraceDescribeString(path, pathText, sizeof(pathText));
-    if (pathText[0] && strstr(pathText, "typhoea") != nullptr) {
+    if (TraceIdentityTextMatchesConfiguredRule(pathText)) {
       char typeText[512] = {};
       char resultText[512] = {};
       TraceDescribeObject(type, typeText, sizeof(typeText));
@@ -9552,7 +9278,7 @@ static void TraceSkinnedMeshSetSharedMesh(void *self, void *mesh,
   char identityText[768] = {};
   TraceLookupAssetOrigin(mesh, nullptr, identityText,
                          sizeof(identityText));
-  if (!TraceIdentityTextMatchesTyphoea(identityText))
+  if (!TraceIdentityTextMatchesConfiguredRule(identityText))
     TraceReadUnityObjectName(mesh, identityText, sizeof(identityText));
   if (!s_traceReentrant &&
       TraceTakeTargetBudget(&s_traceSharedMeshCount, 180, identityText)) {
@@ -9586,7 +9312,7 @@ static void TraceMeshFilterSetSharedMesh(void *self, void *mesh,
   char identityText[768] = {};
   TraceLookupAssetOrigin(mesh, nullptr, identityText,
                          sizeof(identityText));
-  if (!TraceIdentityTextMatchesTyphoea(identityText))
+  if (!TraceIdentityTextMatchesConfiguredRule(identityText))
     TraceReadUnityObjectName(mesh, identityText, sizeof(identityText));
   if (!s_traceReentrant &&
       TraceTakeTargetBudget(&s_traceMeshFilterCount, 120, identityText)) {

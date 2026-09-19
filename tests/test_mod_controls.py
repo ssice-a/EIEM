@@ -59,7 +59,6 @@ static bool EiemApplyStandaloneRenderRules(
 }
 static void EiemStoreModelPhysicsIntents(
     void *, std::vector<EiemPhysicsIntent>, const char *) {}
-static void EiemDestroyPartnerObjects(uintptr_t) {}
 static void EiemForgetRenderOverrides(uintptr_t) {}
 static int observedModels = 0;
 static void EiemProbeObserveModel(void *, const char *) { ++observedModels; }
@@ -202,28 +201,6 @@ int main(int argc, char **argv) {
     CHECK(EiemPrepareInputUpdate({event}, &next, &affected));
     CHECK(next.states[0].variables.at("$a") == 0);
     CHECK(next.states[0].variables.at("$b") == 1);
-  } else if (scenario == "partner_links_only") {
-    EiemModProgram program;
-    std::istringstream input(
-      "[Constants]\n$a=0\n"
-      "[KeyA]\nkey=F6\ntype=cycle\n$a=0,1\n"
-      "[MeshNew]\npath=meshes/new.mesh\n"
-      "[RenderMain]\nasset=Body\nif $a == 1\npartner.0=RenderPart\nendif\n"
-      "[RenderPart]\nmesh=MeshNew\n");
-    CHECK(EiemModParseStream(input, "a/mod.ini", program, &error));
-    EiemPublishModState(program); s_eiemModGeneration = 9;
-    std::vector<EiemModRule> potential;
-    EiemFindPotentialPartnerRules("a/mod.ini", "RenderMain", &potential);
-    CHECK(potential.size() == 1);
-    CHECK(std::string(potential[0].section) == "RenderPart");
-    EiemModProgram next; std::vector<std::string> affected;
-    bool shapesOnly = false, partnerLinksOnly = false;
-    CHECK(EiemPrepareInputUpdate({{{VK_F6,0},9,"a/mod.ini"}}, &next, &affected,
-                                 &shapesOnly, &partnerLinksOnly));
-    CHECK(!shapesOnly);
-    CHECK(partnerLinksOnly);
-    CHECK(next.rules.size() == program.rules.size());
-    CHECK(next.rules[0].partnerCount == 1);
   } else if (scenario == "submesh_visibility_only") {
     EiemModProgram program;
     std::istringstream input(
@@ -237,15 +214,13 @@ int main(int argc, char **argv) {
     EiemPublishModState(program); s_eiemModGeneration = 10;
     CHECK(program.rules.size() == 1 && program.rules[0].hiddenSubmeshMask == 0);
     EiemModProgram next; std::vector<std::string> affected;
-    bool shapesOnly = false, partnerLinksOnly = false;
+    bool shapesOnly = false;
     bool submeshVisibilityOnly = false;
     std::vector<EiemSubmeshVisibilityChange> visibilityChanges;
     CHECK(EiemPrepareInputUpdate({{{VK_F6,0},10,"a/mod.ini"}}, &next, &affected,
-                                 &shapesOnly, &partnerLinksOnly,
-                                 &submeshVisibilityOnly,
+                                 &shapesOnly, &submeshVisibilityOnly,
                                  &visibilityChanges));
     CHECK(!shapesOnly);
-    CHECK(!partnerLinksOnly);
     CHECK(submeshVisibilityOnly);
     CHECK(next.rules.size() == 1 && next.rules[0].hiddenSubmeshMask == (1u << 2));
     CHECK(affected.size() == 1 && affected[0] == "a/mod.ini");
@@ -310,7 +285,6 @@ class ModControlsTests(unittest.TestCase):
     def test_key_events_only_change_the_selected_mod(self): self.run_case("selected_mod_scope")
     def test_reload_preserves_or_falls_back_selected_mod(self): self.run_case("selection_survives_reload")
     def test_manager_button_targets_one_key_section(self): self.run_case("manager_key_section")
-    def test_partner_visibility_is_a_lightweight_link_update(self): self.run_case("partner_links_only")
     def test_submesh_visibility_is_a_lightweight_mesh_update(self): self.run_case("submesh_visibility_only")
     def test_actual_runtime_registers_default_off_multi_instances(self): self.run_case("default_off_instances")
     def test_empty_program_still_registers_instances_without_diagnostic_probe(self): self.run_case("empty_rules_observed")

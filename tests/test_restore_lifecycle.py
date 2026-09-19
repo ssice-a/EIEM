@@ -67,6 +67,8 @@ static bool EiemSetSharedMesh(void *,void *mesh,const char *,void *) {
 static bool EiemBuildMeshResource(const EiemModRule &,void **out,char *,size_t,void *,std::shared_ptr<const EiemSkinIdentity> *) { *out=&tokens[2]; return true; }
 static bool EiemResolveMeshBones(const EiemSkinIdentity &,void *,void **,char *,size_t) { return true; }
 static bool EiemPreserveSourceSkinning(void *,void *,char *,size_t) { return true; }
+static bool EiemResolveMeshBonesFromNativeInstance(const EiemSkinIdentity &,void *,void **,char *,size_t) { return true; }
+static bool EiemSetRendererEnabled(void *,bool) { return true; }
 struct EiemBounds { float value[6]{}; };
 static void *g_smr_get_localBounds=nullptr;
 static bool EiemReadBounds(void *,void *,EiemBounds *) { return false; }
@@ -100,12 +102,14 @@ static bool EiemManagedObjectArraySame(void *a,void *b) {
 }
 static bool EiemReadRendererEnabled(void *,bool *out) { *out=liveEnabled; return true; }
 static constexpr size_t IL2CPP_ARRAY_DATA=32;
+static volatile LONG64 s_eiemLastSkinCommitTick=0;
 // FUNCTIONS
 static void Apply() {
-  void *renderer=&tokens[0],*mesh=&tokens[1];
+  void *renderer=&tokens[0],*drawRenderer=renderer,*mesh=&tokens[1];
   const char *rendererType="SkinnedMeshRenderer",*source="test",*asset="Body";
   EiemModRule rule{}; rule.hasMesh=true; strcpy_s(rule.mesh,"MeshBody");
   const bool applyMesh=true;
+  const bool resourcesReady=true;
   const bool skeletonReady=true;
   std::shared_ptr<EiemSkeletonInstance> skeleton;
   // WRITE_BLOCK

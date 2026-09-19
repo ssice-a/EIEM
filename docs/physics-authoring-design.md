@@ -1,7 +1,6 @@
-# 物理骨骼与碰撞体：三端设计契约
+﻿# 物理骨骼与碰撞体：三端设计契约
 
 状态：目标设计。当前实现范围以[文档索引](README.md)、[Physics 运行时重构边界](physics-runtime-redesign.md)、[Physics 作者 v1/v3/v4/v5](physics-authoring-v1.md)及[源作者 v2](physics-authoring-v2.md)为准。
-原生研究证据统一放在[原生物理调查归档](archive/native-physics-investigation.md)。
 本文描述完整链路要求，不把设计目标、源码草稿或宿主测试当作游戏能力。
 沿用[资源替换职责](refactor-resource-replacement.md)、[共享骨架绑定](shared-skeleton-binding.md)和[作者状态](author-state-materials.md)。
 
@@ -25,7 +24,6 @@
 ## 2. 实现与证据入口
 
 当前实现状态见[文档索引](README.md)。原生方法、序列化样本、索引空间和生命周期证据
-集中在[原生物理调查归档](archive/native-physics-investigation.md)。新增作者 v1/v3/v4 的实际读写范围见[格式契约](physics-authoring-v1.md)。
 
 ## 3. chain2 / RE 编辑器：参考什么，不参考什么
 
@@ -253,14 +251,13 @@ physics=PhysicsCoat
 本例使用 `asset` 命中；若增加 Render 的 `path`，其含义仍是现行规范中的相对 Transform 路径，
 不能填解包资源逻辑路径。Physics 扩展不得重新定义现有路径字段。
 
-- `mesh` 仍修改命中 Renderer 的 Mesh；`partner` 仍是显式新建 Renderer；`handling=skip` 仍只控制原绘制。
+- `mesh` 修改命中 Renderer 的 Mesh；`handling=skip` 只控制原绘制。`partner.N` 已停止支持，拆分部件由合并 Mesh 的 submesh 表达。
 - `skeleton`、`physics` 是该 Render 对当前模型实例的资源依赖，不表示创建独立 Animator 或每个 Renderer 创建一套模拟。
 - 只调整原物理尺寸时可仅写命中条件和 `physics`；未声明的 Mesh/材质保持原状。
 - 只使用已有骨架且不改物理时，不需要增加这两个引用。
 - 同一实例的多个 Render/LOD 引用同一 Physics，按资源身份取得同一个物理实例；不同模型实例各建一份。
-- Blender 将同一源 Mesh 下、同一 Rig 的拆分部件输出为一个源 Render 的共享 `skeleton=`/`physics=`，
-  Partner 模板不重复声明所有权；依赖不一致时不提升到源 Render、不猜测合并，仍保留显式部件字段，
-  这属于高级且待运行时验证的用法。
+- Blender 将同一源 Mesh 下、同一 Rig 的拆分部件输出为一个源 Render 的共享 `skeleton=`/`physics=`；
+  依赖不一致时拒绝导出，不在 DLL 内猜测或创建额外 Renderer。
 - 隐藏一片 Mesh 不自动关闭仍驱动其他 Mesh 的共享物理。真正关闭某物理组必须有单独的物理组状态。
 - 即使最后一片引用 Mesh 暂时隐藏，也不是删除新增骨骼的指令；恢复显示复用该实例的骨架与物理状态。
   Mod 卸载或物理拓扑更新则按原生注销完成边界释放自己创建的节点，不让骨骼永久泄漏。
@@ -276,8 +273,8 @@ physics=PhysicsCoat
 - `physics=` 与 `mesh=` 一样由 `[Render...]` 的 `asset`、相对 `path` 和可选 Mesh 形状条件命中，
   并服从现有规则顺序和首个命中优先级。条件、Key 和 Lua UI 重新求值后仍走现有完整 reconcile；
   Physics 引用发生变化不会误走仅更新 shape weight 的快速路径。
-- `Prefab.render.N` 只记录 PFB 与 Render 的资源关系，不限制 Render 的消费者范围。PFB 引用的源 Render
-  仍参与全局 Mesh 身份匹配；只有 `partner.N` 指向的额外 Renderer 模板不作为源 Mesh 规则。
+- `Prefab.render.N` 只记录 PFB 与 Render 的资源关系，不限制 Render 的消费者范围。所有带 `asset` 或
+  相对 `path` 选择器的 Render 都参与 Mesh 身份匹配。
 - 只有在已注册模型根下遍历 Renderer 时，命中的 Physics 才会进入模型计划。单个 Renderer 的
   `sharedMesh` setter Hook 没有可靠模型根，因此只继续处理现有 Mesh 行为，不创建、删除或规划物理。
   NPC 的最终 `SetSMRRootBone` Renderer 数组同样只补齐 Mesh/材质/skip 等 Render 行为；在 NPC 模型根
@@ -357,7 +354,6 @@ v67 已把上述计划层接到按模型实例持有的原生适配器，实机�
 2026-09-07 本机指令复查：初始化受全局模式影响，可能在 Awake 或 Start 中发生，Start 还会触发 AutoBuild。
 新组件工厂必须解决“配置前禁止自动构建”，不能在 AddComponent 返回后才假定初始化尚未发生。
 BuildAndRun 的通知可同步早于返回；异步取消分支还可能完全不通知，详见
-[初始化与完成证据](archive/native-physics-investigation.md#9-2026-09-07-追加初始化完成和延迟释放)。
 
 原组件参数修改必须作用于该实例拥有的数据；若配置被多个实例共享，先建立实例配置副本。
 新建组件只复制已理解的序列化参数，并重绑引用；**不得 memcpy 一个运行中的组件或连带克隆人物整棵 GameObject**。
@@ -404,7 +400,6 @@ LOD、屏外剔除、传送/换图恢复遵循原生重置与时间步策略，�
 先取得真实原生组件的构建、取消与销毁记录，并确认 Task/Job/动画写回的退出边界；
 再用不依赖 Blender 的 DLL 最小新增链实验验证 Animator 接纳、模拟位姿、网格驱动和安全注销。
 v67～v71 已按这一顺序完成 v1 无碰撞体范围，并接通对应 `Render.physics` 与作者端组合导出；原生 v2 与碰撞体
-仍须分别满足同样的证据要求，依据见[原生调查归档](archive/native-physics-investigation.md)。
 普通函数返回、跟踪计数归零和日志无丢失，单独或组合都不是任务退出凭证。
 这些前置条件限制依赖原生构建、绑定与对象释放结论的操作；不阻塞离线格式、Blender 编辑工具、
 资源读取、编译、静态分析和宿主测试。缺少证据时记录具体的“尚未验证”项，不将整个项目停工。

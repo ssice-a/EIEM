@@ -3,7 +3,8 @@
 Current authoring/runtime scope: [documentation index](../docs/README.md).
 
 EIEM pins [ssice-a/AnimeStudio](https://github.com/ssice-a/AnimeStudio) as a
-submodule with a direct Endfield VFS data source. Initialize it after cloning:
+submodule for integration tests. Day-to-day AnimeStudio development and publishing use
+the sibling checkout `E:\vscode\AnimeStudio`. Initialize the pinned copy after cloning:
 
 ```powershell
 git submodule update --init tools/AnimeStudio
@@ -15,7 +16,7 @@ AssetMap.
 ## Run
 
 ```text
-tools\AnimeStudio\dist\win-x64-vfs-next\AnimeStudio.GUI.exe
+E:\vscode\AnimeStudio\dist\win-x64-vfs-next\AnimeStudio.GUI.exe
 ```
 
 Choose `File -> Open Endfield VFS...`, then select:
@@ -95,18 +96,19 @@ colliders** is enabled.
 
 ## Build
 
-The independently maintained source is pinned under `tools\AnimeStudio`. The local release targets
-.NET 9 and is self-contained:
+The independently maintained source is pinned under `tools\AnimeStudio`; build the sibling
+checkout so generated files never dirty EIEM's integration pin. The local release targets .NET 9
+and is self-contained:
 
 ```powershell
-dotnet restore .\tools\AnimeStudio\AnimeStudio\AnimeStudio.csproj `
+dotnet restore E:\vscode\AnimeStudio\AnimeStudio\AnimeStudio.csproj `
   -p:TargetFrameworks=net9.0
-dotnet build .\tools\AnimeStudio\AnimeStudio\AnimeStudio.csproj `
+dotnet build E:\vscode\AnimeStudio\AnimeStudio\AnimeStudio.csproj `
   -c Release -p:TargetFramework=net9.0 -p:TargetFrameworks=net9.0 --no-restore
-dotnet restore .\tools\AnimeStudio\AnimeStudio.GUI\AnimeStudio.GUI.csproj `
+dotnet restore E:\vscode\AnimeStudio\AnimeStudio.GUI\AnimeStudio.GUI.csproj `
   -p:TargetFrameworks=net9.0-windows
-dotnet publish .\tools\AnimeStudio\AnimeStudio.GUI\AnimeStudio.GUI.csproj `
+dotnet publish E:\vscode\AnimeStudio\AnimeStudio.GUI\AnimeStudio.GUI.csproj `
   -c Release -f net9.0-windows -r win-x64 --self-contained true `
   --no-restore -p:TargetFrameworks=net9.0-windows `
-  -o .\tools\AnimeStudio\dist\win-x64-vfs-next
+  -o E:\vscode\AnimeStudio\dist\win-x64-vfs-next
 ```

@@ -1,17 +1,16 @@
-# 形态键与 ImGui 控制
+﻿# 形态键与 ImGui 控制
 
 状态：v36 建立作者入口、导出、INI 求值和 Renderer 权重接口；v38 的 UI 完全由用户 Lua 组织。
-现行窗口与脚本约定见 [Lua UI](lua-ui.md)。历史测试/部署已移至档案，当前验证状态见[文档索引](README.md)。
+现行窗口与脚本约定见 [Lua UI](lua-ui.md)，当前验证状态见[文档索引](README.md)。
 形态键进入 EIEMESH 不代表终末地自定义 GPU 管线已参与变形；API 写入/回读与游戏画面验收分开记录。
 游戏画面尚未验收。
 
-动作期间意外变形的证据与修正记录见 [形态键权重诊断](archive/shape-weight-diagnosis.md)。
 v45 实机已确认游戏 Apply 路径向新增通道按索引赋值；v46 改为按源通道归属转发，游戏画面验收另行记录。
 
 ## 职责
 
 - Mesh 资源包含形态键的名称、帧、顶点/法线/切线增量；不包含运行时实例权重。
-- Render 的 `shape.名称=数值或变量` 控制命中实例或 partner 的形态键。名称区分大小写。
+- Render 的 `shape.名称=数值或变量` 控制命中现有 Renderer 的形态键。名称区分大小写。
 - 可选 `shape_speed.名称=正数` 将赋值解释为目标值，并按 Blender 数值/秒平滑推进；省略时保持立即赋值。
 - UI `[UI...]` 只指定 Lua 文件；按键是普通 Key，窗口开关与布局由 Lua 决定，不持有 Unity 对象，不独立实现资源替换。
 - 快捷键与滑条进入同一有序输入队列。F10 重载会丢弃旧代事件，恢复旧效果；普通变量重置默认值，persist 变量保留玩家值。
@@ -67,7 +66,7 @@ v45 已确认游戏 Apply 路径以原生数字索引写入新增通道。本次
 - 显式控制原生通道期间，继续记录游戏最新要求值；撤销控制恢复此值，而非首次控制时的旧快照。
 - 新绑定初始化目标权重一次；新增通道初始化为 0，原生通道使用源权重，随后应用显式规则。
   不每帧清零、不禁用整个控制器、不按角色或形态键名称特判。
-- 绑定由现有 Renderer/partner 状态拥有，Hook 仅持弱索引，验证对象生命周期和当前 Mesh。
+- 绑定由现有 Renderer override 状态拥有，Hook 仅持弱索引，验证对象生命周期和当前 Mesh。
   F10、换图和失败恢复沿用现有状态清理；游戏 Hook 不回头获取替换状态锁，
   查表锁和通道锁在转发原生调用之前释放，内部装配仍使用现有状态锁。
 - 同一 Renderer 被游戏重新赋予另一个源 Mesh 时，重新读取源名称/权重并退役旧通道绑定；
@@ -97,7 +96,7 @@ SMR 替换 Mesh 时无论是否带形态键控制，均先保存源通道信息�
 保存及恢复默认值的完整约定见 [作者状态与材质导入](author-state-materials.md)。
 保存 .blend 保留作者数据；导出选中 Mesh 时生成 Constants 和 Render 的 shape 绑定；
 勾选“生成简单 UI”才额外生成 UI、ui.lua，具体交互属于可编辑的 Lua 模板。
-同源拆分自动生成 partner 时，绑定属于使用该 Mesh 的 partner，而非被 skip 的源 Render。
+同源拆分部件由导出器合并为一个 Mesh 的多个 submesh，形态键绑定仍属于命中的现有 Renderer。
 共享 Mesh 数据只导出一份资源/滑条；不同 Mesh 的同名形态键分别控制。
 V1 不伪装支持绝对形态键、非 Basis 相对键或顶点组遮罩：遇到这些明确拒绝导出，避免静默变形错误。
 新形态键顶点增量必须与 Basis 使用相同顶点数/顺序；不删除零权重骨骼组。
@@ -114,4 +113,3 @@ V1 不伪装支持绝对形态键、非 Basis 相对键或顶点组遮罩：遇�
 `tests/test_shape_controls.py`、`test_shape_runtime.py`、`test_shape_ownership.py` 与
 `test_blender_shapes.py` 覆盖资源、权重、游戏通道归属和 Blender 作者流程。
 游戏 GPU 形变、动作期间权重、F10 和多实例画面仍需独立验收。
-历史测试和部署结果见[版本记录](archive/release-records.md)。v44～v46 根因证据见[诊断档案](archive/shape-weight-diagnosis.md)。

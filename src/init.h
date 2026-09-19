@@ -965,25 +965,6 @@ static DWORD WINAPI InitThread(LPVOID) {
         g_renderer_get_isVisible, g_renderer_get_forceRenderingOff);
   }
 
-  // LOD membership is optional: older Unity builds or stripped metadata may
-  // not expose LODGroup. Partner Renderers still work without this block.
-  g_lodGroupClass = FindClass("UnityEngine", "LODGroup", asms, ac);
-  if (g_lodGroupClass) {
-    // This Endfield build exposes GetLODs(bool getPlatformLODs), rather than
-    // Unity's usual public zero-argument wrapper. The v75 zero-argument lookup
-    // therefore left every partner outside the source Renderer LOD levels.
-    g_lodGroup_get_lods = FindMethod(g_lodGroupClass, "GetLODs", 1);
-    g_lodGroup_set_lods = FindMethod(g_lodGroupClass, "SetLODs", 1);
-    Log("[MOD] LODGroup get/set lods: %p / %p", g_lodGroup_get_lods,
-        g_lodGroup_set_lods);
-    if (g_lodGroup_set_lods &&
-        Hook(g_lodGroup_set_lods, "LODGroup.SetLODs observation",
-             (void *)TraceLodGroupSetLODs, &s_origLodGroupSetLODs))
-      Log("[MOD-LOD] LODGroup.SetLODs observation hook installed");
-  } else {
-    Log("[MOD] LODGroup class not found; partner LOD membership disabled");
-  }
-
   g_materialClass = FindClass("UnityEngine", "Material", asms, ac);
   if (g_materialClass) {
     g_material_get_shader = FindMethodInHierarchy(g_materialClass, "get_shader", 0);

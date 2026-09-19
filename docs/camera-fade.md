@@ -4,7 +4,6 @@
 
 只改变相机渐隐，不做 UI 绘制、景深处理或模型资源替换。
 旧 Renderer setter hook 在真实日志中未命中，已删除；失败证据保存在
-[v34 失败结论](archive/release-records.md)。
 
 运行时从 IL2CPP 元数据查找 `Beyond.Gameplay.View.CameraMono` 的两个零参数实例方法：
 `_ProcessDitherByPitch()` 与 `ForceClearDither()`。不硬编码地址、偏移或角色名字。
@@ -83,5 +82,3 @@ F10 不重装 hook，也不在按键线程直接调用游戏相机方法；它�
 
 游戏画面需要核验拉近镜头、开关往返、换地图、角色 UI，并与日志一起判断。
 编译及模拟 MinHook 测试不能替代该验收。历史自动验证与部署结果见版本记录。
-
-历史测试和部署结果见[版本记录](archive/release-records.md)。

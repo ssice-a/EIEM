@@ -1,6 +1,5 @@
-# EIEM 文档索引与当前状态
+﻿# EIEM 文档索引与当前状态
 
-核对日期：2026-09-19。本文只记录 v1.0.0 当前能力及明确的实机验收边界。版本试验、探针部署和旧问题诊断统一保存在[历史档案](archive/README.md)。
 
 ## 当前状态
 
@@ -28,7 +27,6 @@
 | 仓库边界 | [三仓库架构](repository-architecture.md) | DLL、Blender、AnimeStudio 的所有权、协议和发布关系 |
 | 重构基线 | [资源替换重构](refactor-resource-replacement.md) | 目标架构、验证顺序、禁止事项和当前进度 |
 | 原生装配链 | [模型创建链路](model-assembly-chain.md) | 世界、UI、NPC 的装配边界与蒙皮条件 |
-| 合并边界 | [合并的边界](merged-part-renderer-boundaries.md) | 合并 Mesh、submesh、UV、材质槽和 LOD 约束 |
 | Blender LOD 导出 | [LOD 导出](blender-lod-export.md) | 从已导入资源发现 LOD；按勾选复制模板；每级独立 Render/合并，共享切换状态 |
 | 输入与配置 | [条件与按键](conditional-keys.md) | INI、表达式、状态与更新顺序 |
 | Blender 网格工具 | [切换作者流程](blender-switches.md) | 选择、显隐、状态和导出 |
@@ -48,6 +46,5 @@
 
 1. “已实现”“构建通过”“已部署”“游戏内验收”是四种不同状态，文档必须明确区分。
 2. 现行文档描述契约和当前能力，不追加每次 DLL 哈希、启动日志或失败尝试。
-3. 有复用价值的探针结果、根因和部署记录移入[历史档案](archive/README.md)，不能再作为当前行为的直接依据。
-4. 身份、装配和高频资源探针默认关闭，只在有明确问题和退出条件的验证阶段临时启用。
-5. 静态替换、按键、F10、Skeleton 和 Physics 分阶段验收；一个阶段通过不能替代另一阶段的实机结果。
+3. 身份、装配和高频资源探针默认关闭，只在有明确问题和退出条件的验证阶段临时启用。
+4. 静态替换、按键、F10、Skeleton 和 Physics 分阶段验收；一个阶段通过不能替代另一阶段的实机结果。

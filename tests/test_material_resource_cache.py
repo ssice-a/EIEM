@@ -53,6 +53,10 @@ static void *s_eiemMaterialSetInt = &methodIds[12], *s_eiemMaterialSetColor = &m
 static void *s_eiemMaterialSetTextureScale = &methodIds[14], *s_eiemMaterialSetTextureOffset = &methodIds[15];
 static void *s_eiemMaterialSetTexture = &methodIds[16], *s_eiemMaterialGetTexture = &methodIds[17];
 static void *s_eiemVector2Class = &methodIds[18];
+static void *g_material_get_shader = nullptr;
+static void *g_eiemShaderGetPropertyCount = nullptr;
+static void *g_eiemShaderGetPropertyName = nullptr;
+static void *g_eiemShaderGetPropertyType = nullptr;
 static Object sourceMaterial;
 static int meshAllocations = 0, textureBuilds = 0, materialBuilds = 0;
 static bool invalidNewTexture = false;
@@ -73,6 +77,9 @@ static void *il2cpp_array_new(void *, size_t size) {
 static void *il2cpp_string_new(const char *text) {
     buffers.emplace_back(new char[std::strlen(text) + 1]);
     std::strcpy(buffers.back().get(), text); return buffers.back().get();
+}
+static void ReadStrUtf8(void *, char *out, size_t size) {
+    if (out && size) out[0] = 0;
 }
 static void *Invoke(void *method, void *self, void **params = nullptr) {
     if (heldLocks || !unityThread) std::abort();
@@ -188,7 +195,8 @@ class MaterialResourceCache(unittest.TestCase):
         source.write_text(fixture_source(), encoding="utf-8")
         cls.executable = cls.folder / "material_cache.exe"
         build = subprocess.run(["cl", "/nologo", "/EHsc", "/std:c++17", f"/I{ROOT / 'src'}", str(source), f"/Fe{cls.executable}"],
-                               cwd=cls.folder, capture_output=True, text=True)
+                               cwd=cls.folder, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace")
         if build.returncode:
             raise AssertionError(build.stdout + build.stderr)
 
@@ -197,7 +205,9 @@ class MaterialResourceCache(unittest.TestCase):
                          "unknown_material", "unknown_texture", "same_stamp_new_texture",
                          "wrong_thread", "invalid_new_texture"):
             with self.subTest(scenario=scenario):
-                result = subprocess.run([str(self.executable), scenario], cwd=self.folder, capture_output=True, text=True)
+                result = subprocess.run([str(self.executable), scenario], cwd=self.folder,
+                                        capture_output=True, text=True,
+                                        encoding="utf-8", errors="replace")
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 

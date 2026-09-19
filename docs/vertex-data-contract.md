@@ -1,10 +1,10 @@
-# 顶点数据契约
+﻿# 顶点数据契约
 
 更新：2026-09-07。本文规定当前数据行为，历史实验另行归档。
 
 **当前实现（Blender 0.11.1）：原生切线能用就用；新增/外部几何没有可用切线时，导出时生成。**
 同一个网格中也按数据区分：保留有效源值，仅为缺失部分生成。旧解码调查、当时的待办和回归数量
-均在历史档案，不描述当前导出器状态。本文不配置 IDE/宿主的审查或提示行为。
+已删除的历史试验不描述当前导出器状态。本文不配置 IDE/宿主的审查或提示行为。
 
 当前解包源码 [AnimeStudio/Classes/Mesh.cs](https://github.com/ssice-a/AnimeStudio/blob/master/AnimeStudio/Classes/Mesh.cs) 的压缩 NORMAL 分支调用
 `DecompressEndfieldFrame`，同时填充 `m_Normals` 和 `m_Tangents`；Blender 导入将切线向量和符号
@@ -59,4 +59,3 @@
 ## 历史记录
 
 解码修复前调查、2026-09-05 的原生解码回归、2026-09-06 的接缝/骨架实验，
-已移至[顶点数据历史实验记录](archive/vertex-data-history.md)。现行行为以本文上面的实现及测试为准。

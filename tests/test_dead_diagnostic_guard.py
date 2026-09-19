@@ -53,20 +53,21 @@ class DeadDiagnosticGuardTests(unittest.TestCase):
             f'{len(combined)} guards are already dead against the constant '
             f'stub; stop adding new ones instead of growing this set')
 
-    def test_skin_probe_guards_do_not_route_through_the_stub(self):
-        # The specific regression: the probe must stay on a real counter.
-        for needed in ('s_traceSkinProbeCount', '[SKIN-PROBE] phase=create',
-                       '[SKIN-PROBE] phase=setBones'):
-            self.assertIn(needed, TRACE)
-        for match in re.finditer(r'if \(([^)]*)\) \{\s*\n\s*const EiemSkinProbe::Result',
-                                 TRACE):
-            self.assertNotIn('TraceTakeBudget', match.group(1),
-                             'a skin-probe block is guarded by the constant stub')
-        self.assertIn('InterlockedIncrement(&s_traceSkinProbeCount)', TRACE)
+    def test_hot_skin_setter_does_not_run_legacy_pose_measurement(self):
+        start = TRACE.rindex('static void TraceSkinnedMeshSetBones(')
+        end = TRACE.index('static void *EiemFindSourceLodGroup', start)
+        body = TRACE[start:end]
+        self.assertNotIn('EiemSkinProbe::Measure', body)
+        self.assertNotIn('EiemSnapshotPartnerBones', body)
+        self.assertNotIn('EiemArmSkinProbeSweep', body)
 
-    def test_counter_declaration_is_volatile(self):
-        # A non-volatile counter could be hoisted or cached across the hook.
-        self.assertRegex(TRACE, r'volatile LONG s_traceSkinProbeCount')
+    def test_current_assembly_boundaries_do_not_recreate_partner_renderers(self):
+        for name in ('TraceAssignSkinGo', 'TraceAssignSkinPost',
+                     'TraceSetSmrRootBone'):
+            start = TRACE.rindex(f'static void {name}')
+            body = TRACE[start:start + 2400]
+            self.assertNotIn('EiemApplyPartners', body)
+            self.assertNotIn('EiemRegisterPartnersInSkinArrays', body)
 
 
 if __name__ == '__main__':

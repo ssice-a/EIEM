@@ -32,35 +32,6 @@ class RuntimeHookContracts(unittest.TestCase):
         self.assertNotIn("TraceApplyLoadedModelRenderers", self.trace)
         self.assertNotIn("EiemResolveRenderRuleForAsset", self.trace)
 
-    def test_partner_renderers_use_inherited_bounds_and_real_lod_methods(self):
-        self.assertIn(
-            'FindMethodInHierarchy(g_skinnedMeshRendererClass, "get_localBounds", 0)',
-            self.init,
-        )
-        self.assertIn(
-            'FindMethodInHierarchy(g_skinnedMeshRendererClass, "set_localBounds", 1)',
-            self.init,
-        )
-        self.assertIn('FindMethod(g_lodGroupClass, "GetLODs", 1)', self.init)
-        self.assertIn('FindMethod(g_lodGroupClass, "SetLODs", 1)', self.init)
-        self.assertNotIn('FindMethod(g_lodGroupClass, "get_lods"', self.init)
-        self.assertIn('"LODGroup.SetLODs observation"', self.init)
-        self.assertIn("TraceLodGroupSetLODs", self.trace)
-        self.assertIn("EiemTraceLodGroupMembers", self.trace)
-        self.assertIn("event=lod-group-member", self.trace)
-        self.assertIn("EiemReconcilePartnerLodGroup", self.trace)
-        self.assertIn("bool getPlatformLODs = false", self.trace)
-        self.assertIn("EiemCopySkinnedRendererState(sourceMeshOwner, partnerMeshOwner)", self.trace)
-        for property_name in (
-            "skinningRoot",
-            "quality",
-            "updateWhenOffscreen",
-            "forceMatrixRecalculationPerRender",
-            "skinnedMotionVectors",
-        ):
-            self.assertIn(f'"get_{property_name}"', self.init)
-            self.assertIn(f'"set_{property_name}"', self.init)
-
     def test_model_scan_replaces_inactive_authored_lod_siblings(self):
         start = self.trace.index("static bool EiemApplyRenderRuleSetToRenderer")
         end = self.trace.index("static bool EiemApplyRenderRuleSet(", start)
@@ -72,7 +43,13 @@ class RuntimeHookContracts(unittest.TestCase):
         scan_end = self.trace.index("static bool EiemApplyStandaloneRenderRules(", scan_start)
         scan = self.trace[scan_start:scan_end]
         self.assertIn("bool includeInactive = true", scan)
-        self.assertIn("allowPartnerCreation, true", scan)
+        self.assertIn(
+            "snapshotType(g_skinnedMeshRendererClass, &skinnedRenderers)", scan
+        )
+        self.assertIn("snapshotType(g_meshFilterClass, &meshFilters)", scan)
+        self.assertIn('visitType(skinnedRenderers, "SkinnedMeshRenderer")', scan)
+        self.assertIn('visitType(meshFilters, "MeshFilter")', scan)
+        self.assertNotIn("allowPartnerCreation", scan)
         self.assertIn('"inactive-authored-lod"', self.trace)
         self.assertIn('"force-off-authored-lod"', self.trace)
         self.assertIn('"disabled-authored-lod"', self.trace)
@@ -99,7 +76,6 @@ class RuntimeHookContracts(unittest.TestCase):
     def test_prefab_lifecycle_releases_instance_state(self):
         for method in ("Unload", "Clear", "Dispose"):
             self.assertIn("TracePrefabInstantiate" + method, self.trace)
-        self.assertIn("EiemDestroyPartnerObjects(modelOwner)", self.trace)
         self.assertIn("EiemForgetRenderOverrides(modelOwner)", self.trace)
 
     def test_ui_async_leaves_managed_callback_and_completion_to_game(self):
@@ -190,26 +166,6 @@ class RuntimeHookContracts(unittest.TestCase):
             self.trace,
         )
 
-    def test_base_model_completion_observes_partner_skin_cache_membership(self):
-        for field in (
-            "m_renderers",
-            "m_renderersInitState",
-            "m_meshes",
-            "m_meshesInitState",
-            "m_lodGroups",
-        ):
-            self.assertIn(field, self.trace)
-        self.assertIn("[BASEMODEL-SKIN-v108]", self.trace)
-        self.assertIn("PostDealLoadedModel-after", self.trace)
-        self.assertIn("EiemTraceBaseModelPartnerArrays", self.trace)
-
-        finish = self.trace[
-            self.trace.rindex("static void TraceBasePartFinish") :
-        ][:1800]
-        self.assertIn("OnLoadFinish-before-register", finish)
-        self.assertIn("OnLoadFinish-after-register", finish)
-        self.assertNotIn("il2cpp_array_new", finish)
-
     def test_character_ui_owner_can_apply_mesh_rules_without_prefab_identity(self):
         self.assertIn("EiemModelOwnerKind::CharUIModel", self.trace)
         self.assertIn("TraceCharUIModelOnAwake", self.trace)
@@ -274,7 +230,10 @@ class RuntimeHookContracts(unittest.TestCase):
 
     def test_npc_final_bone_boundary_remains_observation_only(self):
         start = self.trace.rindex("static void TraceSetSmrRootBone")
-        body = self.trace[start : start + 900]
+        end = self.trace.index(
+            "static size_t EiemApplyStandaloneRenderRulesToSkinArray", start
+        )
+        body = self.trace[start:end]
         self.assertIn(
             "original(animator, renderers, rootBoneInfos, methodInfo)", body
         )
@@ -303,7 +262,7 @@ class RuntimeHookContracts(unittest.TestCase):
         self.assertIn("TraceRendererInfoTryReplaceSharedMaterials", self.trace)
         self.assertIn("EiemFindBoundRenderRule", self.trace)
 
-    def test_renderer_info_init_defers_inside_entity_helper_and_does_not_create_partners(self):
+    def test_renderer_info_init_reapplies_materials_after_game_commit(self):
         start = self.trace.index("static void TraceMaterialInfoInit")
         end = self.trace.index("static bool TraceRendererInfoTrySetSharedMaterial", start)
         body = self.trace[start:end]
@@ -316,11 +275,11 @@ class RuntimeHookContracts(unittest.TestCase):
             body.index("EiemApplyStandaloneRenderRulesToRenderer"),
         )
         self.assertIn('"RendererInfo._Init"', body)
-        self.assertIn('"RendererInfo._Init", false', body)
+        self.assertNotIn("allowPartnerCreation", body)
         self.assertIn("EiemReapplyRendererMaterialsAfterCommit", body)
         self.assertNotIn("EiemApplyPrefabRules", body)
 
-    def test_partner_creation_runs_at_enclosing_model_assembly_boundaries(self):
+    def test_resources_apply_at_enclosing_model_assembly_boundaries(self):
         base_start = self.trace.rindex("static void TraceBasePartPostDeal")
         base_end = self.trace.index("static void TraceComplexPartPostDeal", base_start)
         base = self.trace[base_start:base_end]
@@ -344,7 +303,7 @@ class RuntimeHookContracts(unittest.TestCase):
                 body.index("EiemApplyStandaloneRenderRulesToSkinArray"),
             )
 
-    def test_per_renderer_mesh_setters_defer_partner_creation(self):
+    def test_per_renderer_mesh_setters_defer_resource_replay(self):
         for name in ("TraceSkinnedMeshSetSharedMesh", "TraceMeshFilterSetSharedMesh"):
             start = self.trace.rindex(f"static void {name}")
             body = self.trace[start : start + 1800]
@@ -362,6 +321,8 @@ class RuntimeHookContracts(unittest.TestCase):
     def test_configured_target_diagnostics_are_not_character_hardcoded(self):
         self.assertNotIn('strstr(pathText, "wulfa")', self.trace)
         self.assertNotIn('_strnicmp(assetName, "S_actor_wulfa"', self.trace)
+        self.assertNotIn("typhoea", self.trace.lower())
+        self.assertIn("TraceIdentityTextMatchesConfiguredRule", self.trace)
 
     def test_asset_completion_is_observation_only(self):
         start = self.trace.index("static void TraceAssetFinishWithAsset")
@@ -464,7 +425,8 @@ class RuntimeHookContracts(unittest.TestCase):
             "static bool EiemApplyStandaloneRenderRules(", model_start)
         model_pass = self.trace[model_start:model_end]
         snapshot = model_pass.index("liveSkinSources.push_back")
-        mutation = model_pass.index("visitType(g_skinnedMeshRendererClass")
+        mutation = model_pass.index(
+            'visitType(skinnedRenderers, "SkinnedMeshRenderer")')
         self.assertLess(snapshot, mutation)
         self.assertIn("originalBonesHandle", model_pass)
         self.assertIn("s_eiemLiveSkinSources = previousLiveSkinSources", model_pass)
@@ -487,7 +449,7 @@ class RuntimeHookContracts(unittest.TestCase):
         end = self.mods.index("static bool EiemValidShapeExpression", start)
         body = self.mods[start:end]
         self.assertNotIn("for (const auto &prefab", body)
-        self.assertIn('statement.key.compare(0, 8, "partner.")', body)
+        self.assertNotIn('statement.key.compare(0, 8, "partner.")', body)
         self.assertIn("program.standaloneRules.push_back(i)", body)
         self.assertNotIn("EiemApplyPrefabRules", self.trace)
 

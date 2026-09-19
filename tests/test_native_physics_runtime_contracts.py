@@ -164,36 +164,6 @@ class NativePhysicsRuntimeContracts(unittest.TestCase):
         self.assertIn("instance=%p skeleton=%p anchor=%p", self.runtime)
         self.assertIn("firstSelectedPath=%s", self.runtime)
 
-    def test_registration_probe_checks_partner_membership_in_game_arrays(self):
-        self.assertIn("EiemRegistrationTracePartnerEntry", self.registration)
-        self.assertIn("EiemRegistrationTraceArrayMembers", self.registration)
-        self.assertIn("EiemRegistrationTraceParallelArrays", self.registration)
-        self.assertIn("EiemTraceKnownPartnerParallelArrays", self.trace)
-        self.assertIn("EiemRegisterPartnersInSkinArrays", self.trace)
-        self.assertIn("EiemCopyExpandedRendererPointers", self.trace)
-        self.assertIn("rootBoneElementSize", self.trace)
-        self.assertIn('"AssignSkinPre"', self.trace)
-        self.assertIn('"CreateSMSInfoForPostModelPost"', self.trace)
-        self.assertIn("partnerHits=%zu/%zu", self.registration)
-        self.assertIn("firstVisibleMissing=%s", self.registration)
-        for boundary in (
-            '"AssignSkinPost"',
-            '"SetSMRRootBone"',
-            '"CreateSMSGO"',
-            '"CreateSMSInfoForPostModel"',
-        ):
-            self.assertIn(
-                f'EiemTraceKnownPartnerArrayMembers(\n      {boundary}',
-                self.trace,
-            )
-
-    def test_partner_commit_probe_distinguishes_public_assignment_from_game_registration(self):
-        self.assertIn("skinArrayObserved", self.trace)
-        self.assertIn("[PARTNER-COMMIT-v102]", self.trace)
-        self.assertIn('strcmp(boundary, "partner-created")', self.trace)
-        self.assertIn('strstr(boundary, "refresh")', self.trace)
-        self.assertIn("gameArray=%d", self.trace)
-
     def test_runtime_observes_visible_palette_and_move_node_writeback(self):
         self.assertIn("EiemPhysicsRuntimeLogPartnerBinding", self.runtime)
         self.assertIn("visible-binding generation=", self.runtime)

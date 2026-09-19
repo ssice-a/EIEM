@@ -47,6 +47,9 @@ struct EiemModRule {
   // buffer in the generated Mesh variant. The Renderer and its skinning stay
   // unchanged, so visibility changes do not create or destroy Unity objects.
   uint32_t hiddenSubmeshMask = 0;
+  // Retained temporarily as an ABI-local placeholder while the quarantined
+  // legacy implementation is physically removed. The parser no longer
+  // accepts partner.N and production execution never reads these fields.
   char partners[16][96] = {};
   uint32_t partnerCount = 0;
   char shapeNames[64][192] = {};
@@ -282,12 +285,6 @@ static bool EiemSetRenderField(EiemModRule &rule, const std::string &key,
     rule.materialSlots[slot] = index;
     return true;
   }
-  if (key.compare(0, 8, "partner.") == 0) {
-    if (!EiemModInteger(key.substr(8), &index, 0, _countof(rule.partners) - 1) ||
-        !copy(rule.partners[index])) return fail();
-    rule.partnerCount = (std::max)(rule.partnerCount, (uint32_t)index + 1);
-    return true;
-  }
   if (key.compare(0, 8, "submesh.") == 0) {
     int32_t slot = -1;
     if (!EiemModInteger(key.substr(8), &index, 0, _countof(rule.submeshSlots) - 1) ||
@@ -352,21 +349,11 @@ static std::string EiemModIdentifier(const char *file, const char *section) {
 
 static void EiemCompileModProgram(EiemModProgram &program) {
   program.standaloneRules.clear();
-  std::unordered_set<std::string> partnerTemplates;
-  // A Prefab reference records related resources and an instance origin. It
-  // never scopes a Render: every source Render still matches every consumer
-  // of the selected Mesh. Only partner declarations are templates rather than
-  // source-Mesh actions. Inspect all branches so an inactive partner cannot be
-  // promoted when its condition becomes false.
-  for (const auto &definition : program.definitions)
-    EiemVisitStatements(definition.statements, [&](const EiemModStatement &statement) {
-      if (statement.key.compare(0, 8, "partner.") == 0 && !statement.value.empty())
-        partnerTemplates.insert(EiemModIdentifier(definition.selector.modPath, statement.value.c_str()));
-    });
+  // Prefab declarations group resources but do not scope Render selectors.
+  // Every Render that identifies a source Mesh is compiled as a direct action.
   for (size_t i = 0; i < program.definitions.size(); ++i) {
     const auto &rule = program.definitions[i].selector;
-    if ((rule.path[0] || rule.asset[0]) &&
-        !partnerTemplates.count(EiemModIdentifier(rule.modPath, rule.section)))
+    if (rule.path[0] || rule.asset[0])
       program.standaloneRules.push_back(i);
   }
   EiemEvaluateModProgram(program);
@@ -432,7 +419,6 @@ static bool EiemValidateModDocument(EiemModProgram &doc, std::string &error) {
   for (const auto &r : doc.resources) resources[EiemModIdentifier("", r.section)] = r.kind;
   for (size_t i = 0; i < doc.definitions.size(); ++i)
     renders[EiemModIdentifier("", doc.definitions[i].selector.section)] = i;
-  std::vector<std::vector<size_t>> edges(doc.definitions.size());
   for (size_t i = 0; i < doc.definitions.size(); ++i) {
     bool valid = true;
     std::unordered_set<std::string> shapes, shapeSpeeds;
@@ -463,11 +449,6 @@ static bool EiemValidateModDocument(EiemModProgram &doc, std::string &error) {
             valid = false; detail = "Missing " + kind + " declaration: " + s.value;
           }
         }
-        if (s.key.compare(0, 8, "partner.") == 0) {
-          auto it = renders.find(EiemModIdentifier("", s.value.c_str()));
-          if (it == renders.end()) { valid = false; detail = "Missing partner: " + s.value; }
-          else edges[i].push_back(it->second);
-        }
       }
       if (!valid) error = std::to_string(s.line) + ": " + detail;
     });
@@ -478,10 +459,6 @@ static bool EiemValidateModDocument(EiemModProgram &doc, std::string &error) {
       if (prefab.renders[i][0] && !renders.count(EiemModIdentifier("", prefab.renders[i]))) {
         error = "Prefab references missing Render: " + std::string(prefab.renders[i]); return false;
       }
-  // Runtime partners are one-level Render templates. Reject unsupported nesting
-  // explicitly instead of accepting an inert or recursive graph.
-  for (const auto &refs : edges) for (size_t target : refs)
-    if (!edges[target].empty()) { error = "Nested/cyclic partner references are not supported"; return false; }
   for (const auto &key : state.keys) {
     if (!key.chord.vk || key.assignments.empty()) {
       error = std::to_string(key.line) + ": Key needs key=, type and variable values"; return false;

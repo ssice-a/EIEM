@@ -22,7 +22,7 @@ static void EiemRegistrationTraceRenderer(void *,const char *,LONG) {}
 static bool EiemOnUnityThread() { return unityThread; }
 static bool EiemIsSkinnedRenderer(void *) { return true; }
 static bool EiemApplyStandaloneRenderRulesToRenderer(
-    void *,void *,void *,const char *,void *,const char *,bool) { return false; }
+    void *,void *,void *,const char *,void *,const char *) { return false; }
 static EiemModRule activeRule{};
 static bool EiemFindRenderRuleBySection(const char *,const char *,EiemModRule *out) {
   if(!programEnabled) return false; *out=activeRule; return true;

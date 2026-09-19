@@ -1,8 +1,7 @@
-# 资源替换重构设计
+﻿# 资源替换重构设计
 
 状态：v1.0.0 已完成静态 Mesh、Material、Texture、按键显隐和 F10 热重载的实机验收；Skeleton、Physics 和碰撞体继续作为后续阶段。
 
-本文定义 DLL 端资源替换的现行边界。2026-09-15 至 2026-09-17 的探针、部署和 PFB 对比记录保存在[验证归档](archive/resource-replacement-validation-20260915-17.md)，不作为当前行为的直接说明。
 
 ## 1. 目标
 

@@ -14,6 +14,9 @@ static bool g_shutdownRequested=false;
 static DWORD s_eiemUnityThreadId=0;
 static HWND g_gameHwnd=nullptr;
 static constexpr UINT_PTR kEiemModRetryTimer=0xE13A;
+static constexpr UINT_PTR kEiemModReplayTimer=0xE13B;
+static constexpr uint32_t kEiemDeferredReplayRequest=0x80000000u;
+static volatile LONG s_eiemDeferredModReplayPending=0;
 static void *g_gameObject_GetComponentsInChildren=(void *)1;
 static SRWLOCK s_eiemInputLock=SRWLOCK_INIT;
 static std::vector<EiemModInputEvent> s_eiemPendingInputs;
@@ -21,11 +24,6 @@ static void EiemProbeCheckpoint(const char *,bool=false) {}
 static void EiemReportCameraFade() {}
 static void EiemReapplyShapeControls(const std::vector<std::string> &) {}
 static void EiemRefreshShapeTransitionTimer() {}
-static void EiemApplyPartnerControlVisibility(
-    const std::vector<std::string> *, const EiemModProgram &) {}
-static void EiemDestroyPartnerObjects(const std::vector<std::string> *) {}
-static void EiemDestroyUndesiredPartnerObjects(
-    const std::vector<std::string> *, const EiemModProgram &) {}
 static void EiemCollectSkeletonInstances() {}
 static void EiemPhysicsRuntimeBoundary(const char *) {}
 static size_t EiemPhysicsRuntimeRetireChangedAssets(const char *) { return 0; }
@@ -33,6 +31,8 @@ static thread_local bool s_eiemPhysicsLifecycleTransaction = false;
 static void EiemReconcileModelPhysics(
     void *, const std::vector<EiemPhysicsIntent> &, bool, const char *) {}
 static void EiemRestoreRenderOverrides(const std::vector<std::string> *) { appliedModels.clear(); }
+static uint32_t EiemReapplySubmeshVisibility(
+    const std::vector<EiemSubmeshVisibilityChange> &) { return 0; }
 '''
 SINK=r'''
 static std::vector<void *> appliedModels;
@@ -58,7 +58,11 @@ static void WriteInvalidMod() {
   std::ofstream file("plugin/mods/test/mod.ini");
   file << "[RenderBody]\nasset=Body\nmesh=MissingMesh\n";
 }
-static void Reload() { s_eiemModUpdates.Request(EiemModUpdate::Reload); EiemRunModReconcile(); }
+static void Reload() {
+  s_eiemModUpdates.Request(EiemModUpdate::Reload);
+  EiemRunModReconcile(); // restore, parse and publish
+  EiemRunModReconcile(); // timer-driven replay after native teardown settles
+}
 int main() {
   WriteMod(false); EiemReloadMods();
   EiemRegisterAndApplyModelInstance(EiemModelOwnerKind::BaseModelPart,(void *)1,(void *)11,nullptr,1,"first-arrival");

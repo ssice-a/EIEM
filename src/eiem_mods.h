@@ -196,14 +196,6 @@ static bool EiemSameRenderAssembly(EiemModRule a, EiemModRule b) {
   return memcmp(&a, &b, sizeof(a)) == 0;
 }
 
-static bool EiemSameRenderWithoutPartnerLinks(EiemModRule a,
-                                               EiemModRule b) {
-  memset(a.partners, 0, sizeof(a.partners));
-  memset(b.partners, 0, sizeof(b.partners));
-  a.partnerCount = b.partnerCount = 0;
-  return memcmp(&a, &b, sizeof(a)) == 0;
-}
-
 static bool EiemSameRenderWithoutSubmeshVisibility(EiemModRule a,
                                                    EiemModRule b) {
   // A submesh visibility key changes only the generated index buffer. Keep
@@ -223,7 +215,6 @@ struct EiemSubmeshVisibilityChange {
 static bool EiemPrepareInputUpdate(const std::vector<EiemModInputEvent> &events,
                                    EiemModProgram *next, std::vector<std::string> *affected,
                                    bool *shapesOnly = nullptr,
-                                   bool *partnerLinksOnly = nullptr,
                                    bool *submeshVisibilityOnly = nullptr,
                                    std::vector<EiemSubmeshVisibilityChange>
                                        *visibilityChanges = nullptr) {
@@ -265,12 +256,6 @@ static bool EiemPrepareInputUpdate(const std::vector<EiemModInputEvent> &events,
     *shapesOnly = before.size() == next->rules.size();
     for (size_t i = 0; *shapesOnly && i < before.size(); ++i)
       *shapesOnly = EiemSameRenderAssembly(before[i], next->rules[i]);
-  }
-  if (partnerLinksOnly) {
-    *partnerLinksOnly = before.size() == next->rules.size();
-    for (size_t i = 0; *partnerLinksOnly && i < before.size(); ++i)
-      *partnerLinksOnly =
-           EiemSameRenderWithoutPartnerLinks(before[i], next->rules[i]);
   }
   if (submeshVisibilityOnly) {
     *submeshVisibilityOnly = before.size() == next->rules.size();
@@ -355,9 +340,9 @@ static LONG EiemPublishPreparedModReload(EiemModProgram next) {
   for (const auto &prefab : next.prefabs)
     Log("[MOD] prefab section=%s path=%s renders=%u", prefab.section, prefab.path, prefab.renderCount);
   for (const auto &rule : next.rules)
-    Log("[MOD] rule section=%s path=%s asset=%s handling=%s mesh=%s partners=%u",
+    Log("[MOD] rule section=%s path=%s asset=%s handling=%s mesh=%s",
         rule.section, rule.path, rule.asset, rule.handling[0] ? rule.handling : "<none>",
-        rule.hasMesh ? rule.mesh : "<none>", rule.partnerCount);
+        rule.hasMesh ? rule.mesh : "<none>");
   const size_t prefabCount = next.prefabs.size(), ruleCount = next.rules.size();
   const size_t resourceCount = next.resources.size(), standaloneCount = next.standaloneRules.size();
   AcquireSRWLockExclusive(&s_eiemModLock);

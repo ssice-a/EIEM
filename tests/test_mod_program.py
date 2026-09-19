@@ -39,8 +39,8 @@ int main(int argc, char **argv) {
     EiemModProgram mesh;
     CHECK(parse("[RenderBody]\nasset=Body\nmesh=MeshNew\n; handling=skip\n[MeshNew]\npath=new.mesh\n", mesh, error));
     CHECK(mesh.rules[0].hasMesh && !mesh.rules[0].handling[0]);
-    CHECK(parse("[RenderAdd]\npartner.0=RenderExtra\n[RenderExtra]\n", mesh, error));
-    CHECK(!mesh.rules[1].hasMesh && mesh.rules[1].partnerCount == 1);
+    CHECK(!parse("[RenderAdd]\npartner.0=RenderExtra\n[RenderExtra]\n", mesh, error));
+    CHECK(!error.empty());
     EiemModProgram visibility;
     CHECK(parse("[RenderBody]\nasset=Body\nsubmesh_visible.2=false\n", visibility, error));
     CHECK(visibility.rules[0].hiddenSubmeshMask == (1u << 2));
@@ -61,8 +61,8 @@ int main(int argc, char **argv) {
     CHECK(!parse("[TextureBad]\npath=x.png\nmip_bias=nan", p, error));
   } else if (scenario == "compile") {
     CHECK(parse("[PrefabA]\npath=actors/A.prefab\nrender.0=RenderScoped\n"
-                "[RenderScoped]\nasset=Body\n[RenderMain]\nasset=Body\npartner.0=RenderExtra\n"
-                "[RenderExtra]\nasset=Extra\n[RenderUnusedTemplate]\nmesh=MeshBody\n"
+                "[RenderScoped]\nasset=Body\n[RenderMain]\nasset=Body\n"
+                "[RenderUnusedTemplate]\nmesh=MeshBody\n"
                 "[MeshBody]\npath=body.mesh\ntarget.asset=Body\n", p, error));
     EiemCompileModProgram(p);
     CHECK(p.standaloneRules.size() == 2);
@@ -161,19 +161,19 @@ int main(int argc, char **argv) {
   } else if (scenario == "ordered_and_scope") {
     const std::string text = "[Constants]\n$a=0\n$b=0\n[KeyA]\nkey=F6\ntype=cycle\n$a=0,1\n$b=0,2\n"
       "[MeshNew]\npath=new.mesh\n[MaterialNew]\npath=new.mat\n[RenderMain]\nasset=Body\n"
-      "material.0=MaterialNew\nif $a\nmaterial.0=\npartner.0=RenderPartner\nendif\n"
-      "if $b == 2\nmesh=MeshNew\nendif\n[RenderPartner]\nasset=Extra\nmesh=MeshNew\n";
+      "material.0=MaterialNew\nif $a\nmaterial.0=\nendif\n"
+      "if $b == 2\nmesh=MeshNew\nendif\n";
     CHECK(parse(text, p, error, "a/mod.ini"));
     CHECK(parse(text, p, error, "b/mod.ini"));
-    CHECK(p.standaloneRules.size() == 2); // both inactive partners remain scoped
+    CHECK(p.standaloneRules.size() == 2);
     p.states[1].keys.clear();
     EiemKeyChord chord; CHECK(EiemParseKeyChord("F6", &chord));
     auto changed = EiemCycleModKey(p, chord);
     CHECK(changed.size() == 1 && changed[0] == "a/mod.ini");
-    CHECK(p.rules[0].hasMesh && p.rules[0].materialCount == 0 && p.rules[0].partnerCount == 1);
-    CHECK(!p.rules[2].hasMesh && p.rules[2].materialCount == 1 && p.rules[2].partnerCount == 0);
+    CHECK(p.rules[0].hasMesh && p.rules[0].materialCount == 0);
+    CHECK(!p.rules[1].hasMesh && p.rules[1].materialCount == 1);
     EiemCycleModKey(p, chord);
-    CHECK(!p.rules[0].hasMesh && p.rules[0].materialCount == 1 && !p.rules[0].partnerCount);
+    CHECK(!p.rules[0].hasMesh && p.rules[0].materialCount == 1);
   } else if (scenario == "hold") {
     CHECK(parse("[Constants]\n$shape=0\n[KeyShape]\nkey=F6\ntype=hold\n"
                 "speed=2\n$shape=1\n[RenderShape]\nasset=Body\n"
