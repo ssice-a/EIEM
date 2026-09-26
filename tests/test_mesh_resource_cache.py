@@ -39,6 +39,7 @@ FIXTURE = r'''
 #include <memory>
 #include <algorithm>
 #include "eiem_skin_binding.h"
+#include "eiem_file_io.h"
 #define MAX_PATH 260
 #define SRWLOCK_INIT {}
 using LONG = long;
@@ -61,7 +62,16 @@ struct EiemModRule { bool hasMesh = true; char modPath[MAX_PATH] = "mod.ini";
 struct EiemModResource { char modPath[MAX_PATH] = "mod.ini";
     char section[96] = "MeshA"; char path[MAX_PATH] = "mesh.mesh"; };
 static SRWLOCK s_eiemMeshResourceCacheLock;
+// F10 publishes a generation and intentionally rebuilds generated resources.
 static volatile LONG s_eiemModGeneration = 1;
+static constexpr bool kEiemEnableNativeMeshBoneSlots = false;
+static constexpr bool kEiemEnableLifecycleDiagnostics = false;
+static bool EiemValidateNativeMeshBoneSlots(void *, const char *, char *, size_t) {
+    return true;
+}
+static bool EiemModEquals(const char *left, const char *right) {
+    return left && right && std::strcmp(left, right) == 0;
+}
 static std::map<uint32_t, void *> targets;
 static std::vector<uint32_t> freed;
 static int tokens[32];
@@ -106,6 +116,10 @@ static bool EiemFindModResource(const char *, const char *, const char *,
                                EiemModResource *) { return true; }
 static unsigned GetFullPathNameA(const char *path, size_t size, char *out, void *) {
     strncpy_s(out, size, path, _TRUNCATE); return (unsigned)std::strlen(out);
+}
+static bool EiemResolveResourceDiskPath(const EiemModResource &resource,
+                                        char *out, size_t size) {
+    return GetFullPathNameA(resource.path, size, out, nullptr) != 0;
 }
 static uint64_t EiemMeshResourceFileStamp(const char *) { return 10; }
 static bool EiemApplyMeshSubmeshVisibility(

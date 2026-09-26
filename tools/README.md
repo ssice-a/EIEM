@@ -2,12 +2,13 @@
 
 Current authoring/runtime scope: [documentation index](../docs/README.md).
 
-EIEM pins [ssice-a/AnimeStudio](https://github.com/ssice-a/AnimeStudio) as a
-submodule for integration tests. Day-to-day AnimeStudio development and publishing use
-the sibling checkout `E:\vscode\AnimeStudio`. Initialize the pinned copy after cloning:
+EIEM keeps [ssice-a/AnimeStudio](https://github.com/ssice-a/AnimeStudio) and
+[ssice-a/EIEM-blender](https://github.com/ssice-a/EIEM-blender) as separate Git
+submodules. Develop AnimeStudio in `tools/AnimeStudio` and the Blender add-on in
+`tools/Blender`. Initialize both after cloning:
 
 ```powershell
-git submodule update --init tools/AnimeStudio
+git submodule update --init --recursive
 ```
 
 It does not require a 53 GB decrypted `.ab` tree or a separately generated
@@ -16,7 +17,7 @@ AssetMap.
 ## Run
 
 ```text
-E:\vscode\AnimeStudio\dist\win-x64-vfs-next\AnimeStudio.GUI.exe
+tools\AnimeStudio\dist\win-x64-vfs-next\AnimeStudio.GUI.exe
 ```
 
 Choose `File -> Open Endfield VFS...`, then select:
@@ -96,19 +97,17 @@ colliders** is enabled.
 
 ## Build
 
-The independently maintained source is pinned under `tools\AnimeStudio`; build the sibling
-checkout so generated files never dirty EIEM's integration pin. The local release targets .NET 9
-and is self-contained:
+Build from the AnimeStudio submodule. Generated `bin`, `obj`, and `dist` files are
+ignored by its own repository. The local Windows build targets .NET 9; the
+project also targets .NET 10, which requires a matching SDK:
 
 ```powershell
-dotnet restore E:\vscode\AnimeStudio\AnimeStudio\AnimeStudio.csproj `
-  -p:TargetFrameworks=net9.0
-dotnet build E:\vscode\AnimeStudio\AnimeStudio\AnimeStudio.csproj `
-  -c Release -p:TargetFramework=net9.0 -p:TargetFrameworks=net9.0 --no-restore
-dotnet restore E:\vscode\AnimeStudio\AnimeStudio.GUI\AnimeStudio.GUI.csproj `
+dotnet restore tools\AnimeStudio\AnimeStudio.GUI\AnimeStudio.GUI.csproj `
   -p:TargetFrameworks=net9.0-windows
-dotnet publish E:\vscode\AnimeStudio\AnimeStudio.GUI\AnimeStudio.GUI.csproj `
-  -c Release -f net9.0-windows -r win-x64 --self-contained true `
-  --no-restore -p:TargetFrameworks=net9.0-windows `
-  -o E:\vscode\AnimeStudio\dist\win-x64-vfs-next
+dotnet build tools\AnimeStudio\AnimeStudio.GUI\AnimeStudio.GUI.csproj `
+  -c Release -p:TargetFrameworks=net9.0-windows --no-restore -t:Rebuild
 ```
+
+The three repositories have separate working trees and commit histories. Commit
+tool changes in their submodules first, then update the EIEM gitlinks. Release
+creation is paused while local project organization and verification continue.

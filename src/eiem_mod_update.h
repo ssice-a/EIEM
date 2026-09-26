@@ -8,6 +8,7 @@ enum class EiemModUpdate : uint32_t {
   Reconcile = 1, // lifecycle event: retry registered models, no config change
   Reapply = 2,   // state change: restore/replay, no disk parsing
   Reload = 4,    // F10: restore, load/publish config, replay
+  SkinRefresh = 8, // native set_bones completed: rebind affected model later
 };
 
 class EiemModUpdateQueue {
@@ -28,11 +29,15 @@ class EiemModUpdateQueue {
 // The same ordering is used by runtime and native tests. Resource creation and
 // restoration stay in their existing implementations, not in the input layer.
 template <typename Restore, typename Reload, typename Replay>
-static void EiemDispatchModUpdate(uint32_t requests, Restore restore,
+static bool EiemDispatchModUpdate(uint32_t requests, Restore restore,
                                   Reload reload, Replay replay) {
-  if (!requests) return;
+  if (!requests) return true;
+  bool restored = true;
   if (requests & ((uint32_t)EiemModUpdate::Reapply | (uint32_t)EiemModUpdate::Reload))
-    restore();
-  if (requests & (uint32_t)EiemModUpdate::Reload) reload();
+    restored = restore();
+  if (restored && (requests & (uint32_t)EiemModUpdate::Reload)) reload();
+  // Recover successfully restored consumers with the old program when any
+  // consumer is still pending. Never publish a mixed configuration generation.
   replay();
+  return restored;
 }

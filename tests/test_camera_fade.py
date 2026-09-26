@@ -17,7 +17,7 @@ static void Log(const char *, ...) {}
 int main() {
   EiemGlobalConfig config;
   std::string error;
-  CHECK(!config.disableCameraFade);
+  CHECK(config.disableCameraFade);
   std::istringstream good("[Graphics]\ndisable_camera_fade=true\n[Hotkeys]\nreload=F8\n");
   CHECK(EiemParseGlobalConfig(good, &config, error));
   CHECK(config.disableCameraFade && config.reload.vk == VK_F8);
@@ -29,9 +29,9 @@ int main() {
     CHECK(config.disableCameraFade && config.reload.vk == VK_F8);
   }
   std::istringstream old("[Hotkeys]\nreload=F10\n");
-  CHECK(EiemParseGlobalConfig(old, &config, error) && !config.disableCameraFade);
+  CHECK(EiemParseGlobalConfig(old, &config, error) && config.disableCameraFade);
   CHECK(LoadEiemConfig());
-  CHECK(!EiemGetGlobalConfig().disableCameraFade);
+  CHECK(EiemGetGlobalConfig().disableCameraFade);
   { std::ofstream f(kEiemGlobalConfigPath); f << "[Graphics]\ndisable_camera_fade=true\n"; }
   CHECK(LoadEiemConfig() && EiemGetGlobalConfig().disableCameraFade);
   auto generation = s_eiemGlobalConfigGeneration;

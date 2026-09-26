@@ -1,5 +1,6 @@
 """Neutral channels through real MinHook and the production IL2CPP shape adapter."""
 from pathlib import Path
+from runtime_source import read_runtime_source
 import shutil
 import subprocess
 import tempfile
@@ -160,7 +161,7 @@ class ShapeOwnershipTests(unittest.TestCase):
     def test_game_mesh_change_rebases_actual_consumer_state(self):
         if not shutil.which("cl"):
             self.skipTest("Requires MSVC")
-        trace = (ROOT / "src/il2cpp_trace.h").read_text(encoding="utf-8")
+        trace = read_runtime_source(ROOT)
         adapter = trace[trace.index("struct EiemUnityShapes"):trace.index("struct EiemRenderOverrideState")]
         state_start = trace.index("struct EiemRenderOverrideState {")
         state = trace[state_start:trace.index("\n};", state_start) + 3]
@@ -209,7 +210,7 @@ int main() {
     def test_native_call_chain_and_real_adapter(self):
         if not shutil.which("cl"):
             self.skipTest("Requires MSVC")
-        trace = (ROOT / "src/il2cpp_trace.h").read_text(encoding="utf-8")
+        trace = read_runtime_source(ROOT)
         adapter = trace[trace.index("struct EiemUnityShapes"):trace.index("struct EiemRenderOverrideState")]
         with tempfile.TemporaryDirectory(prefix="eiem-shape-ownership-") as temp:
             folder = Path(temp)

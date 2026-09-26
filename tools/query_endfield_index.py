@@ -142,6 +142,8 @@ def main() -> int:
                 count = reader.int32()
                 dependencies = [reader.string() for _ in range(max(0, count))]
                 cabs += 1
+                if not args.cab and not args.cabs_only:
+                    continue
                 if cab_re and not cab_re.search(cab_name):
                     continue
                 hits += 1

@@ -38,6 +38,7 @@ SOURCE=r'''
 #include <unordered_map>
 #include <vector>
 #include "eiem_skin_binding.h"
+#include "eiem_file_io.h"
 // READER
 struct Array { char pad[24]{}; size_t count=0; void *items[32]{}; };
 struct Node { std::string name; Node *parent=nullptr; std::vector<Node *> children; bool alive=true; float p[3]{},q[4]{0,0,0,1},s[3]{1,1,1}; };

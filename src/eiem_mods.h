@@ -11,7 +11,16 @@ static EiemModProgram s_eiemModProgram;
 static volatile LONG s_eiemModGeneration = 0;
 static volatile LONG s_eiemModControlGeneration = 0;
 static std::string s_eiemSelectedModPath;
+static volatile LONG s_eiemModManagerOpen = 0;
 static EiemPersistentStore s_eiemPersistentStates;
+
+// The built-in manager controls a game Mod. Its focused overlay uses the
+// game's Key scope; a separate authored Lua UI still uses the UI scope.
+static bool EiemModUsesUiKeyScope(bool gameWindowFocus,
+                                  bool managerWindowFocus,
+                                  bool managerOpen) {
+  return !gameWindowFocus && !(managerWindowFocus && managerOpen);
+}
 
 static bool EiemModAffected(const char *path, const std::vector<std::string> *mods) {
   if (!mods) return true;
@@ -22,25 +31,32 @@ static bool EiemModAffected(const char *path, const std::vector<std::string> *mo
 struct EiemModControlSnapshot {
   std::string modPath;
   std::vector<EiemModKey> keys;
+  std::vector<EiemModShapeControl> shapeControls;
   EiemVariables variables;
   bool selected = false;
 };
 
-static bool EiemSelectableMod(const EiemModState &state) {
-  return !state.keys.empty();
+static bool EiemSelectableMod(const EiemModProgram &program,
+                              size_t stateIndex) {
+  return !program.states[stateIndex].keys.empty() ||
+         !program.states[stateIndex].shapeControls.empty();
 }
 
 // Caller owns s_eiemModLock exclusively.
 static void EiemReconcileControlledModLocked() {
   std::string next;
-  for (const auto &state : s_eiemModProgram.states) {
-    if (!EiemSelectableMod(state)) continue;
+  std::string firstWithKeys, firstWithShapes;
+  for (size_t index = 0; index < s_eiemModProgram.states.size(); ++index) {
+    const auto &state = s_eiemModProgram.states[index];
+    if (!EiemSelectableMod(s_eiemModProgram, index)) continue;
+    if (firstWithKeys.empty() && !state.keys.empty()) firstWithKeys = state.path;
+    if (firstWithShapes.empty() && !state.shapeControls.empty()) firstWithShapes = state.path;
     if (EiemModEquals(state.path.c_str(), s_eiemSelectedModPath.c_str())) {
       next = state.path;
       break;
     }
-    if (next.empty()) next = state.path;
   }
+  if (next.empty()) next = firstWithKeys.empty() ? firstWithShapes : firstWithKeys;
   const bool changed = !EiemModEquals(next.c_str(), s_eiemSelectedModPath.c_str());
   s_eiemSelectedModPath = std::move(next);
   if (changed) InterlockedIncrement(&s_eiemModControlGeneration);
@@ -49,8 +65,9 @@ static void EiemReconcileControlledModLocked() {
 static bool EiemSelectControlledMod(const std::string &modPath) {
   bool found = false, changed = false;
   AcquireSRWLockExclusive(&s_eiemModLock);
-  for (const auto &state : s_eiemModProgram.states) {
-    if (!EiemSelectableMod(state) ||
+  for (size_t index = 0; index < s_eiemModProgram.states.size(); ++index) {
+    const auto &state = s_eiemModProgram.states[index];
+    if (!EiemSelectableMod(s_eiemModProgram, index) ||
         !EiemModEquals(state.path.c_str(), modPath.c_str()))
       continue;
     found = true;
@@ -76,9 +93,11 @@ static std::vector<EiemModControlSnapshot> EiemGetModControls(
   AcquireSRWLockShared(&s_eiemModLock);
   if (generation) *generation = s_eiemModGeneration;
   if (controlGeneration) *controlGeneration = s_eiemModControlGeneration;
-  for (const auto &state : s_eiemModProgram.states) {
-    if (!EiemSelectableMod(state)) continue;
-    result.push_back({state.path, state.keys, state.variables,
+  for (size_t index = 0; index < s_eiemModProgram.states.size(); ++index) {
+    const auto &state = s_eiemModProgram.states[index];
+    auto shapeControls = state.shapeControls;
+    if (state.keys.empty() && shapeControls.empty()) continue;
+    result.push_back({state.path, state.keys, std::move(shapeControls), state.variables,
                       EiemModEquals(state.path.c_str(),
                                     s_eiemSelectedModPath.c_str())});
   }
@@ -142,6 +161,7 @@ struct EiemModInputEvent {
   std::string keySection; // non-empty when the manager invokes one Key section
   bool holdTick = false; // true for polling ticks; cycle keys ignore these
   double holdSeconds = 0.02;
+  bool directValues = false; // built-in manager sliders, even without a Lua UI
 };
 
 struct EiemUiSnapshot {
@@ -221,13 +241,37 @@ static bool EiemPrepareInputUpdate(const std::vector<EiemModInputEvent> &events,
   AcquireSRWLockShared(&s_eiemModLock);
   *next = s_eiemModProgram;
   const LONG generation = s_eiemModGeneration;
+  const std::string selectedModPath = s_eiemSelectedModPath;
   ReleaseSRWLockShared(&s_eiemModLock);
   const auto before = next->rules;
   affected->clear();
   for (const auto &event : events) {
     if (event.generation != generation) continue; // queued before an F10 reset
     std::vector<std::string> changed;
-    if (event.uiSection.empty() && !event.modPath.empty())
+    if (event.directValues &&
+        EiemModEquals(event.modPath.c_str(), selectedModPath.c_str())) {
+      for (size_t i = 0; i < next->states.size(); ++i) {
+        auto &state = next->states[i];
+        if (!EiemModEquals(state.path.c_str(), event.modPath.c_str())) continue;
+        const auto &controls = state.shapeControls;
+        bool inRange = !event.values.empty();
+        for (const auto &item : event.values) {
+          auto control = std::find_if(controls.begin(), controls.end(),
+              [&](const auto &candidate) { return candidate.variable == item.first; });
+          inRange &= control != controls.end() && std::isfinite(item.second) &&
+                     item.second >= control->minimum &&
+                     item.second <= control->maximum;
+        }
+        const auto previous = state.variables;
+        std::string error;
+        if (!inRange || !EiemApplyUiValues(*next, i, event.values, error))
+          Log("[UI] Rejected manager shape values for %s", state.path.c_str());
+        else if (previous != state.variables) changed.push_back(state.path);
+      }
+      if (!changed.empty()) EiemEvaluateModProgram(*next);
+    }
+    else if (event.uiSection.empty() && !event.modPath.empty() &&
+             EiemModEquals(event.modPath.c_str(), selectedModPath.c_str()))
       changed = EiemApplyModKey(*next, event.chord, event.uiFocus,
                                 event.modPath.c_str(),
                                 event.keySection.empty()
@@ -301,14 +345,15 @@ static bool EiemPrepareModReload(EiemModProgram *prepared,
   }
   EiemModProgram next;
   std::vector<std::string> files;
-  WIN32_FIND_DATAA data = {};
-  HANDLE root = FindFirstFileA("plugin\\mods\\*", &data);
+  WIN32_FIND_DATAW data = {};
+  HANDLE root = FindFirstFileW(L"plugin\\mods\\*", &data);
   if (root != INVALID_HANDLE_VALUE) {
     do {
       if (!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || data.cFileName[0] == '.')
         continue;
-      files.push_back(std::string("plugin\\mods\\") + data.cFileName + "\\mod.ini");
-    } while (FindNextFileA(root, &data));
+      files.push_back((std::filesystem::path(L"plugin\\mods") /
+                       data.cFileName / L"mod.ini").u8string());
+    } while (FindNextFileW(root, &data));
     FindClose(root);
   }
   // File enumeration order is unspecified. Preserve deterministic conflict

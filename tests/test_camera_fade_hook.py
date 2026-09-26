@@ -113,7 +113,7 @@ int main(int argc, char **argv) {
     } else if (scenario == "reload_and_manager") {
       CHECK(LoadEiemConfig());
       entry(&a, &pitchMethod);
-      CHECK(a.faded && a.clearCalls == 0);
+      CHECK(!a.faded && a.clearCalls == 1); // new installations enable anti-fade
       for (unsigned cycle = 0; cycle < 5; ++cycle) {
         { std::ofstream file(kEiemGlobalConfigPath); file << "[Graphics]\ndisable_camera_fade=true\n"; }
         CHECK(LoadEiemConfig());

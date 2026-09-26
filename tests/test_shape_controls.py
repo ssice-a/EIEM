@@ -38,6 +38,7 @@ int main() {
         std::string(p.rules[0].shapeSpeedNames[0])=="Inflate" &&
         p.rules[0].shapeSpeeds[0]==.5f);
   EiemPublishModState(p); s_eiemModGeneration=7;
+  CHECK(EiemSelectControlledMod("a/mod.ini"));
   EiemModInputEvent slider{{},7,"a/mod.ini","UISize",{{"$size",.6}}};
   EiemModInputEvent keyA{{VK_F6,0},7,"a/mod.ini"};
   EiemModInputEvent keyB{{VK_F6,0},7,"b/mod.ini"};
@@ -48,6 +49,9 @@ int main() {
   CHECK(EiemPrepareInputUpdate({slider,keyA},&next,&affected));
   CHECK(next.rules[0].shapeWeights[0]==0); // unmatched cycle value starts at 0
   CHECK(EiemPrepareInputUpdate({keyB,slider},&next,&affected));
+  CHECK(next.rules[0].shapeWeights[0]==.6f && next.rules[1].shapeWeights[0]==0);
+  CHECK(EiemSelectControlledMod("b/mod.ini"));
+  CHECK(EiemPrepareInputUpdate({keyB,slider},&next,&affected));
   CHECK(next.rules[0].shapeWeights[0]==.6f && next.rules[1].shapeWeights[0]==1);
   slider.generation=6;
   CHECK(!EiemPrepareInputUpdate({slider},&next,&affected));
@@ -56,6 +60,25 @@ int main() {
   slider.values={{"$size",.4},{"$unknown",1}};
   CHECK(!EiemPrepareInputUpdate({slider},&next,&affected));
   CHECK(next.states[0].variables.at("$size")==0); // no partial transaction
+  EiemModProgram shapeOnly;
+  std::istringstream shapeOnlyIni(
+    "[Constants]\npersist $wide=0.4\n"
+    "[ShapeControlWidth]\nvariable=$wide\nlabel=Width\nmin=0.2\nmax=0.8\n"
+    "[RenderShape]\nasset=Cloth\nshape.Width=$wide\n");
+  CHECK(EiemModParseStream(shapeOnlyIni,"shape/mod.ini",shapeOnly,&error));
+  EiemPublishModState(shapeOnly); s_eiemModGeneration=8;
+  LONG shapeGeneration=0,controlGeneration=0;
+  auto shapeControls=EiemGetModControls(&shapeGeneration,&controlGeneration);
+  CHECK(shapeControls.size()==1 && shapeControls[0].keys.empty() &&
+        shapeControls[0].shapeControls.size()==1 && shapeControls[0].selected);
+  EiemModInputEvent direct;
+  direct.generation=8; direct.modPath="shape/mod.ini";
+  direct.values={{"$wide",0.7}}; direct.directValues=true;
+  CHECK(EiemGetSelectedModPath()=="shape/mod.ini");
+  CHECK(EiemPrepareInputUpdate({direct},&next,&affected));
+  CHECK(next.rules[0].shapeWeights[0]==.7f);
+  direct.values={{"$wide",0.9}};
+  CHECK(!EiemPrepareInputUpdate({direct},&next,&affected)); // above authored max
   for (const char *bad : {
     "[RenderA]\nasset=A\nshape.X=1e38\n",
     "[Constants]\n$x=0\n[KeyA]\nkey=F6\ntype=cycle\n$x=0,1e38\n[RenderA]\nasset=A\nshape.X=$x\n",
@@ -84,6 +107,13 @@ int main() {
     CHECK(!EiemModParseStream(stream,"bad/mod.ini",invalid,&error));
     CHECK(invalid.states.empty());
   }
+  for (const char *bad : {
+    "[Constants]\n$x=0\n[ShapeControlA]\nvariable=$x\nlabel=X\nmin=0\nmax=1\n",
+    "[Constants]\n$x=0\n[ShapeControlA]\nvariable=$x\nlabel=X\nmin=1\nmax=0\n[RenderA]\nasset=A\nshape.X=$x\n",
+    "[Constants]\n$x=0\n[ShapeControlA]\nvariable=$x\nlabel=X\nmin=0\nmax=1\n[ShapeControlB]\nvariable=$x\nlabel=Y\nmin=0\nmax=1\n[RenderA]\nasset=A\nshape.X=$x\n"}) {
+    EiemModProgram invalid; std::istringstream stream(bad);
+    CHECK(!EiemModParseStream(stream,"bad/mod.ini",invalid,&error));
+  }
   std::istringstream conditional(R"ini([Constants]
 $x=0
 [UIX]
@@ -110,6 +140,8 @@ endif
   CHECK(EiemCycleModKey(conditionDoc,{VK_F9,0},true).empty());
   CHECK(EiemCycleModKey(conditionDoc,{VK_F9,0},false).size()==1);
   EiemPublishModState(q);
+  s_eiemModGeneration=7;
+  EiemSelectControlledMod("c/mod.ini");
   CHECK(EiemPrepareInputUpdate({{{},7,"c/mod.ini","UIX",{{"$x",1}}}},&next,&affected,&shapesOnly));
   CHECK(!shapesOnly && next.rules[0].shapeCount==0);
   // Tiny values must not be rounded away by string formatting.

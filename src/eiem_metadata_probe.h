@@ -66,6 +66,13 @@ static void EiemLogClassMethods(void *klass) {
   while (void *method = il2cpp_class_get_methods(klass, &iterator)) {
     const char *name = il2cpp_method_get_name(method);
     const uint32_t count = il2cpp_method_get_param_count(method);
+    const char *returnName = "?";
+    if (il2cpp_method_get_return_type && il2cpp_type_get_name) {
+      void *returnType = il2cpp_method_get_return_type(method);
+      const char *resolved =
+          returnType ? il2cpp_type_get_name(returnType) : nullptr;
+      if (resolved && resolved[0]) returnName = resolved;
+    }
     char params[512] = {};
     size_t used = 0;
     for (uint32_t p = 0; p < count && p < 16; ++p) {
@@ -80,9 +87,9 @@ static void EiemLogClassMethods(void *klass) {
       if (written <= 0 || (size_t)written >= sizeof(params) - used) break;
       used += (size_t)written;
     }
-    Log("[META-METHOD] class=%s index=%d name=%s params=%u(%s)", 
-        il2cpp_class_get_name(klass), index, name ? name : "<null>", count,
-        params);
+    Log("[META-METHOD] class=%s index=%d name=%s return=%s params=%u(%s)",
+        il2cpp_class_get_name(klass), index, name ? name : "<null>",
+        returnName, count, params);
     ++index;
     if (index >= 160) {
       Log("[META-METHOD] class=%s truncated at 160 methods",
@@ -173,6 +180,78 @@ static void EiemDumpMetadataClasses(void **assemblies, size_t assemblyCount) {
   }
   Log("[META-SUMMARY] assemblies=%zu classes=%zu matched=%zu", assemblyCount,
       classTotal, matched);
+}
+
+// A deliberately narrow census for the intermittent T-pose investigation.
+// The public SkinnedMeshRenderer input has already been validated.  These are
+// the exact game-owned classes between that input and Endfield's HG/GPU part
+// path.  Dumping their real signatures is the prerequisite for safe runtime
+// hooks; guessing a native signature here can corrupt the call frame.
+static void EiemDumpCustomSkinPipelineMetadata(void **assemblies,
+                                                size_t assemblyCount) {
+  static std::atomic<bool> dumped{false};
+  if (dumped.exchange(true) || !assemblies || !assemblyCount) return;
+
+  struct Candidate {
+    const char *nameSpace;
+    const char *name;
+    bool fields;
+    bool methods;
+  };
+  const Candidate candidates[] = {
+      {"UnityEngine", "HGMeshRenderer", true, true},
+      {"UnityEngine", "HGMeshRendererData", true, true},
+      {"UnityEngine.HyperGryph.ECS", "Entity", true, true},
+      {"Beyond.NPC.Avatar", "SubMeshInfo", true, true},
+      {"Beyond.NPC.Avatar", "NPCAvatarLodMeshAssets", true, true},
+      {"Beyond.NPC.Avatar", "NPCAvatarCreatorUtils", false, true},
+      {"Beyond.Gameplay.View", "EntityRenderHelper", true, true},
+      {"Beyond.Rendering", "EntityRenderHelperMaterialController", true, true},
+      {"Beyond.Gameplay.View", "BaseModelViewPart", true, false},
+      {"Beyond.Gameplay.View", "CharUIModelMono", true, false},
+      // Custom skin/GPU candidates. Their metadata is collected before any
+      // hook is attempted so the next probe can bind only to real signatures.
+      {"Beyond.NPC.Animation", "GpuAnimator", true, true},
+      {"Beyond.NPC.Animation", "GpuAnimatorSampler", true, true},
+      {"Beyond.NPC.Animation", "GpuAnimInfo", true, true},
+      {"Beyond.NPC.Animation", "GpuAnimMgr", true, true},
+      {"Beyond.Gameplay.Core", "GpuResourceWithMat", true, true},
+      {"Beyond.Gameplay.Core", "NpcGpuResource", true, true},
+      {"Beyond.Gameplay.Core", "NpcGpuInstanceWithMat", true, true},
+      {"Beyond.Gameplay.Core", "NpcGpuInstanceMgr", true, true},
+      {"Beyond.Gameplay.Core", "PartSubMeshGPU", true, true},
+      {"HG.Rendering.Runtime", "SkinnedMeshCaptureManager", true, true},
+      {"HG.Rendering.Runtime", "GpuClothManager", true, true},
+      {"HG.Rendering.Runtime", "GpuClothRenderData", true, true},
+      {"HG.Rendering.Runtime", "GpuClothGroupUploadData", true, true},
+      {"HG.Rendering.Runtime", "GpuClothClearBufferData", true, true},
+      {"HG.Rendering.Runtime", "GpuClothMatrixGenerator", true, true},
+      {"HG.Rendering.Runtime", "GpuClothSimulationPassConstructor", true, true},
+      {"BeyondDynamicBone", "VirtualMesh", true, true},
+      {"BeyondDynamicBone", "TeamManager", true, true},
+  };
+
+  size_t found = 0;
+  for (const Candidate &candidate : candidates) {
+    void *klass = FindClass(candidate.nameSpace, candidate.name, assemblies,
+                            assemblyCount);
+    uint32_t alignment = 0;
+    const int32_t valueSize =
+        klass && il2cpp_class_value_size
+            ? il2cpp_class_value_size(klass, &alignment)
+            : 0;
+    Log("[CUSTOM-SKIN-META] namespace=%s class=%s found=%d fields=%d "
+        "methods=%d valueSize=%d alignment=%u",
+        candidate.nameSpace, candidate.name, klass ? 1 : 0,
+        candidate.fields ? 1 : 0, candidate.methods ? 1 : 0, valueSize,
+        alignment);
+    if (!klass) continue;
+    ++found;
+    if (candidate.fields) EiemLogClassFields(klass);
+    if (candidate.methods) EiemLogClassMethods(klass);
+  }
+  Log("[CUSTOM-SKIN-META] complete requested=%zu found=%zu",
+      _countof(candidates), found);
 }
 
 // ---------------------------------------------------------------------------

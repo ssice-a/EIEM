@@ -1,6 +1,6 @@
 ﻿# 资源替换重构设计
 
-状态：v1.0.0 已完成静态 Mesh、Material、Texture、按键显隐和 F10 热重载的实机验收；Skeleton、Physics 和碰撞体继续作为后续阶段。
+状态：v1.0.0 是功能参照；四槽样本在大世界手动 50 次 F10 无躺地，旧 UI F10 闪退和 NPC 材质异常已记录，最新 NPC 反馈正常。本轮普通候选尚未再次三端实机验收。Skeleton、Physics 和碰撞体属于后续阶段。见[当前装配状态](unified-assembly-status-20260926.md)。
 
 
 ## 1. 目标
@@ -29,7 +29,7 @@ EIEM 需要支持：
 
 三端需要轻量 owner 适配器，但不能各自实现一套 Mesh、材质或状态语义。
 
-### 2.2 当前静态替换链稳定
+### 2.2 已观察到的静态替换链
 
 当前 Typhoea 包实际启用三条 Render：
 
@@ -49,18 +49,18 @@ set_sharedMesh
   -> LOD 登记
 ```
 
-三条规则的调用次数一致，没有 `binding failed`、槽位不匹配或漏装配证据。用户已确认当前静态版本稳定。
+大世界 50 次 F10 的三条目标规则均被创建和读取，`native Mesh +0x1C8` 写后均为 4；这不能证明三端装配稳定。另一轮 UI F10 闪退，NPC 显示异常，需按场景继续验收。
 
 ### 2.3 既有骨骼槽位按源 Mesh 身份继承
 
 Unity 蒙皮使用 Mesh 内的骨骼索引、Renderer 的 `bones[]` 数组和 bindpose，不使用 Blender 顶点组名称在运行时查找 Transform。
 
-Blender 导出器必须为 EIEMESH v5 的每个局部槽保存来源 Mesh 身份和原始槽号。DLL 遵守以下规则：
+Blender 导出器必须为 EIEMESH v6 的每个局部槽保存来源 Mesh 身份、原始槽号及可用供体候选。DLL 遵守以下规则：
 
 1. 修改任何 Renderer 前，快照当前模型实例内所有原生 SkinnedMeshRenderer 的 Mesh 身份和原始 `bones[]`。
 2. replacement 的每个槽按“源 Mesh 身份 + 原始槽号”读取当前实例 Transform，不按目标 Renderer 的同序号猜测。
 3. 世界、UI、NPC 各自解析自己的实例 Transform，不跨模型实例共享数组。
-4. 完整 v5 来源表不依赖 Transform 名称或层级；路径和层级索引只作为旧格式回退。
+4. 完整 v6 供体表不依赖 Transform 名称或层级；路径和层级索引只作为旧格式兼容回退。
 5. 缺失、越界或歧义时拒绝替换，不为角色、PFB 或骨骼名称增加特殊映射。
 
 这允许修改后的 Mesh 使用同一原生模型中其他源 Mesh 已装配的骨骼，也覆盖不同 PFB 对同一骨骼改名的情况。完整契约见[共享骨架绑定](shared-skeleton-binding.md)。
@@ -82,7 +82,7 @@ Blender 导出器必须为 EIEMESH v5 的每个局部槽保存来源 Mesh 身份
 
 当前生产路径在游戏已经创建 Renderer、尚处于原生装配回调的边界应用 Mesh 和材质。它不是理想化的全局 AssetBundle 缓存替换，但已证明世界、UI 和 NPC 能得到一致结果，并继续由游戏的 skin、Animator、LOD 和 owner 生命周期管理。
 
-Mesh-only 规则不得修改 Animator 数据。源骨骼槽位按 2.3 的 v5 来源记录处理，不能按名称重建整个数组，也不能借用另一个模型实例的 Transform。
+Mesh-only 规则不得修改 Animator 数据。源骨骼槽位按 2.3 的 v6 供体记录处理，不能按名称重建整个数组，也不能借用另一个模型实例的 Transform。
 
 材质和贴图按声明的材质槽提交。未声明槽位保留游戏值；不能直接污染游戏或其他 Mod 共用的材质对象。
 
@@ -164,10 +164,10 @@ F10 不得把“恢复所有旧覆盖、逐 Renderer 重放、重建 Partner/Phy
 
 | 阶段 | 内容 | 当前状态 | 通过条件 |
 |---|---|---|---|
-| 0 | 清理研究 Hook 和日志 | 已完成 | 诊断探针默认关闭，测试和构建通过 |
-| 1 | 静态 Mesh/Material/Texture | 已实机通过 | 三条目标 Render、三端实例使用相同规则且稳定 |
-| 2 | 按键显隐 | 原地索引更新已实机通过 | Mesh、Renderer 和 skin/Physics 指针不变，只更新目标 submesh 索引 |
-| 3 | F10 统一资源代际 | 事务预检完成，资源回放待收敛 | 已有实例一致更新，失败可回滚，旧代际可退休 |
+| 0 | 清理研究 Hook 和日志 | 部分完成 | 诊断探针默认关闭；仍有隔离的旧 Partner 与探针代码待清理 |
+| 1 | 静态 Mesh/Material/Texture | 三端待回归 | 三条目标 Render、三端实例使用相同规则且稳定 |
+| 2 | 按键显隐 | 历史版本已实机通过，当前候选待回归 | Mesh、Renderer 和 skin/Physics 指针不变，只更新目标 submesh 索引 |
+| 3 | F10 统一资源代际 | 事务预检与同一执行器回放已实现；最终原生资源重建未实现 | 已有实例一致更新，失败可回滚，旧代际可退休 |
 | 4 | 材质参数热更新 | 待验收 | 只影响声明槽位，不污染共享对象 |
 | 5 | Skeleton/Physics/碰撞体 | 待取证 | 三端原生消费入口和释放边界均有证据 |
 | 6 | Blender 完整适配 | 部分完成 | 导出格式与各已验收 DLL 契约一致 |

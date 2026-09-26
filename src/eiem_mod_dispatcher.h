@@ -9,11 +9,13 @@ static LRESULT CALLBACK EiemModWndProc(HWND hwnd, UINT msg, WPARAM wParam,
   WNDPROC original = g_origWndProc;
   if (msg == WM_CLOSE || msg == WM_DESTROY || msg == WM_NCDESTROY ||
       msg == WM_ENDSESSION) {
+    EiemFinishPhysicsManualCaptureOnUnityThread(hwnd,"shutdown");
     g_shutdownRequested = true;
     g_guiRunning = false;
     KillTimer(hwnd, kEiemShapeTransitionTimer);
     KillTimer(hwnd, kEiemModRetryTimer);
-    KillTimer(hwnd, kEiemModReplayTimer);
+    KillTimer(hwnd, kEiemSkinTimingProbeTimer);
+    KillTimer(hwnd, kEiemPhysicsCaptureTimer);
     s_eiemShapeTransitionTick = 0;
     if (original &&
         GetWindowLongPtrW(hwnd, GWLP_WNDPROC) == (LONG_PTR)EiemModWndProc) {
@@ -36,13 +38,21 @@ static LRESULT CALLBACK EiemModWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     EiemRunModReconcile();
     return 0;
   }
-  if (msg == WM_TIMER && wParam == kEiemModReplayTimer) {
-    KillTimer(hwnd, kEiemModReplayTimer);
-    EiemRunModReconcile();
-    return 0;
-  }
   if (msg == WM_TIMER && wParam == kEiemShapeTransitionTimer) {
     EiemRunShapeTransitions();
+    return 0;
+  }
+  if (msg == WM_EIEM_PHYSICS_CAPTURE) {
+    EiemStartPhysicsManualCaptureOnUnityThread(hwnd);
+    return 0;
+  }
+  if (msg == WM_TIMER && wParam == kEiemSkinTimingProbeTimer) {
+    KillTimer(hwnd, kEiemSkinTimingProbeTimer);
+    EiemRunSkinTimingProbe();
+    return 0;
+  }
+  if (msg == WM_TIMER && wParam == kEiemPhysicsCaptureTimer) {
+    EiemFinishPhysicsManualCaptureOnUnityThread(hwnd,"bounded-window-complete");
     return 0;
   }
   if (msg == WM_EIEM_MOD_KEY) {
@@ -89,14 +99,37 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
   // Cycle keys use OS edges. Hold keys use the same registration only as a
   // capture gate, then are sampled below so their speed is independent of the
   // keyboard's repeat delay/rate.
-  enum class KeyAction { Manager, Reload, Cycle };
+  enum class KeyAction { Manager, Reload, Cycle, PhysicsCapture };
   struct Binding {
     int id; EiemKeyChord chord; EiemModKeyBehavior behavior;
     KeyAction action; LONG generation; ULONGLONG holdTick = 0;
   };
   std::vector<Binding> registered;
+  // RegisterHotKey's MOD_NOREPEAT state belongs to one OS registration.  A
+  // reload publishes a new Mod generation and rebuilds those registrations;
+  // if the user still holds F10, Windows can emit a fresh WM_HOTKEY for the
+  // new registration and start an unbounded reload/rebind loop.  Keep the
+  // physical edge latch outside `registered`, so it survives every rebind and
+  // is cleared only after the complete chord has actually been released.
+  std::vector<EiemKeyChord> pressedChords;
+  auto chordDown = [](const EiemKeyChord &chord) {
+    return (GetAsyncKeyState((int)chord.vk) & 0x8000) != 0 &&
+           (!(chord.modifiers & MOD_CONTROL) ||
+            (GetAsyncKeyState(VK_CONTROL) & 0x8000)) &&
+           (!(chord.modifiers & MOD_SHIFT) ||
+            (GetAsyncKeyState(VK_SHIFT) & 0x8000)) &&
+           (!(chord.modifiers & MOD_ALT) ||
+            (GetAsyncKeyState(VK_MENU) & 0x8000));
+  };
+  auto takePressEdge = [&](const EiemKeyChord &chord) {
+    for (const auto &pressed : pressedChords)
+      if (pressed == chord) return false;
+    pressedChords.push_back(chord);
+    return true;
+  };
   LONG boundModGeneration = -1, boundControlGeneration = -1;
   LONG boundConfigGeneration = -1;
+  bool boundManagerOpen = false;
   HWND boundForeground = nullptr;
   MSG message = {};
   PeekMessageW(&message, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
@@ -106,14 +139,22 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
   };
   while (g_guiRunning && !g_shutdownRequested && IsWindowAlive(hwnd)) {
     s_eiemPersistentStates.Flush(); // batched writes only; no disk polling or Unity calls
+    pressedChords.erase(
+        std::remove_if(pressedChords.begin(), pressedChords.end(),
+                       [&](const EiemKeyChord &chord) {
+                         return !chordDown(chord);
+                       }),
+        pressedChords.end());
     HWND foreground = GetForegroundWindow();
     LONG modGeneration = InterlockedCompareExchange(&s_eiemModGeneration, 0, 0);
     LONG controlGeneration =
         InterlockedCompareExchange(&s_eiemModControlGeneration, 0, 0);
     LONG configGeneration = InterlockedCompareExchange(&s_eiemGlobalConfigGeneration, 0, 0);
+    const bool managerOpen =
+        InterlockedCompareExchange(&s_eiemModManagerOpen, 0, 0) != 0;
     if (foreground != boundForeground || modGeneration != boundModGeneration ||
         controlGeneration != boundControlGeneration ||
-        configGeneration != boundConfigGeneration) {
+        configGeneration != boundConfigGeneration || managerOpen != boundManagerOpen) {
       clearBindings();
       // Discard messages from the old registration before reusing OS IDs.
       while (PeekMessageW(&message, nullptr, WM_HOTKEY, WM_HOTKEY, PM_REMOVE)) {}
@@ -121,17 +162,19 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
       std::string selectedModPath;
       std::vector<EiemModHotkeyBinding> modKeys = EiemGetModKeyBindings(
           &modGeneration, &controlGeneration, &selectedModPath,
-          foreground != hwnd);
+          EiemModUsesUiKeyScope(foreground == hwnd,
+                                foreground == g_modUiHwnd, managerOpen));
       int nextId = 1;
       auto bind = [&](EiemKeyChord chord, EiemModKeyBehavior behavior,
-                      KeyAction action) {
+                      KeyAction action) -> bool {
         int id = nextId++;
         if (id > 0xBFFF || !RegisterHotKey(nullptr, id, chord.modifiers | MOD_NOREPEAT, chord.vk)) {
           Log("[HOTKEY] registration failed vk=%u modifiers=%u err=%lu; change key in INI",
               chord.vk, chord.modifiers, GetLastError());
-          return;
+          return false;
         }
         registered.push_back({id, chord, behavior, action, modGeneration});
+        return true;
       };
       const bool ownedForeground = foreground == hwnd || (g_guiHwnd && foreground == g_guiHwnd) ||
                                   (g_modUiHwnd && foreground == g_modUiHwnd);
@@ -139,8 +182,29 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
                                 KeyAction::Manager);
       if (ownedForeground) {
         bind(config.reload, EiemModKeyBehavior::Cycle, KeyAction::Reload);
+        const EiemKeyChord physicsCapture{VK_F12,0};
+        const EiemKeyChord physicsFallback{VK_F12,MOD_CONTROL};
+        bool fallbackBound=false;
+        if (kEiemEnableNativePhysicsObservation &&
+            !(physicsCapture == config.reload) && !(physicsCapture == config.gui)) {
+          if (!bind(physicsCapture,EiemModKeyBehavior::Cycle,
+                    KeyAction::PhysicsCapture)) {
+            bool fallbackConflict=physicsFallback == config.reload ||
+                                  physicsFallback == config.gui;
+            for (const auto &binding:modKeys)
+              fallbackConflict |= binding.chord == physicsFallback;
+            if (!fallbackConflict)
+              fallbackBound=bind(physicsFallback,EiemModKeyBehavior::Cycle,
+                                 KeyAction::PhysicsCapture);
+            if (fallbackBound)
+              Log("[HOTKEY] F12 unavailable; physics capture fallback=Ctrl+F12");
+          }
+        }
         for (const auto &binding : modKeys) {
-          if (binding.chord == config.reload || binding.chord == config.gui) {
+          if (binding.chord == config.reload || binding.chord == config.gui ||
+              (kEiemEnableNativePhysicsObservation &&
+               (binding.chord == physicsCapture ||
+                (fallbackBound && binding.chord == physicsFallback)))) {
             Log("[HOTKEY] mod key conflicts with global shortcut vk=%u modifiers=%u; mod shortcut disabled",
                 binding.chord.vk, binding.chord.modifiers);
             continue;
@@ -152,6 +216,7 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
       boundModGeneration = modGeneration;
       boundControlGeneration = controlGeneration;
       boundConfigGeneration = configGeneration;
+      boundManagerOpen = managerOpen;
       Log("[HOTKEY] bindings updated count=%zu modGeneration=%ld configGeneration=%ld",
           registered.size(), modGeneration, configGeneration);
     }
@@ -159,6 +224,7 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
       if (!g_pluginActive) continue;
       for (const auto &binding : registered) {
         if (binding.id != (int)message.wParam) continue;
+        if (!takePressEdge(binding.chord)) break;
         HWND currentForeground = GetForegroundWindow();
         if (binding.action == KeyAction::Manager) {
           if (currentForeground == hwnd || currentForeground == g_guiHwnd || currentForeground == g_modUiHwnd)
@@ -166,6 +232,11 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
         } else if (currentForeground == hwnd || currentForeground == g_guiHwnd || currentForeground == g_modUiHwnd) {
           if (binding.action == KeyAction::Reload)
             EiemRequestModUpdate(EiemModUpdate::Reload, "global reload hotkey");
+          else if (binding.action == KeyAction::PhysicsCapture) {
+            if (!PostMessageW(hwnd,WM_EIEM_PHYSICS_CAPTURE,0,0))
+              Log("[HOTKEY] could not queue F12 physics capture err=%lu",
+                  GetLastError());
+          }
           else if (!PostMessageW(hwnd, WM_EIEM_MOD_KEY,
                                  MAKEWPARAM(binding.chord.vk, binding.chord.modifiers),
                                  binding.generation))
@@ -181,13 +252,7 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
         if (binding.action != KeyAction::Cycle ||
             binding.behavior != EiemModKeyBehavior::Hold)
           continue;
-        const bool down = (GetAsyncKeyState((int)binding.chord.vk) & 0x8000) != 0 &&
-          (!(binding.chord.modifiers & MOD_CONTROL) ||
-           (GetAsyncKeyState(VK_CONTROL) & 0x8000)) &&
-          (!(binding.chord.modifiers & MOD_SHIFT) ||
-           (GetAsyncKeyState(VK_SHIFT) & 0x8000)) &&
-          (!(binding.chord.modifiers & MOD_ALT) ||
-           (GetAsyncKeyState(VK_MENU) & 0x8000));
+        const bool down = chordDown(binding.chord);
         if (!down) {
           binding.holdTick = 0;
           continue;

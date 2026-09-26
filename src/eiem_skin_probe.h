@@ -156,6 +156,11 @@ struct Result {
   Bounds skinnedBounds;
   float staticLongest = 0.0f;
   float skinnedLongest = 0.0f;
+  size_t validSkinMatrices = 0;
+  size_t skinMatricesNearIdentity = 0;
+  float minSkinIdentityError = 0.0f;
+  float maxSkinIdentityError = 0.0f;
+  float maxSkinTranslation = 0.0f;
   // Displacement of the skinned box from where the mesh sits, measured about
   // the Renderer's own world origin. The raw difference is dominated by the
   // character's world position (bone matrices are world space, mesh vertices
@@ -268,12 +273,28 @@ static Result Measure(void *renderer) {
   }
 
   std::vector<Matrix> skin(bones.size());
+  float minimumIdentityError = 1.0e30f;
   for (size_t index = 0; index < bones.size(); ++index) {
     Matrix world;
     if (!ReadLocalToWorld(bones[index], &world)) continue;
     skin[index] = EiemSkinProbe::SkinningMatrix(
         world, index < bindposes.size() ? &bindposes[index] : nullptr);
+    const float identityError =
+        EiemSkinProbe::IdentityError(skin[index]);
+    ++result.validSkinMatrices;
+    if (identityError <= 1.0e-3f) ++result.skinMatricesNearIdentity;
+    if (identityError < minimumIdentityError)
+      minimumIdentityError = identityError;
+    if (identityError > result.maxSkinIdentityError)
+      result.maxSkinIdentityError = identityError;
+    const float translation =
+        EiemSkinProbe::TranslationMagnitude(skin[index]);
+    if (translation > result.maxSkinTranslation)
+      result.maxSkinTranslation = translation;
   }
+  result.minSkinIdentityError = result.validSkinMatrices
+                                    ? minimumIdentityError
+                                    : 0.0f;
 
   const size_t stride =
       vertices.size() > kSampleLimit ? vertices.size() / kSampleLimit : 1;
@@ -332,6 +353,8 @@ static void LogResult(const char *tag, const Result &result) {
         "degenPose=%zu verts=%zu sampled=%zu stride=%zu unweighted=%zu "
         "static=[%.4f %.4f %.4f] staticMax=%.4f "
         "skinned=[%.4f %.4f %.4f] skinnedMax=%.4f "
+        "skinMatrices=%zu nearIdentity=%zu idErr=[%.6g %.6g] "
+        "maxSkinTranslation=%.6g "
         "rbounds=[%.4f %.4f %.4f] rMax=%.4f rCenter=[%.1f %.1f %.1f] "
         "centerShift=%.4f poseHash=%016llX verdict=%s",
         tag, result.rendererName[0] ? result.rendererName : "<unnamed>",
@@ -342,6 +365,9 @@ static void LogResult(const char *tag, const Result &result) {
         result.vertexBounds.SizeZ(), result.staticLongest,
         result.skinnedBounds.SizeX(), result.skinnedBounds.SizeY(),
         result.skinnedBounds.SizeZ(), result.skinnedLongest,
+        result.validSkinMatrices, result.skinMatricesNearIdentity,
+        result.minSkinIdentityError, result.maxSkinIdentityError,
+        result.maxSkinTranslation,
         result.rendererBounds.SizeX(), result.rendererBounds.SizeY(),
         result.rendererBounds.SizeZ(), result.rendererBounds.Longest(),
         result.rendererBounds.CenterX(), result.rendererBounds.CenterY(),
@@ -353,6 +379,8 @@ static void LogResult(const char *tag, const Result &result) {
       "degenPose=%zu verts=%zu sampled=%zu stride=%zu unweighted=%zu "
       "static=[%.4f %.4f %.4f] staticMax=%.4f "
       "skinned=[%.4f %.4f %.4f] skinnedMax=%.4f "
+      "skinMatrices=%zu nearIdentity=%zu idErr=[%.6g %.6g] "
+      "maxSkinTranslation=%.6g "
       "rbounds=<unread> centerShift=%.4f poseHash=%016llX verdict=%s",
       tag, result.rendererName[0] ? result.rendererName : "<unnamed>",
       result.mesh, result.boneCount, result.nullBones,
@@ -361,7 +389,10 @@ static void LogResult(const char *tag, const Result &result) {
       result.unweighted, result.vertexBounds.SizeX(), result.vertexBounds.SizeY(),
       result.vertexBounds.SizeZ(), result.staticLongest,
       result.skinnedBounds.SizeX(), result.skinnedBounds.SizeY(),
-      result.skinnedBounds.SizeZ(), result.skinnedLongest, result.centerShift,
+      result.skinnedBounds.SizeZ(), result.skinnedLongest,
+      result.validSkinMatrices, result.skinMatricesNearIdentity,
+      result.minSkinIdentityError, result.maxSkinIdentityError,
+      result.maxSkinTranslation, result.centerShift,
       (unsigned long long)result.bindposeHash, result.verdict);
 }
 

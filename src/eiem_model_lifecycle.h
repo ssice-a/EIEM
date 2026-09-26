@@ -35,8 +35,7 @@ struct EiemModelInstanceState {
   EiemUnityRef modelRef;
   uint32_t instanceUid = 0;
   char path[768] = {};
-  EiemModelOwnerRef owners[4] = {};
-  uint32_t ownerCount = 0;
+  std::vector<EiemModelOwnerRef> owners;
   // Declarative snapshots only. Native component handles and retirement
   // state live in the Physics runtime adapter, not in this registry.
   std::vector<EiemPhysicsIntent> physicsIntents;

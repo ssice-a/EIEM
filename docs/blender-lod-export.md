@@ -18,7 +18,7 @@ mesh=MeshBody_lod0
 
 按键切换变量只声明一次。每个 LOD 的 Render 规则复用同一个变量和相同的 submesh 条件，因此世界、NPC、UI 实例以及不同 LOD 共享同一 Mod 状态。导出器不会创建 `asset=*lod*` 通配规则，也不会新增 DLL LOD Hook。
 
-同一源资源的多个部件先按稳定顺序合并为一份 Mesh；所有目标 LOD 复用这份合并结果和同一套全局 submesh 槽位。模板的顶点权重、bindpose、骨骼路径及 EIEMESH v5“源 Mesh + 原始槽号”记录保持不变。目标 LOD 只负责命中游戏 Renderer，不会把 LOD0 权重索引重新解释成 LOD1/2/3 各自的原生 `bones[]` 顺序。
+同一源资源的多个部件先按稳定顺序合并为一份 Mesh；所有目标 LOD 复用这份合并结果和同一套全局 submesh 槽位。模板的顶点权重、bindpose、骨骼路径及 EIEMESH v6“源 Mesh + 原始槽号候选”记录保持不变。目标 LOD 只负责命中游戏 Renderer，不会把 LOD0 权重索引重新解释成 LOD1/2/3 各自的原生 `bones[]` 顺序。
 
 这一约束是蒙皮正确性的组成部分。游戏的各原生 LOD Renderer 可以拥有不同长度或不同顺序的局部骨骼 palette；复制同一几何后若把来源槽改成目标 LOD 的同序号槽，局部顶点会被错误骨骼拉伸。共享一份模板 Mesh 后，DLL 始终在当前世界、NPC 或 UI 实例内按模板记录的源槽取得 Transform。
 

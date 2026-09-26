@@ -1,5 +1,6 @@
 from pathlib import Path
 import unittest
+from runtime_source import read_runtime_source
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,7 +15,7 @@ class NativePhysicsRuntimeContracts(unittest.TestCase):
         cls.skeleton_runtime = (
             ROOT / "src" / "eiem_skeleton_runtime.h"
         ).read_text(encoding="utf-8")
-        cls.trace = (ROOT / "src" / "il2cpp_trace.h").read_text(encoding="utf-8")
+        cls.trace = read_runtime_source(ROOT)
         cls.registration = (
             ROOT / "src" / "eiem_registration_trace.h"
         ).read_text(encoding="utf-8")
@@ -49,7 +50,10 @@ class NativePhysicsRuntimeContracts(unittest.TestCase):
             self.runtime.index("static size_t EiemPhysicsRuntimeRetireChangedAssets")
         ]
         self.assertIn("if (!kEiemEnableExperimentalPhysicsRuntime) return;", reconcile)
-        self.assertIn("if (!kEiemEnableNativePhysicsObservation) return;", self.diagnostic)
+        self.assertIn(
+            "if (!kEiemEnableNativePhysicsObservation || !hwnd) return;",
+            self.diagnostic,
+        )
 
     def test_physics_mode_is_reported_once_at_resource_trace_start(self):
         self.assertIn("[PHYSICS-MODE] experimentalRuntime=%s nativeObservation=%s", self.trace)
@@ -187,9 +191,10 @@ class NativePhysicsRuntimeContracts(unittest.TestCase):
         self.assertIn("retry-suppressed", reconcile)
         self.assertIn("failure.assetStamp ==", reconcile)
 
-    def test_shutdown_only_finishes_the_trace(self):
+    def test_manual_capture_finishes_trace_before_export(self):
         finish = self.diagnostic[
-            self.diagnostic.index("static void EiemFinishPhysicsAutoTraceOnUnityThread") :
+            self.diagnostic.index("static void EiemFinishPhysicsManualCaptureOnUnityThread") :
+            self.diagnostic.index("static void EiemStartPhysicsManualCaptureOnUnityThread")
         ]
         self.assertNotIn("EiemPhysicsFactoryProbe", finish)
         self.assertLess(finish.index("EiemPhysicsStopTrace"),

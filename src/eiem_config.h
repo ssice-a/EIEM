@@ -1,4 +1,5 @@
 #pragma once
+#include "eiem_file_io.h"
 #include "eiem_keys.h"
 #include <fstream>
 #include <cstdio>
@@ -7,7 +8,7 @@
 struct EiemGlobalConfig {
   EiemKeyChord reload{VK_F10, 0};
   EiemKeyChord gui{VK_INSERT, 0};
-  bool disableCameraFade = false;
+  bool disableCameraFade = true;
 };
 
 static constexpr const char *kEiemGlobalConfigPath = "plugin\\eiem.ini";
@@ -19,7 +20,7 @@ static constexpr const char *kEiemDefaultGlobalConfig =
     "gui=INSERT\n"
     "\n[Graphics]\n"
     "; Disable CameraMono camera fade; Mod mesh/skip state is unchanged.\n"
-    "disable_camera_fade=false\n";
+    "disable_camera_fade=true\n";
 
 // Parse separately from publication/registration so the same API is testable.
 static bool EiemParseGlobalConfig(std::istream &input, EiemGlobalConfig *out,
@@ -82,9 +83,10 @@ static EiemGlobalConfig EiemGetGlobalConfig() {
 }
 
 static bool LoadEiemConfig() {
-  if (GetFileAttributesA(kEiemGlobalConfigPath) == INVALID_FILE_ATTRIBUTES) {
-    CreateDirectoryA("plugin", nullptr);
-    HANDLE file = CreateFileA(kEiemGlobalConfigPath, GENERIC_WRITE, FILE_SHARE_READ,
+  const auto configPath = std::filesystem::u8path(kEiemGlobalConfigPath);
+  if (GetFileAttributesW(configPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    CreateDirectoryW(L"plugin", nullptr);
+    HANDLE file = CreateFileW(configPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
                               nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file != INVALID_HANDLE_VALUE) {
       DWORD written = 0;
@@ -94,7 +96,7 @@ static bool LoadEiemConfig() {
       CloseHandle(file);
     }
   }
-  std::ifstream input(kEiemGlobalConfigPath, std::ios::binary);
+  auto input = EiemOpenUtf8Input(kEiemGlobalConfigPath);
   EiemGlobalConfig next;
   std::string error;
   if (!input || !EiemParseGlobalConfig(input, &next, error)) {

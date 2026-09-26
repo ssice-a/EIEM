@@ -1,6 +1,6 @@
 ﻿# 条件与按键配置
 
-状态：已实现 DLL 解析、求值、按 Mod 隔离的按键调度、内置 Mod 管理器与同一 Mesh 上的 submesh 索引更新。v1.0.0 已通过世界、角色 UI、NPC 三端实机验收。
+状态：已实现 DLL 解析、求值、按 Mod 隔离的按键调度、内置 Mod 管理器与同一 Mesh 上的 submesh 索引更新。当前重构候选仍需世界、角色 UI、NPC 三端实机验收。
 作者端操作见[Blender 切换流程](blender-switches.md)，当前能力和验证等级见[文档索引](README.md)。
 
 ## 固定的全局配置
@@ -14,7 +14,7 @@ reload=F10
 gui=INSERT
 
 [Graphics]
-disable_camera_fade=false
+disable_camera_fade=true
 ```
 
 `reload` 重读全局设置及所有 mod；普通变量使用 `[Constants]` 初始值，`persist` 变量恢复该 Mod 保存的玩家值。
@@ -23,16 +23,14 @@ v47 的保存文件和默认值恢复方式见 [作者状态与材质导入](aut
 `gui` 打开内置 Mod 管理器。两者不得相同；mod 按键不能占用这两个全局组合。
 ApplePie 的配置入口指向 `eiem.ini`，刷新接口同样只向 Unity 线程提交 Reload。
 
-管理器只列出声明了 `[Key...]` 的 Mod，并以可横向滚动的 Tab 显示 Mod 文件夹名。选择一个 Mod 后，普通快捷键只注册并修改该 Mod；
-其他 Mod 即使使用相同按键也不会同时切换。选中 Tab 下方的 Key 按钮只触发被点击的 section，
-同一 Mod 内共用快捷键的其他 Key section 不会被按钮连带触发。该 Mod 的世界、角色 UI 和 NPC
-实例继续共享同一组变量。F10 后若所选 Mod 仍存在则保留选择；被删除时回退到第一个含 Key 的 Mod。
-Tab 使用完整 Mod 路径作为内部标识，避免同名文件夹冲突。选择是本次进程的控制焦点，不写入 Mod 的持久变量文件。
+管理器列出声明了 `[Key...]` 或有 `shape.*` 控制变量的 Mod。启动时默认选中第一个带 `[Key...]` 的 Mod；若只有形态控制，则选中第一个有滑块的 Mod。可以从下拉列表改选；F10 后保留仍存在的选择，所选 Mod 删除时自动回退到可切换 Mod。所选 Mod 的 Key 按钮只触发对应 section；按住 `type=hold` 按钮持续推进到目标。形态键即使没有按键或 Lua UI 也有内置滑块，范围来自 `[ShapeControl...]`，旧包可用默认范围。世界、角色 UI、NPC 的同一 Mod 实例共享变量。内置管理器获得焦点时，所选 Mod 的普通 `scope=game` 快捷键仍生效；作者 Lua UI 单独获得焦点时继续使用 `scope=ui`。Lua UI 的变量事务不受管理器选择限制。选择只保留在本次进程。
 
 `disable_camera_fade` 控制相机渐隐，详见 [相机反虚化](camera-fade.md)，不改变 Mod 显隐规则。
 
+DLL 将 Mod 文件夹名、`mod.ini`、资源相对路径和内置段名按 UTF-8 处理。可以使用中文文件夹、Mesh/Material/Texture/Skeleton/Physics/Lua 文件名，以及 `[Mesh衣服]`、`[Render衣服]` 等带类型前缀的中文段名；引用名称必须与声明一致。`mod.ini` 建议保存为 UTF-8（可带 BOM），变量名及段类型前缀仍遵守下文语法。资源 `path=` 仍须是 Mod 内的相对路径，不能用 `..` 跳出目录。文件访问、缓存时间戳、状态保存和 F10 重载使用同一 UTF-8 路径约定。
+
 全局配置写错时明确记录错误，保持最后有效的设置（含快捷键与相机反虚化），防止失去修正配置的入口；
-不尝试别的文件，也不使用另一套解析路径。普通 mod 文件非法则整文件不发布，不保留其旧动作。
+不尝试别的文件，也不使用另一套解析路径。任一已发现的 mod 文件非法时，本次 F10 候选代际整体拒绝，现有规则和实例保持最后一次有效状态。
 
 ## 一个按键切换原版、修改版、隐藏
 

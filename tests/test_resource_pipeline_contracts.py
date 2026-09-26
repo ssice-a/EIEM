@@ -1,5 +1,6 @@
 from pathlib import Path
 import unittest
+from runtime_source import read_runtime_source
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -8,7 +9,8 @@ ROOT = Path(__file__).resolve().parents[1]
 class RuntimeHookContracts(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.trace = (ROOT / "src" / "il2cpp_trace.h").read_text(encoding="utf-8")
+        cls.trace = read_runtime_source(ROOT)
+        cls.features = (ROOT / "src" / "eiem_runtime_features.h").read_text(encoding="utf-8")
         cls.mods = (ROOT / "src" / "eiem_mod_document.h").read_text(encoding="utf-8") + (ROOT / "src" / "eiem_mods.h").read_text(encoding="utf-8")
         cls.api = (ROOT / "src" / "il2cpp_api.h").read_text(encoding="utf-8")
         cls.trojan = (ROOT / "src" / "trojan.h").read_text(encoding="utf-8")
@@ -66,7 +68,8 @@ class RuntimeHookContracts(unittest.TestCase):
             body,
         )
         self.assertIn("resource dependent edits skipped after mesh failure", body)
-        self.assertIn("if (resourceCommitted)\n    EiemRememberRuleBinding", body)
+        self.assertLess(body.index("if (!resourceCommitted) {\n    const bool restored"),
+                        body.index("EiemRememberRuleBinding(renderer, rule)"))
         self.assertLess(
             body.index("EiemBuildRendererMaterialsForSource"),
             body.index("EiemBeginMeshWrite(renderer)"),
@@ -96,10 +99,11 @@ class RuntimeHookContracts(unittest.TestCase):
         self.assertNotIn("EiemPendingUIModelCallback", self.trace)
         self.assertNotIn("EiemCancelPendingUIModelCallbacks", self.trace)
 
-    def test_cached_model_allocation_only_reapplies_known_instances(self):
+    def test_cached_model_allocation_does_not_commit_inside_native_allocation(self):
         start = self.trace.rindex("static void TraceModelManagerGameObjectAllocate")
         body = self.trace[start : start + 700]
-        self.assertIn("EiemReapplyRegisteredModelInstance", body)
+        self.assertIn("original(self, model, methodInfo)", body)
+        self.assertNotIn("EiemReapplyRegisteredModelInstance", body)
         self.assertNotIn("EiemRegisterAndApplyModelInstance", body)
 
     def test_f10_reconcile_only_walks_registered_model_instances(self):
@@ -271,23 +275,85 @@ class RuntimeHookContracts(unittest.TestCase):
             body.index("EiemApplyStandaloneRenderRulesToRenderer"),
         )
         self.assertLess(
-            body.index("if (s_eiemEntityRenderHelperInitGuard) return;"),
+            body.index("if (s_eiemEntityRenderHelperInitGuard) {"),
             body.index("EiemApplyStandaloneRenderRulesToRenderer"),
+        )
+        self.assertIn("s_eiemMaterialsToReapplyAfterHelper.push_back(renderer)", body)
+        material_start = self.trace.rindex(
+            "static void TraceEntityRenderHelperMaterialControllerInit"
+        )
+        material_end = self.trace.index(
+            "static void TraceEntityRenderHelperInitRenderAndMaterial",
+            material_start,
+        )
+        helper = self.trace[material_start:material_end]
+        self.assertNotIn('EiemReapplyRendererMaterialsAfterCommit(', helper)
+        outer_start = self.trace.rindex(
+            "static void TraceEntityRenderHelperInitRenderAndMaterial"
+        )
+        outer_end = self.trace.index(
+            "static bool EiemApplyStandaloneRenderRulesToRenderer", outer_start
+        )
+        outer = self.trace[outer_start:outer_end]
+        self.assertIn('EiemReapplyRendererMaterialsAfterCommit(', outer)
+        self.assertLess(
+            outer.index("if (original) original(self, methodInfo);", outer.index("const bool outermost")),
+            outer.index('EiemReapplyRendererMaterialsAfterCommit('),
         )
         self.assertIn('"RendererInfo._Init"', body)
         self.assertNotIn("allowPartnerCreation", body)
         self.assertIn("EiemReapplyRendererMaterialsAfterCommit", body)
         self.assertNotIn("EiemApplyPrefabRules", body)
 
+    def test_reload_replays_registered_instances_without_reentering_creation_helper(self):
+        start = self.trace.index("static void EiemRunModReconcile() {")
+        end = self.trace.index("static void *s_origAssetBundleLoadAsset1", start)
+        body = self.trace[start:end]
+        self.assertIn("EiemApplyStandaloneRenderRules(", body)
+        self.assertNotIn("EiemRebuildNativeRendererRegistration(", body)
+
     def test_resources_apply_at_enclosing_model_assembly_boundaries(self):
+        material_start = self.trace.rindex(
+            "static void TraceEntityRenderHelperMaterialControllerInit"
+        )
+        material_end = self.trace.index(
+            "static void TraceEntityRenderHelperInitRenderAndMaterial",
+            material_start,
+        )
+        material = self.trace[material_start:material_end]
+        self.assertIn("EiemLogMaterialControllerRegistry(self, renderers, \"before-original\")", material)
+        self.assertLess(
+            material.index("EiemApplyStandaloneRenderRules("),
+            material.rindex(
+                "original(self, renderers, rendererTypeConfigs,"
+            ),
+        )
+        self.assertIn("s_eiemEntityRenderHelperActiveModel", material)
+
+        helper_start = self.trace.rindex(
+            "static void TraceEntityRenderHelperInitRenderAndMaterial"
+        )
+        helper_end = self.trace.index(
+            "static bool EiemApplyStandaloneRenderRulesToRenderer", helper_start
+        )
+        helper = self.trace[helper_start:helper_end]
+        self.assertNotIn(
+            'EiemApplyStandaloneRenderRules(\n        model, "EntityRenderHelper._InitRenderAndMaterial-before"',
+            helper,
+        )
+        self.assertIn('EntityRenderHelper.MaterialController.Init-before', material)
+        self.assertIn("s_eiemEntityRenderHelperMaterialApplied", helper)
+        self.assertNotIn("s_eiemEnclosingModelAssemblyDepth == 0", helper)
+
         base_start = self.trace.rindex("static void TraceBasePartPostDeal")
         base_end = self.trace.index("static void TraceComplexPartPostDeal", base_start)
         base = self.trace[base_start:base_end]
         self.assertLess(
-            base.index("EiemApplyStandaloneRenderRules"),
             base.index("original(self, methodInfo)"),
+            base.index("EiemRegisterBaseModelViewPartInstance"),
         )
-        self.assertIn("PostDealLoadedModel-before", base)
+        self.assertIn("PostDealLoadedModel\", true", base)
+        self.assertNotIn("PostDealLoadedModel-before", base)
 
         for name in ("TraceCreateSmsGo", "TraceCreateSmsPost"):
             start = self.trace.index(f"static void {name}")
@@ -297,11 +363,19 @@ class RuntimeHookContracts(unittest.TestCase):
 
         for name in ("TraceAssignSkinGo", "TraceAssignSkinPost"):
             start = self.trace.index(f"static void {name}")
-            body = self.trace[start : start + 2200]
+            body = self.trace[start : self.trace.index(
+                "static void TraceSetSmrRootBone", start)]
             self.assertLess(
                 body.index("original(lod, renderers"),
-                body.index("EiemApplyStandaloneRenderRulesToSkinArray"),
+                body.index("EiemRememberAssemblyBoneSnapshot"),
             )
+            self.assertNotIn("EiemApplyStandaloneRenderRulesToSkinArray", body)
+
+    def test_mesh_commit_hides_every_changed_skin_transaction(self):
+        start = self.trace.index("static bool EiemApplyResolvedRenderRule")
+        end = self.trace.index("static bool EiemApplyRenderRuleSetToRenderer", start)
+        body = self.trace[start:end]
+        self.assertIn("if ((meshWillChange || bonesWillChange) &&", body)
 
     def test_per_renderer_mesh_setters_defer_resource_replay(self):
         for name in ("TraceSkinnedMeshSetSharedMesh", "TraceMeshFilterSetSharedMesh"):
@@ -309,6 +383,25 @@ class RuntimeHookContracts(unittest.TestCase):
             body = self.trace[start : start + 1800]
             self.assertNotIn("EiemApplyStandaloneRenderRulesToRenderer", body)
             self.assertIn("completed assembly boundaries", body)
+
+        start = self.trace.rindex("static void TraceSkinnedMeshSetBones")
+        end = self.trace.index("static void *EiemFindSourceLodGroup", start)
+        bones = self.trace[start:end]
+        self.assertIn("EiemRememberGameSourceBones", bones)
+        self.assertIn("EiemQueueNativeSkinRefresh", bones)
+        self.assertNotIn("EiemPreserveSourceSkinning", bones)
+
+    def test_creation_boundary_owns_cold_and_replay_registration(self):
+        self.assertNotIn("EiemRunDelayedNativeRendererReplay", self.trace)
+        self.assertNotIn("EiemRebuildNativeRendererRegistration", self.trace)
+        self.assertNotIn("kEiemDeferInitialSkinCommit", self.features)
+
+        reconcile = self.trace[self.trace.index("static void EiemRunModReconcile") :]
+        self.assertIn("restoreComplete = EiemRestoreRenderOverrides(affected)", reconcile)
+        self.assertIn("if (restoreComplete && affected) EiemPublishModState", reconcile)
+        self.assertNotIn("EiemRebuildNativeRendererRegistration(\n             instance.model", reconcile)
+        self.assertIn("applied = EiemApplyStandaloneRenderRules(\n", reconcile)
+        self.assertIn("EiemRenderReplayLedger replayLedger", reconcile)
 
     def test_value_type_asset_handle_is_unboxed_before_instance_methods(self):
         self.assertIn("il2cpp_object_unbox", self.api)
@@ -409,13 +502,22 @@ class RuntimeHookContracts(unittest.TestCase):
         resolver_end = self.trace.index(
             "static bool EiemPreserveSourceSkinning", resolver_start)
         resolver = self.trace[resolver_start:resolver_end]
+        donor_palette = resolver.index(
+            "if (identity.sourceCandidates.size() == identity.paths.size()")
         source_palette = resolver.index(
             "if (identity.sources.size() == identity.paths.size())")
-        hierarchy_api = resolver.index("if (!g_transform_get_parent")
-        self.assertLess(source_palette, hierarchy_api)
+        self.assertLess(donor_palette, source_palette)
+        self.assertIn("binding=instance-donor-candidates", resolver)
+        self.assertIn("Replacement bone has no native Mesh donor", resolver)
         self.assertIn("binding=instance-source", resolver)
         self.assertIn("s_eiemLiveSkinSources", resolver)
         self.assertIn("Replacement bone source is ambiguous", resolver)
+        self.assertIn("completed unified skeleton root", resolver)
+        self.assertIn("mapDonorToTargetSkeleton", resolver)
+        self.assertIn("childIndexPath", resolver)
+        self.assertIn("EIEMESH has no native source-Mesh slot records", resolver)
+        self.assertNotIn("EiemSkinRootPath", resolver)
+        self.assertNotIn("byPath.find(path)", resolver)
         for character_specific in (
                 "typhoe", "cloth_", "body_", "skirt_", "actor_"):
             self.assertNotIn(character_specific, resolver.lower())
@@ -501,6 +603,17 @@ class RuntimeHookContracts(unittest.TestCase):
         self.assertNotIn("fileStamp ^= (uint64_t)rule.hiddenSubmeshMask", build)
         self.assertNotIn("rule.hiddenSubmeshMask)) return false", build)
 
+    def test_mesh_cache_identity_includes_the_full_reload_generation(self):
+        build_start = self.backend.index("static bool EiemBuildMeshResource")
+        build_end = self.backend.index("static bool EiemResolveResourceDiskPath", build_start)
+        build = self.backend[build_start:build_end]
+        # Every F10 salts the source stamp with a fresh generation, even
+        # when the author did not change files. No role-specific bypass.
+        self.assertIn("const uint64_t sourceStamp = EiemMeshResourceFileStamp(fullPath);", build)
+        self.assertIn("EiemMeshCacheStamp(sourceStamp)", build)
+        self.assertNotIn("kEiemTestReuseUnchangedCloth01Mesh", build)
+        self.assertIn("static uint64_t EiemMeshCacheStamp", self.backend)
+
     def test_static_baseline_uses_minimal_mod_window_dispatcher(self):
         start = self.dispatcher.index("static LRESULT CALLBACK EiemModWndProc")
         end = self.dispatcher.index("static DWORD WINAPI HotkeyThread", start)
@@ -563,9 +676,9 @@ class RuntimeHookContracts(unittest.TestCase):
     def test_reconcile_begin_and_end_share_the_generation_trace(self):
         self.assertIn("EiemRegistrationTraceReconcile", self.trace)
         body = self.trace[self.trace.index("static void EiemRunModReconcile") :]
-        self.assertIn("s_eiemDeferredModReplayPending", body[:700])
         self.assertIn("if (!requests) return;", body[:1000])
-        self.assertIn("kEiemDeferredReplayRequest", body[:700])
+        self.assertNotIn("s_eiemDeferredModReplayPending", body)
+        self.assertNotIn("kEiemDeferredReplayRequest", body)
         self.assertIn('EiemRegistrationTraceReconcile("begin"', body)
         self.assertIn('EiemRegistrationTraceReconcile(\n      "end"', body)
         self.assertIn("inputs.size()", body)

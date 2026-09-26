@@ -280,7 +280,7 @@ public:
   bool LoadFile(const std::string &modIni, const std::string &relative) {
     try {
       namespace fs = std::filesystem;
-      if (!EiemUiRelativePath(relative)) throw std::runtime_error("Invalid UI relative path");
+      if (!EiemModRelativeFilePath(relative)) throw std::runtime_error("Invalid UI relative path");
       auto root = fs::canonical(fs::absolute(fs::u8path(modIni)).parent_path());
       auto path = fs::canonical(root / fs::u8path(relative));
       auto part = path.begin();

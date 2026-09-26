@@ -81,7 +81,7 @@ int main(int argc, char **argv) {
     int config = 1, applied = 1;
     // First lifecycle reconcile must not discard effects already applied by startup hooks.
     CHECK(queue.Request(EiemModUpdate::Reconcile));
-    EiemDispatchModUpdate(queue.Take(), [&] { order += 'S'; applied = 0; },
+    EiemDispatchModUpdate(queue.Take(), [&] { order += 'S'; applied = 0; return true; },
                          [&] { order += 'L'; ++config; }, [&] { order += 'A'; applied = config; });
     CHECK(order == "A" && applied == 1);
     order.clear();
@@ -89,16 +89,23 @@ int main(int argc, char **argv) {
     CHECK(!queue.Request(EiemModUpdate::Reload)); // must merge, not drop F10
     CHECK(!queue.Request(EiemModUpdate::Reapply));
     bool sawOldConfigDuringRestore = false, restoredBeforePublish = false;
-    EiemDispatchModUpdate(queue.Take(), [&] { order += 'S'; sawOldConfigDuringRestore = config == 1; applied = 0; },
+    EiemDispatchModUpdate(queue.Take(), [&] { order += 'S'; sawOldConfigDuringRestore = config == 1; applied = 0; return true; },
                          [&] { order += 'L'; restoredBeforePublish = applied == 0; ++config; },
                          [&] { order += 'A'; applied = config; });
     CHECK(order == "SLA" && applied == 2 && sawOldConfigDuringRestore && restoredBeforePublish);
     order.clear();
     CHECK(queue.Request(EiemModUpdate::Reapply));
-    EiemDispatchModUpdate(queue.Take(), [&] { order += 'S'; }, [&] { order += 'L'; }, [&] {
+    EiemDispatchModUpdate(queue.Take(), [&] { order += 'S'; return true; }, [&] { order += 'L'; }, [&] {
       order += 'A';
     });
     CHECK(order == "SA"); // future state changes do not reparse disk
+    order.clear();
+    const bool restoreAccepted = EiemDispatchModUpdate(
+        (uint32_t)EiemModUpdate::Reload,
+        [&] { order += 'S'; return false; },
+        [&] { order += 'L'; ++config; },
+        [&] { order += 'A'; applied = config; });
+    CHECK(!restoreAccepted && order == "SA" && config == 2 && applied == 2);
     CHECK(queue.Take() == 0);
     CHECK(queue.Request(EiemModUpdate::Reload)); // requests after drain are schedulable
     const uint32_t retry = queue.Take();

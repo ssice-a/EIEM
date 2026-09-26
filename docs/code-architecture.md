@@ -8,7 +8,7 @@
 |---|---|---|
 | EIEM | DLL、INI 运行时、游戏实例适配、资源提交与恢复 | 编辑作者数据、解析游戏 VFS |
 | EIEM-blender（`tools/Blender`） | Blender 导入、编辑、校验与导出 EIEM 资源 | 游戏对象生命周期、Unity API |
-| AnimeStudio（开发目录 `E:\vscode\AnimeStudio`） | VFS 解包、资源索引与离线检查 | Mod 运行时替换 |
+| AnimeStudio（`tools/AnimeStudio`） | VFS 解包、资源索引与离线检查 | Mod 运行时替换 |
 
 三端只通过有版本的文件格式交接。DLL 不读取 `.blend`，Blender 不调用游戏 Hook，AnimeStudio 不参与游戏运行时。
 
@@ -42,18 +42,23 @@ mod.ini
 `eiem_model_lifecycle.h` 保存通用 owner 类型与实例状态；`eiem_npc_model_owner.h` 及 `il2cpp_trace.h` 中的 world/UI adapters 只负责登记、激活、失活和释放模型实例。它们都调用同一个 Render executor。
 
 生命周期状态必须按具体模型实例保存。不同 PFB 可以有不同 Transform 对象，不能跨世界、UI、NPC 实例借用骨骼。
+同一实例可由多个 owner 同时登记；owner 使用动态集合，只有最后一个释放后才退役。具体审查记录见[架构审查](architecture-review-20260926.md)。
 
 ### Render replacement
 
-`eiem_resource_backend.h`、`eiem_skin_binding.h`、`eiem_render_state.h` 和 `il2cpp_trace.h` 中尚未拆出的 executor 负责 Mesh、Material、Texture、骨骼 palette、submesh 显隐及恢复。
+`eiem_resource_backend.h`、`eiem_skin_binding.h`、`eiem_render_state.h` 和 `eiem_render_executor.h` 负责 Mesh、Material、Texture、骨骼 palette、submesh 显隐及恢复。`eiem_render_replay.h` 的账本使一次 F10 更新中成功提交的 Renderer 只执行一次；绑定失败仍可在更完整的模型 owner 中重试。`eiem_mod_reconcile.h` 在 Unity 线程处理 F10 与按键更新。
 
-每次模型事务先对 SkinnedMeshRenderer 和 MeshFilter 各做一次层级快照。骨骼解析顺序为：
+Render executor 在写入前捕获源 Mesh、骨骼、材质、形态键和临时 enabled 状态。每个 Renderer 的写入失败后立即尝试恢复；恢复不完整则保留原对象引用、保持 `restorePending`，拒绝继续写入。F10 若有任一 Renderer 恢复不完整，不发布新 Mod program；已恢复的实例用旧 program 回放。`handling=skip` 的 enabled 所有权与 Mesh 提交时的短暂禁用分开，成功提交后仍由游戏管理非 skip Renderer 的 enabled。
 
-1. 当前实例中的完整名称路径；
-2. EIEMESH v5 记录的“源 Mesh 身份 + 原始 bones[] 槽号”；
-3. 当前实例内的层级索引路径。
+直接由 NPC/UI 的 `RendererInfo._Init` 入口装配的 Renderer 可能早于 Model instance 登记；完整模型遍历观察到同一存活 Renderer 时认领该 override。最终 Model instance 退役按 owner 清理。此路径已有独立宿主测试，游戏生命周期覆盖仍需实机验证。
 
-第二步解决同一原 Mesh 在不同 PFB 中骨骼名称不同的问题。映射不包含角色名、Mesh 名或裙骨等特例。
+每次模型事务先对 SkinnedMeshRenderer 和 MeshFilter 各做一次层级快照。EIEMESH v6 的骨骼解析只使用源 Mesh 供体；旧格式才走兼容回退：
+
+1. v6：当前实例内每个槽的“源 Mesh 身份 + 原始 bones[] 槽号”候选；
+2. v2-v5 兼容：源 Mesh 单一身份；
+3. v2-v4 兼容：当前实例内的层级索引路径与名称路径。
+
+v6 候选解析解决同一原 Mesh 在不同 PFB 中骨骼名称不同的问题；如果当前实例中多个候选指向不同 Transform，则拒绝绑定。映射不包含角色名、Mesh 名或裙骨等特例。
 
 ### 可选功能
 
@@ -70,14 +75,13 @@ mod.ini
 - 一次 Render 事务复用同一批 Renderer 快照，避免重复遍历和两个不同层级时刻之间的竞态。
 - `partner.N` 已从解析器、编译器、按键/F10 执行入口和 Hook 安装路径移除。
 - 旧 Partner 测试及历史诊断文档已删除。
-- 旧 Partner 实现块目前没有生产入口，后续应在拆出 Render executor 时物理删除，不能重新接回运行链。
+- 旧 Partner 实现块目前没有生产入口，但诊断和兼容字段仍引用部分定义；删除前必须逐个核对引用和测试，不能重新接回运行链。
 
 ## 下一步拆分顺序
 
-1. 从 `il2cpp_trace.h` 提取 update coordinator。
-2. 提取 model registry 和 world/UI lifecycle adapters。
-3. 提取 Renderer override ownership 与 Render executor。
-4. 删除无调用者的旧 Partner 实现及它专用的 Unity API 解析。
-5. 最后整理 Hook 安装与可选诊断。
+1. 已提取 update coordinator 和 Render executor，宿主测试通过；三端游戏验收仍待完成。
+2. 完成世界、UI、NPC 的材质重采样、直接入口 owner 认领和重复 owner 回放的实机验收，再决定是否部署为正式构建。
+3. 将 model registry 与 Renderer override ownership 从 Hook 宿主提取为独立模块；先固定现有故障注入测试，再移动代码。
+4. 通过引用检查删除无生产调用者的 Partner 实现及专用 Unity API，最后整理 Hook 安装与可选诊断。
 
 每一步都必须保持三端同一 Mesh 身份规则、F10 事务顺序和世界/UI/NPC 实例隔离，并运行完整单元测试与 DLL 构建。涉及 Unity 所有权或 Hook 顺序时，还需分别做世界、UI、NPC 的实机回归。

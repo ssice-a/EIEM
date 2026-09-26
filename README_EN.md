@@ -1,47 +1,79 @@
-# EIEM Importing Endfield MMD
-
-Mod authoring tools, current contracts and implementation status: [documentation index](docs/README.md).
+# EIEM: Endfield Resource Replacement
 
 English | [中文](README.md)
 
-Brings MMD animation playback to *Arknights: Endfield*. Supports muscle-driven body motion, facial expressions, finger animation, camera motion, and synced background music, all controlled through an in-game GUI panel.
+EIEM is an in-game resource replacement plugin for *Arknights: Endfield*. It replaces meshes, materials, and textures by source resource identity. Mod authors can extract source assets with [AnimeStudio](https://github.com/ssice-a/AnimeStudio), then edit and export a Mod with the [EIEM Blender add-on](https://github.com/ssice-a/EIEM-blender). Players installing an existing Mod do not need either authoring tool.
 
-example: [bilibili](https://www.bilibili.com/video/BV1YdEC6bEfP/)
+The development version may differ from a published build. Follow the notes for the Release you install.
 
-## v1.0.0 Resource Replacement
+## Features
 
-v1.0.0 is the first resource-replacement release. Mesh, material, and texture rules enter the game's existing Renderer assembly path, leaving animation, skinning, LOD, and instance lifetime under the game's own systems.
+- Replace meshes, materials, textures, and declared material parameters. One mesh can contain multiple submeshes and material slots.
+- Apply the same resource rules to world characters, character UI, and NPCs, including authored LOD rules.
+- Keep each Mod's switch and shape state separate. The in-game manager provides key buttons and shape sliders.
+- Press F10 to reload Mod configuration and resources for registered instances. Invalid configuration leaves the previous valid version active.
+- Configure the manager and reload shortcuts, as well as camera fade behavior, in the global INI.
+- Check this repository's Releases when the Mod manager opens; defer or ignore a specific version.
 
-### Available now
+## Download and install
 
-- Replace Mesh, materials, textures, and declared material parameters by resource identity.
-- Attach one merged Mesh to the target Renderer with multiple submeshes and material slots.
-- Use the same resource rules for world characters, character UI, and NPC instances without creating an independent Partner.
-- F10 hot reload updates existing instances and keeps the previous valid generation when parsing fails.
-- `cycle` toggles once per press; `hold` continuously moves shape values while held. Mod state is isolated per Mod.
-- Blender 0.32.0 supports LOD0-4 selection/template replication and selected Mesh-only export with materials and textures while skipping skeleton and physics export.
-- LOD export only targets levels discovered in the current project; each level gets an independent Mesh/Render rule while sharing the same switch state.
+Download the DLL package from **[EIEM Releases](https://github.com/ssice-a/EIEM/releases)**. Exit the game, then extract the ZIP into the directory containing `Endfield.exe`:
 
-### TODO
+```text
+game directory/
+├─ d3dcompiler_47.dll      # DirectX proxy loader
+├─ vulkan-1.dll            # Vulkan proxy loader
+└─ plugin/
+   ├─ eiem.dll
+   ├─ eiem.ini             # Global settings; created with defaults if absent
+   └─ mods/
+      └─ SomeMod/
+         ├─ mod.ini
+         └─ ...            # Preserve the Mod's resource folder structure
+```
 
-- Unified registration of added skeletons across world, UI, and NPC instances.
-- Native-factory integration for physics bones, colliders, and physics parameters.
-- Regression coverage and automated release validation across more game versions.
+Install either or both proxy loaders as appropriate for your graphics setup. If another plugin already supplies a compatible loader with the same filename, check how it loads plugins before replacing it. Create `plugin` and `mods` if needed. [Applepie Manager](https://github.com/Sasye/ApplepieManager) is optional.
 
-### Upstream acknowledgements
+To install a Mod, put the **folder containing `mod.ini`** directly inside `plugin/mods/`. Avoid an extra nested folder after extracting the archive. To update EIEM, exit the game first, replace the DLL and any necessary loader, and keep your own `plugin/eiem.ini` and `plugin/mods/`.
 
-- [AnimeStudio](https://github.com/Escartem/AnimeStudio) and its contributors provide the Unity asset browser, VFS access, dependency resolution, and export foundation. EIEM maintains the Endfield integration plus the Blender and DLL layers on top of it. AnimeStudio is MIT-licensed and its license is included with the extractor package.
-- Copyright and license information for [MinHook](https://github.com/TsudaKageyu/minhook), [Dear ImGui](https://github.com/ocornut/imgui), and other dependencies is in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
+## Use in game
 
-Release packages:
+1. Start the game and enter a scene containing the target character. Matching Mods apply automatically.
+2. Press **Insert** to open the Mod manager. Select a Mod to use its key buttons and shape sliders. Static Mods without controls can still apply automatically.
+3. Press **F10** after editing or adding Mod files to reload them.
 
-- `EIEM_v1.0.0_dll.zip`: DLL, proxy loaders, and configuration template.
-- [EIEM-blender](https://github.com/ssice-a/EIEM-blender): independently versioned Blender import, editing, and Mod export add-on.
-- [AnimeStudio fork](https://github.com/ssice-a/AnimeStudio): independently versioned Endfield VFS browser, extractor, and EIEM source-package exporter.
+Shortcuts can be changed in `plugin/eiem.ini`:
 
-The repositories communicate through versioned EIEM file formats. This repository owns the DLL runtime,
-normative contracts, and cross-repository integration tests. Tool revisions are pinned as submodules without
-duplicating their source or release artifacts. See [repository boundaries](docs/repository-architecture.md).
+```ini
+[Hotkeys]
+reload=F10
+gui=INSERT
+
+[Graphics]
+disable_camera_fade=true
+```
+
+After editing a shortcut, press the **old reload shortcut once** to load the new setting. See the [configuration guide](docs/conditional-keys.md) for Mod rules and additional keys.
+
+## Make a Mod
+
+1. Open the game's VFS in AnimeStudio, select a Prefab, and export an EIEM source package.
+2. Install and enable the EIEM Blender add-on, then import the source package's `mod.ini`.
+3. Edit meshes, materials, textures, switches, or shapes. Select the target meshes and export an EIEM Mod package.
+4. Place the exported folder in `plugin/mods/`, then press F10 in game to check the result.
+
+See the [AnimeStudio guide](tools/README.md) and [Blender add-on guide](https://github.com/ssice-a/EIEM-blender#readme) for detailed steps.
+
+## TODO
+
+- Complete cold-start and repeated hot-reload validation in world, character UI, and NPC contexts.
+- Complete native assembly of added bones, physics bones, and colliders.
+- Extend game-version compatibility checks and validation of all three release packages.
+
+## Acknowledgements
+
+- [AnimeStudio](https://github.com/Escartem/AnimeStudio) and its contributors provide the asset browsing, extraction, and export foundation; EIEM uses an independently maintained fork.
+- Copyright and licenses for [MinHook](https://github.com/TsudaKageyu/minhook), [Dear ImGui](https://github.com/ocornut/imgui), and other dependencies are in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
 
 ## User Agreement & Disclaimer
 
@@ -63,79 +95,3 @@ duplicating their source or release artifacts. See [repository boundaries](docs/
 - This project is for educational, technical research, and communication purposes only. All Arknights game data assets used in this plugin are copyrighted by Hypergryph. Using this tool may violate the game's terms of service and carries a risk of account suspension. For any loss directly or indirectly caused by using this plugin (including but not limited to account bans, game data corruption, etc.), **this project assumes no legal or financial liability**. Users bear all risks and are strongly advised to use it on a test account.
 
 </details>
-
-## Features
-
-### Implemented
-- **Muscle-driven motion**: Drives full-body animation via 95 muscle values
-- **Finger animation**: Independent rotation control for 30 finger bones
-- **Facial expressions**: Basic expressions including AIUEO, blinks, and smiling eyes
-- **Camera motion**: VMD camera keyframes (with character-facing alignment)
-- **Audio sync**: MCI backend plays WAV/MP3 BGM
-- **Terrain & staircase stepping**: Real-time ground collision probing, adaptively snapping to slopes and stairs
-- **Native IK**: Drives the game's native BipedIK solver using VMD foot IK data
-
-### In Progress
-- **Direct VMD playback mode**
-
-### Planned
-- Multi-character screen playback
-- ...
-
-## Download
-
-You can download the latest DLL release from [Releases](https://github.com/ssice-a/EIEM/releases) or compile it yourself from source.
-
-> Use [Applepie Manager](https://github.com/Sasye/ApplepieManager) to easily manage and configure this plugin.
-
-## Installation
-
-Copy the following files into the game directory (the folder containing `Endfield.exe`):
-
-```
-bin/eiem.dll             → game_dir/plugin/eiem.dll
-bin/vulkan-1.dll         → game_dir/vulkan-1.dll
-bin/d3dcompiler_47.dll   → game_dir/d3dcompiler_47.dll
-```
-
-> **Note**: `d3dcompiler_47.dll` (DX environment) and `vulkan-1.dll` (Vulkan environment) are proxy loaders. You can place either one or both. If you already use another plugin that shares a proxy loader (such as [AntiKick](https://github.com/Sasye/EndFieldAntiKick), [SynchroFocus](https://github.com/Sasye/EndfieldSynchroFocus), or [EndfieldCombatHUD](https://github.com/Sasye/EndfieldCombatHUD), etc.), there is no need to place the proxy loader again.
-
-> If you have **never installed a plugin of this type before**, you may need to create the `plugin` folder yourself.
-
-## Preparing Resource Files
-
-Auto-scans `game_dir/plugin/` or manually specify the following files:
-
-| File | Description | Required |
-|------|-------------|----------|
-| `muscle_anim.bin` | MUS4-format motion data (exported via ExportMuscleAnimation.cs) | **Yes** |
-| `*.vmd` | VMD file (facial expression morph data) | Optional (auto-scans .vmd in plugin dir) |
-| `camera.vmd` | Camera motion data | Optional |
-| `bgm.wav` or `bgm.mp3` | Background music | Optional |
-
-## Usage
-
-1. Install as described above, launch the game, and enter the game.
-2. Press **Insert** to open the GUI panel.
-3. Load the desired files, then click the **Play** button on the "Control" tab to start playback.
-
-## Motion Export (VMD → MUS4)
-
-You must first convert VMD animations to MUS4 format (`muscle_anim.bin`) using the Unity editor.
-
-### Prerequisites
-
-- Unity Editor
-- [MMD4Mecanim](https://stereoarts.jp/#:~:text=MMD4Mecanim_Beta_20200105.zip) — converts VMD to Unity AnimationClip
-- Any Humanoid MMD model
-
-### Steps
-
-1. Place `ExportMuscleAnimation.cs` into your Unity project's `Assets/Editor/` folder
-2. Import an MMD model (set to Humanoid Rig) and use MMD4Mecanim to convert a VMD file into an AnimationClip
-3. Create an Animator Controller and add the converted AnimationClip as the default state
-4. Assign the Animator Controller to the model in the scene
-5. **Select the model**, then click `Tools > Export Muscle Animation` in the menu bar
-6. The exported file `Assets/muscle_anim.bin` will be created — copy it to the game's `plugin/` directory
-
-> Facial expressions do not go through this export — simply place the original `.vmd` file in the `plugin/` directory and the plugin will parse the morph data automatically.

@@ -40,7 +40,7 @@ static void EiemNpcTraceStartNpc(void *avatar, void *component,
   if (model && component)
     EiemRegisterAndApplyModelInstance(
         EiemModelOwnerKind::NpcAvatar, component, model, nullptr, 0,
-        "NPCAvatar.StartNPC");
+        "NPCAvatar.StartNPC", false);
 }
 
 static void EiemNpcTraceReleaseAvatar(void *manager, void *component,

@@ -2,8 +2,6 @@
 #include "eiem_lua_ui.h"
 #include <wrl/client.h>
 
-static volatile LONG s_eiemModManagerOpen = 0;
-
 static void EiemToggleModManager() {
   LONG previous = InterlockedCompareExchange(&s_eiemModManagerOpen, 0, 0);
   while (InterlockedCompareExchange(&s_eiemModManagerOpen,
@@ -26,6 +24,7 @@ class EiemUiHost {
   Com<IDCompositionVisual> visual;
   LONG generation = -1;
   bool failed = false, shown = false, managerWasOpen = false;
+  bool updateDismissedForOpen = false;
   int width = 0, height = 0;
   struct Entry { EiemUiSnapshot snapshot; std::unique_ptr<EiemLuaUi> script; bool reported = false; };
   std::vector<Entry> entries;
@@ -135,26 +134,33 @@ class EiemUiHost {
     bool open = true;
     ImGui::SetNextWindowSize(ImVec2(620.0f, 420.0f), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("EIEM Mod Manager", &open)) {
-      // A scrollable tab bar keeps the manager usable with many Mods while
-      // retaining the full path as the stable ImGui/control identity.
       int selectedIndex = -1;
       for (size_t index = 0; index < controls.size(); ++index)
         if (controls[index].selected) { selectedIndex = (int)index; break; }
-      if (ImGui::BeginTabBar("##mods", ImGuiTabBarFlags_FittingPolicyScroll)) {
+      const std::string selectedLabel = selectedIndex >= 0
+          ? ModLabel(controls[(size_t)selectedIndex].modPath)
+          : "Select a Mod";
+      if (ImGui::BeginCombo("Mod", selectedLabel.c_str())) {
         for (size_t index = 0; index < controls.size(); ++index) {
           const auto &control = controls[index];
-          std::string tabLabel = ModLabel(control.modPath) + "##" + control.modPath;
-          if (ImGui::BeginTabItem(tabLabel.c_str(), nullptr,
-                                  control.selected ? ImGuiTabItemFlags_SetSelected
-                                                   : ImGuiTabItemFlags_None)) {
-            if (selectedIndex != (int)index) {
-              EiemSelectControlledMod(control.modPath);
-              selectedIndex = (int)index;
-            }
-            ImGui::EndTabItem();
+          const std::string label = ModLabel(control.modPath) + "##" + control.modPath;
+          if (ImGui::Selectable(label.c_str(), selectedIndex == (int)index) &&
+              EiemSelectControlledMod(control.modPath)) {
+            selectedIndex = (int)index;
           }
+          if (selectedIndex == (int)index) ImGui::SetItemDefaultFocus();
         }
-        ImGui::EndTabBar();
+        ImGui::EndCombo();
+      }
+      ImGui::SameLine();
+      const auto update = EiemGetUpdateSnapshot();
+      if (update.checking) ImGui::TextDisabled("Checking releases...");
+      else if (update.available) ImGui::Text("Update v%s", update.version.c_str());
+      else if (update.failed) ImGui::TextDisabled("Update check failed");
+      else if (update.latest) ImGui::TextDisabled("Up to date");
+      if (ImGui::SmallButton("Check updates")) {
+        updateDismissedForOpen = false;
+        EiemRequestUpdateCheck(true);
       }
       ImGui::Separator();
       const EiemModControlSnapshot *selected =
@@ -162,14 +168,18 @@ class EiemUiHost {
               ? &controls[(size_t)selectedIndex]
               : nullptr;
       if (!selected) {
-        ImGui::TextDisabled("No Mod with key controls is loaded.");
+        ImGui::TextDisabled("Select a Mod to use its keys and shape sliders.");
       } else {
+        ImGui::PushID(selected->modPath.c_str());
         ImGui::TextUnformatted(ModLabel(selected->modPath).c_str());
         ImGui::Separator();
         for (const auto &key : selected->keys) {
           ImGui::PushID(key.section.c_str());
           std::string label = key.section + "  [" + EiemFormatKeyChord(key.chord) + "]";
-          if (ImGui::Button(label.c_str(), ImVec2(-1.0f, 0.0f)) &&
+          const bool pressed = ImGui::Button(label.c_str(), ImVec2(-1.0f, 0.0f));
+          const bool holding = key.behavior == EiemModKeyBehavior::Hold &&
+                               ImGui::IsItemActive() && ImGui::IsMouseDown(0);
+          if ((holding || (pressed && key.behavior != EiemModKeyBehavior::Hold)) &&
               snapshotGeneration == generation) {
             EiemModInputEvent event;
             event.chord = key.chord;
@@ -177,6 +187,8 @@ class EiemUiHost {
             event.modPath = selected->modPath;
             event.uiFocus = key.scope != EiemKeyScope::Game;
             event.keySection = key.section;
+            event.holdTick = holding;
+            event.holdSeconds = ImGui::GetIO().DeltaTime;
             EiemQueueModInput(std::move(event));
           }
           for (const auto &assignment : key.assignments) {
@@ -186,9 +198,56 @@ class EiemUiHost {
           }
           ImGui::PopID();
         }
+        if (!selected->shapeControls.empty() && !selected->keys.empty())
+          ImGui::Separator();
+        for (const auto &shape : selected->shapeControls) {
+          auto found = selected->variables.find(shape.variable);
+          if (found == selected->variables.end()) continue;
+          float value = (float)found->second;
+          ImGui::PushID(shape.variable.c_str());
+          if (ImGui::SliderFloat(shape.label.c_str(), &value,
+                                 (float)shape.minimum, (float)shape.maximum,
+                                 "%.3f") && snapshotGeneration == generation) {
+            EiemModInputEvent event;
+            event.generation = snapshotGeneration;
+            event.modPath = selected->modPath;
+            event.values[shape.variable] = value;
+            event.directValues = true;
+            EiemQueueModInput(std::move(event));
+          }
+          ImGui::PopID();
+        }
+        ImGui::PopID();
       }
     }
     ImGui::End();
+    const auto update = EiemGetUpdateSnapshot();
+    if (update.available && !updateDismissedForOpen)
+      ImGui::OpenPopup("EIEM update");
+    if (ImGui::BeginPopupModal("EIEM update", nullptr,
+                              ImGuiWindowFlags_AlwaysAutoResize)) {
+      ImGui::Text("EIEM v%s is available (installed v%s).",
+                  update.version.c_str(), EIEM_VERSION);
+      if (ImGui::Button("Open Release")) {
+        ShellExecuteA(nullptr, "open", update.url.c_str(), nullptr, nullptr,
+                      SW_SHOWNORMAL);
+        updateDismissedForOpen = true;
+        ImGui::CloseCurrentPopup();
+      }
+      ImGui::SameLine();
+      if (ImGui::Button("Later")) {
+        updateDismissedForOpen = true;
+        ImGui::CloseCurrentPopup();
+      }
+      ImGui::SameLine();
+      if (ImGui::Button("Ignore this version")) {
+        if (EiemIgnoreRelease(update.version)) {
+          updateDismissedForOpen = true;
+          ImGui::CloseCurrentPopup();
+        }
+      }
+      ImGui::EndPopup();
+    }
     if (!open) InterlockedExchange(&s_eiemModManagerOpen, 0);
   }
 public:
@@ -209,6 +268,22 @@ public:
   }
   void Tick() {
     ContextScope restore(ImGui::GetCurrentContext());
+    HWND foreground = GetForegroundWindow();
+    const bool owned = foreground == g_gameHwnd || foreground == g_guiHwnd ||
+                       foreground == hwnd;
+    const bool managerRequested =
+        InterlockedCompareExchange(&s_eiemModManagerOpen, 0, 0) != 0;
+    if (managerRequested && !managerWasOpen) {
+      updateDismissedForOpen = false;
+      EiemRequestUpdateCheck(false);
+    }
+    // A hidden overlay does not need to copy every Mod's UI variables or
+    // rebuild ImGui scripts. The generation is read when focus returns.
+    if (!g_pluginActive || !owned || IsIconic(g_gameHwnd)) {
+      managerWasOpen = false;
+      Visible(false);
+      return;
+    }
     LONG nextGeneration; auto snapshots = EiemGetModUis(&nextGeneration);
     if (nextGeneration != generation) {
       if (failed) Shutdown(); // a failed device is rebuilt, never reused as a fallback
@@ -228,12 +303,7 @@ public:
       for (size_t i = 0; i < entries.size() && i < snapshots.size(); ++i)
         entries[i].snapshot.variables = std::move(snapshots[i].variables);
     }
-    HWND foreground = GetForegroundWindow();
-    const bool owned = foreground == g_gameHwnd || foreground == g_guiHwnd || foreground == hwnd;
-    const bool managerRequested =
-        InterlockedCompareExchange(&s_eiemModManagerOpen, 0, 0) != 0;
-    if ((entries.empty() && !managerRequested) || !g_pluginActive || !owned ||
-        IsIconic(g_gameHwnd)) {
+    if (entries.empty() && !managerRequested) {
       managerWasOpen = managerRequested;
       Visible(false);
       return;

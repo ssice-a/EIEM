@@ -32,6 +32,14 @@ static bool EiemFindModResource(const char *mod, const char *section, const char
     prefix = prefix.replace("// PRODUCTION_CACHE", production_cache())
     texture_stamp = source[source.index("static uint64_t EiemTextureDependencyStamp(const EiemModResource &resource,", source.index("static bool EiemParseInt32")):source.index("static bool EiemBuildTextureResource(")]
     builders = source[source.index("static bool EiemBuildTextureResource("):source.index("static void EiemApplySubmeshMaterialMap(")]
+    # This harness stubs disk resolution; remove only the later production
+    # definition from the extracted builders, retaining cache helpers.
+    marker = "static bool EiemResolveResourceDiskPath("
+    first = prefix.index(marker)
+    second = prefix.find(marker, first + 1)
+    if second >= 0:
+        end = prefix.index("\n}", second) + 2
+        prefix = prefix[:second] + prefix[end:]
     return prefix + ENDPOINTS + texture_stamp + builders + MAIN
 
 
@@ -97,6 +105,7 @@ static void *Invoke(void *method, void *self, void **params = nullptr) {
     }
     return nullptr;
 }
+static bool EiemModRelativeFilePath(const std::string &path) { return !path.empty(); }
 static bool EiemResolveResourceDiskPath(const EiemModResource &r, char *out, size_t size) {
     strcpy_s(out, size, r.path); return true;
 }

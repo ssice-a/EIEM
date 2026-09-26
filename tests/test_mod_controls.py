@@ -43,7 +43,7 @@ struct EiemUnityRef {
 struct EiemModelInstanceState {
   EiemUnityRef modelRef;
   void *model = nullptr; uint32_t instanceUid = 0; char path[768] = {};
-  EiemModelOwnerRef owners[4] = {}; uint32_t ownerCount = 0;
+  std::vector<EiemModelOwnerRef> owners;
   std::vector<EiemPhysicsIntent> physicsIntents;
 };
 static std::vector<EiemModelInstanceState> s_eiemModelInstances;
@@ -74,7 +74,7 @@ static const char *EiemModelOwnerKindName(EiemModelOwnerKind kind) {
 }
 static void EiemReleaseModelPhysics(void *, const char *) {}
 static bool EiemModelHasActiveOwner(const EiemModelInstanceState &state) {
-  for (uint32_t index = 0; index < state.ownerCount; ++index)
+  for (size_t index = 0; index < state.owners.size(); ++index)
     if (state.owners[index].active) return true;
   return false;
 }
@@ -85,6 +85,9 @@ static void EiemRegistrationTraceRelease(
     const char *, void *, void *, const char *, LONG) {}
 static void EiemRegistrationTraceReconcile(
     const char *, uint32_t, LONG, size_t, size_t, uint32_t, ULONGLONG) {}
+struct EiemPerfCounter {};
+struct EiemPerfScope { explicit EiemPerfScope(EiemPerfCounter &) {} };
+static EiemPerfCounter s_eiemPerfModelRegistration;
 '''
 
 MAIN = r'''
@@ -93,7 +96,7 @@ int main(int argc, char **argv) {
   std::string scenario = argv[1], error;
   if (scenario == "empty_rules_observed") {
     CHECK(s_eiemModelInstances.empty());
-    CHECK(!EiemRegisterAndApplyModelInstance(EiemModelOwnerKind::BaseModelPart, (void *)1, (void *)2, nullptr, 0, "empty-rules"));
+    CHECK(!EiemRegisterAndApplyModelInstance(EiemModelOwnerKind::BaseModelPart, (void *)1, (void *)2, nullptr, 0, "empty-rules", true));
     CHECK(observedModels == 0 && s_eiemModelInstances.size() == 1);
   } else if (scenario == "global") {
     EiemGlobalConfig config;
@@ -128,6 +131,8 @@ int main(int argc, char **argv) {
       "[RenderMain]\nasset=Body\nif $a == 1\nhandling=skip\nendif\n");
     CHECK(EiemModParseStream(input, "a/mod.ini", program, &error));
     EiemPublishModState(program); s_eiemModGeneration = 7;
+    CHECK(EiemGetSelectedModPath() == "a/mod.ini");
+    CHECK(EiemSelectControlledMod("a/mod.ini"));
     EiemModProgram next; std::vector<std::string> affected;
     CHECK(!EiemPrepareInputUpdate({{{VK_F6,0},6,"a/mod.ini"}}, &next, &affected));
     CHECK(EiemPrepareInputUpdate({{{VK_F6,0},7,"a/mod.ini"},
@@ -182,11 +187,33 @@ int main(int argc, char **argv) {
     EiemAppendModDocument(both, std::move(first));
     EiemAppendModDocument(both, std::move(second));
     EiemPublishPreparedModReload(both);
+    CHECK(EiemGetSelectedModPath() == "mods/a/mod.ini");
     CHECK(EiemSelectControlledMod("mods/b/mod.ini"));
     EiemPublishPreparedModReload(both);
     CHECK(EiemGetSelectedModPath() == "mods/b/mod.ini");
     EiemPublishPreparedModReload(std::move(onlyA));
-    CHECK(EiemGetSelectedModPath() == "mods/a/mod.ini");
+    CHECK(EiemGetSelectedModPath() == "mods/a/mod.ini"); // deleted selection falls back
+  } else if (scenario == "default_prefers_switchable_mod") {
+    EiemModProgram shapes, keys, combined;
+    std::istringstream shapeIni(
+      "[Constants]\n$shape=0\n[RenderShape]\nasset=Body\nshape.Inflate=$shape\n");
+    std::istringstream keyIni(
+      "[Constants]\n$state=0\n[KeySwitch]\nkey=F7\ntype=cycle\n$state=0,1\n");
+    CHECK(EiemModParseStream(shapeIni, "mods/a-shapes/mod.ini", shapes, &error));
+    CHECK(EiemModParseStream(keyIni, "mods/b-switch/mod.ini", keys, &error));
+    EiemAppendModDocument(combined, std::move(shapes));
+    EiemAppendModDocument(combined, std::move(keys));
+    EiemPublishPreparedModReload(combined);
+    CHECK(EiemGetSelectedModPath() == "mods/b-switch/mod.ini");
+    CHECK(!EiemSelectControlledMod(""));
+    CHECK(EiemGetSelectedModPath() == "mods/b-switch/mod.ini");
+    CHECK(!EiemModUsesUiKeyScope(true,false,false));
+    CHECK(EiemModUsesUiKeyScope(false,true,false));
+    CHECK(!EiemModUsesUiKeyScope(false,true,true));
+    CHECK(EiemModUsesUiKeyScope(false,false,true));
+    CHECK(EiemSelectControlledMod("mods/a-shapes/mod.ini"));
+    EiemPublishPreparedModReload(combined);
+    CHECK(EiemGetSelectedModPath() == "mods/a-shapes/mod.ini");
   } else if (scenario == "manager_key_section") {
     EiemModProgram program;
     std::istringstream input(
@@ -195,6 +222,7 @@ int main(int argc, char **argv) {
       "[KeyB]\nkey=F6\ntype=cycle\n$b=0,1\n");
     CHECK(EiemModParseStream(input, "mods/a/mod.ini", program, &error));
     EiemPublishModState(program); s_eiemModGeneration = 12;
+    CHECK(EiemSelectControlledMod("mods/a/mod.ini"));
     EiemModInputEvent event{{VK_F6,0},12,"mods/a/mod.ini"};
     event.keySection = "KeyB";
     EiemModProgram next; std::vector<std::string> affected;
@@ -212,6 +240,7 @@ int main(int argc, char **argv) {
       "[MeshBody]\npath=meshes/body.mesh\n");
     CHECK(EiemModParseStream(input, "a/mod.ini", program, &error));
     EiemPublishModState(program); s_eiemModGeneration = 10;
+    CHECK(EiemSelectControlledMod("a/mod.ini"));
     CHECK(program.rules.size() == 1 && program.rules[0].hiddenSubmeshMask == 0);
     EiemModProgram next; std::vector<std::string> affected;
     bool shapesOnly = false;
@@ -235,16 +264,16 @@ int main(int argc, char **argv) {
     CHECK(EiemModParseStream(input, "a/mod.ini", program, &error));
     EiemPublishModState(program);
     void *ownerA = (void *)1, *ownerB = (void *)2, *modelA = (void *)11, *modelB = (void *)12;
-    CHECK(!EiemRegisterAndApplyModelInstance(EiemModelOwnerKind::BaseModelPart, ownerA, modelA, nullptr, 0, "test"));
+    CHECK(!EiemRegisterAndApplyModelInstance(EiemModelOwnerKind::BaseModelPart, ownerA, modelA, nullptr, 0, "test", true));
     CHECK(s_eiemModelInstances.size() == 1); // no mutation is still a tracked target
-    EiemRegisterAndApplyModelInstance(EiemModelOwnerKind::BaseModelPart, ownerB, modelB, nullptr, 0, "test");
+    EiemRegisterAndApplyModelInstance(EiemModelOwnerKind::BaseModelPart, ownerB, modelB, nullptr, 0, "test", true);
     CHECK(s_eiemModelInstances.size() == 2);
-    EiemRegisterAndApplyModelInstance(EiemModelOwnerKind::BaseModelPart, ownerA, modelA, nullptr, 0, "test");
-    CHECK(s_eiemModelInstances.size() == 2 && s_eiemModelInstances[0].ownerCount == 1);
-    EiemRegisterAndApplyModelInstance(EiemModelOwnerKind::BaseModelPart, ownerA, (void *)13, nullptr, 0, "test");
+    EiemRegisterAndApplyModelInstance(EiemModelOwnerKind::BaseModelPart, ownerA, modelA, nullptr, 0, "test", true);
+    CHECK(s_eiemModelInstances.size() == 2 && s_eiemModelInstances[0].owners.size() == 1);
+    EiemRegisterAndApplyModelInstance(EiemModelOwnerKind::BaseModelPart, ownerA, (void *)13, nullptr, 0, "test", true);
     CHECK(s_eiemModelInstances.size() == 2); // recycled owner releases previous instance
     simulateMatch = false;
-    EiemRegisterAndApplyModelInstance(EiemModelOwnerKind::BaseModelPart, (void *)3, (void *)14, nullptr, 0, "test");
+    EiemRegisterAndApplyModelInstance(EiemModelOwnerKind::BaseModelPart, (void *)3, (void *)14, nullptr, 0, "test", true);
     CHECK(s_eiemModelInstances.size() == 3); // future rules may target this observed instance
   } else return 2;
   return 0;
@@ -284,6 +313,7 @@ class ModControlsTests(unittest.TestCase):
     def test_press_order_stale_generation_and_publish_after_restore(self): self.run_case("events")
     def test_key_events_only_change_the_selected_mod(self): self.run_case("selected_mod_scope")
     def test_reload_preserves_or_falls_back_selected_mod(self): self.run_case("selection_survives_reload")
+    def test_default_prefers_switchable_mod_and_manager_focus_is_game_scope(self): self.run_case("default_prefers_switchable_mod")
     def test_manager_button_targets_one_key_section(self): self.run_case("manager_key_section")
     def test_submesh_visibility_is_a_lightweight_mesh_update(self): self.run_case("submesh_visibility_only")
     def test_actual_runtime_registers_default_off_multi_instances(self): self.run_case("default_off_instances")

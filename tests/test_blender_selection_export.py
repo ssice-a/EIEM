@@ -24,8 +24,8 @@ int main(int argc, char **argv) {
   EiemCompileModProgram(split);
   CHECK(split.standaloneRules.size() == 1);
   const auto &s = split.rules[split.standaloneRules[0]];
-  CHECK(EiemModEquals(s.handling, "skip") && !s.hasMesh);
-  CHECK(s.partnerCount == 1 && s.partners[0][0]);
+  CHECK(!EiemModEquals(s.handling, "skip") && s.hasMesh);
+  CHECK(EiemModEquals(s.mesh, "MeshPartA") && s.partnerCount == 0);
   puts("EIEM_SELECTION_DLL_OK");
 }
 '''

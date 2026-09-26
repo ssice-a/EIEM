@@ -173,6 +173,13 @@ int wmain(int argc, wchar_t **argv) {
     CHECK(std::string(s_eiemModProgram.rules.front().asset)=="First");
     CHECK(std::string(s_eiemModProgram.rules.back().asset)=="Last");
     LONG generation=0;
+    // The first switchable Mod is selected on load; ordinary Mods have no keys.
+    CHECK(EiemGetModKeyChords(&generation).size()==(expected==3 ? 1u:0u));
+    CHECK(EiemGetSelectedModPath()==(expected==3
+          ? "plugin\\mods\\M\\mod.ini" : std::string()));
+    if (expected==3)
+      for (const auto &state : s_eiemModProgram.states)
+        if (!state.keys.empty()) CHECK(EiemSelectControlledMod(state.path));
     const auto keys=EiemGetModKeyChords(&generation);
     const auto uis=EiemGetModUis(&generation);
     CHECK(keys.size()==(expected==3 ? 1u:0u) && uis.size()==(expected==3 ? 1u:0u));

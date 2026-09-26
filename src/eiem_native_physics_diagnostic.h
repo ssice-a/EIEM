@@ -7,9 +7,8 @@
 // user-facing Dump page and never constructs or mutates a Physics component.
 static char g_eiemPhysicsDiagnosticDir[512] = "plugin\\physics_diagnostics";
 static volatile LONG s_eiemPhysicsDiagnosticWriting = 0;
-static bool s_eiemPhysicsAutoTraceAttempted = false;
-static bool s_eiemPhysicsAutoTraceStarted = false;
-static bool s_eiemPhysicsAutoTraceFinished = false;
+static bool s_eiemPhysicsManualCaptureActive = false;
+static constexpr UINT kEiemPhysicsManualCaptureMs = 2000;
 
 static bool EiemWriteNativePhysicsDiagnostic() {
   if (!EiemOnUnityThread()) {
@@ -52,21 +51,38 @@ static bool EiemWriteNativePhysicsDiagnostic() {
   return ok;
 }
 
-static void EiemStartPhysicsAutoTraceOnUnityThread() {
-  if (!kEiemEnableNativePhysicsObservation) return;
-  if (s_eiemPhysicsAutoTraceAttempted) return;
-  s_eiemPhysicsAutoTraceAttempted=true;
-  std::string error;
-  if (!EiemStartPhysicsTrace(error)) {
-    Log("[PHYSICS-DIAGNOSTIC] automatic trace start failed: %s",error.c_str()); return;
-  }
-  s_eiemPhysicsAutoTraceStarted=true;
-  Log("[PHYSICS-DIAGNOSTIC] automatic native physics trace started");
+static void EiemFinishPhysicsManualCaptureOnUnityThread(HWND hwnd,
+                                                        const char *reason) {
+  if (hwnd) KillTimer(hwnd,kEiemPhysicsCaptureTimer);
+  if (!s_eiemPhysicsManualCaptureActive) return;
+  s_eiemPhysicsManualCaptureActive=false;
+  EiemPhysicsStopTrace();
+  Log("[PHYSICS-DIAGNOSTIC] manual capture stopped reason=%s",
+      reason ? reason : "unknown");
+  EiemWriteNativePhysicsDiagnostic();
 }
 
-static void EiemFinishPhysicsAutoTraceOnUnityThread() {
-  if (s_eiemPhysicsAutoTraceFinished) return;
-  s_eiemPhysicsAutoTraceFinished=true;
-  if (s_eiemPhysicsAutoTraceStarted) EiemPhysicsStopTrace();
-  EiemWriteNativePhysicsDiagnostic();
+static void EiemStartPhysicsManualCaptureOnUnityThread(HWND hwnd) {
+  if (!kEiemEnableNativePhysicsObservation || !hwnd) return;
+  if (s_eiemPhysicsManualCaptureActive || EiemPhysicsTraceActive()) {
+    Log("[PHYSICS-DIAGNOSTIC] F12 ignored; capture already active");
+    return;
+  }
+  std::string error;
+  const ULONGLONG setupTick=GetTickCount64();
+  if (!EiemStartPhysicsTrace(error,kEiemPhysicsManualCaptureMs)) {
+    Log("[PHYSICS-DIAGNOSTIC] manual F12 capture start failed setupMs=%llu: %s",
+        (unsigned long long)(GetTickCount64()-setupTick),error.c_str());
+    return;
+  }
+  s_eiemPhysicsManualCaptureActive=true;
+  if (!SetTimer(hwnd,kEiemPhysicsCaptureTimer,kEiemPhysicsManualCaptureMs,
+                nullptr)) {
+    Log("[PHYSICS-DIAGNOSTIC] capture timer failed err=%lu",GetLastError());
+    EiemFinishPhysicsManualCaptureOnUnityThread(hwnd,"timer-failed");
+    return;
+  }
+  Log("[PHYSICS-DIAGNOSTIC] manual F12 capture started durationMs=%u setupMs=%llu",
+      (unsigned)kEiemPhysicsManualCaptureMs,
+      (unsigned long long)(GetTickCount64()-setupTick));
 }

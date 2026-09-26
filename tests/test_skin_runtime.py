@@ -19,14 +19,17 @@ SOURCE=r'''
 #include "eiem_skin_binding.h"
 struct Array { char pad[24]{}; size_t count=0; void *items[32]{}; };
 struct Node { std::string name; Node *parent=nullptr; std::vector<Node *> children; bool alive=true; };
-struct Renderer { Array *bones; };
+struct Renderer { Array *bones; Node *rootBone=nullptr; Node *skinningRoot=nullptr; };
 struct Box { char pad[16]{}; int value=0; } box;
 static constexpr size_t IL2CPP_ARRAY_DATA=32;
-static int method[8],writes=0;
+static int method[10],writes=0;
 static bool failSetter=false, s_eiemApplyingModMeshAssignment=false;
 static volatile LONG s_traceHierarchyIndexFailureCount=0;
 static void *g_smr_get_bones=&method[0], *g_transform_get_parent=&method[1], *g_object_get_name=&method[2];
 static void *g_transform_get_childCount=&method[3], *g_transform_GetChild=&method[4], *g_transformClass=&method[5], *g_smr_set_bones=&method[6];
+static void *g_gameObject_get_transform=nullptr, *g_component_get_transform=nullptr;
+static void *g_smr_get_rootBone=&method[7], *g_smr_get_skinningRoot=&method[8];
+static void *s_eiemActivePrefabInstance=nullptr;
 static std::vector<std::unique_ptr<Array>> arrays;
 static void *NewArray(void *,size_t n) { auto a=std::make_unique<Array>(); a->count=n; arrays.push_back(std::move(a)); return arrays.back().get(); }
 static auto il2cpp_array_new=&NewArray;
@@ -44,6 +47,8 @@ static bool EiemManagedObjectArraySame(void *x,void *y) {
 }
 static void *Invoke(void *m,void *p,void **args=nullptr) {
  if(m==g_smr_get_bones) return ((Renderer *)p)->bones;
+ if(m==g_smr_get_rootBone) return ((Renderer *)p)->rootBone;
+ if(m==g_smr_get_skinningRoot) return ((Renderer *)p)->skinningRoot;
  auto n=(Node *)p;
  if(m==g_transform_get_parent) return n->parent;
  if(m==g_object_get_name) return &n->name;
@@ -67,6 +72,10 @@ static bool EiemModEquals(const char *a,const char *b) {
 static bool EiemModSameLogicalPath(const char *a,const char *b) {
  return EiemModEquals(a,b);
 }
+static bool EiemBuildRelativeRendererPath(void *,void *,char *,size_t) { return false; }
+static void *EiemReadSharedMesh(void *,const char *) { return nullptr; }
+static bool EiemPrepareRenderInput(void *,void *,const char *,void **) { return false; }
+static bool EiemReadLiveMeshIdentity(void *,char *,size_t,char *,size_t) { return false; }
 static thread_local const std::vector<EiemLiveSkinSource> *s_eiemLiveSkinSources=nullptr;
 static bool EiemResolveMeshBonesFromAssembly(
     const EiemSkinIdentity &, void *, void **, char *, size_t) { return false; }
@@ -74,7 +83,7 @@ static bool EiemResolveMeshBonesFromAssembly(
 int main() {
  Node scene{"Scene"},actor{"ActorA",&scene},root{"Root",&actor},chest{"Chest",&root},pelvis{"Pelvis",&root},foot{"Foot",&pelvis};
  scene.children={&actor}; actor.children={&root}; root.children={&chest,&pelvis}; pelvis.children={&foot};
- Array source; source.count=1; source.items[0]=&chest; Renderer renderer{&source};
+ Array source; source.count=1; source.items[0]=&chest; Renderer renderer{&source,nullptr,&root};
  EiemSkinIdentity v5;
  v5.paths={"AuthorRoot/CompletelyRenamedChest"};
  v5.hashes={1};
@@ -103,7 +112,7 @@ int main() {
  assert(EiemPreserveSourceSkinning(&renderer,out,error,sizeof(error)) && writes==2 && handles.size()==1);
  Node otherActor{"ActorB",&scene},otherRoot{"Root",&otherActor},otherChest{"Chest",&otherRoot},otherPelvis{"Pelvis",&otherRoot},otherFoot{"Foot",&otherPelvis};
  otherActor.children={&otherRoot}; otherRoot.children={&otherChest,&otherPelvis}; otherPelvis.children={&otherFoot};
- Array otherSource; otherSource.count=1; otherSource.items[0]=&otherChest; Renderer other{&otherSource};
+ Array otherSource; otherSource.count=1; otherSource.items[0]=&otherChest; Renderer other{&otherSource,nullptr,&otherRoot};
  std::vector<EiemLiveSkinSource> liveB={{"assets/character/chest.asset","MeshChest",&other,&otherSource}};
  s_eiemLiveSkinSources=&liveB;
  v5Out=nullptr;
@@ -111,8 +120,35 @@ int main() {
  assert(((Array *)v5Out)->items[0]==&otherChest);
  assert(((Array *)v5Out)->items[0]!=&chest); // never borrow another model instance
  Array footSource; footSource.count=1; footSource.items[0]=&otherFoot;
- Renderer footRenderer{&footSource};
+ Renderer footRenderer{&footSource,nullptr,&otherRoot};
  liveB.push_back({"assets/character/foot.asset","MeshFoot",&footRenderer,&footSource});
+ Array unrelatedSource; unrelatedSource.count=1; unrelatedSource.items[0]=&otherFoot;
+ Renderer unrelatedRenderer{&unrelatedSource,nullptr,&otherRoot};
+ // Different Mesh sub-assets commonly share one FBX container.  Their local
+ // slot numbers are unrelated, so a path-only match must never make this
+ // renderer a donor for MeshChest slot 0.
+ liveB.push_back({"assets/character/chest.asset","MeshUnrelated",&unrelatedRenderer,&unrelatedSource});
+ EiemSkinIdentity donorCandidates;
+ donorCandidates.paths={"NPC/RenamedChest","NPC/RenamedFoot"};
+ donorCandidates.hashes={1,2};
+ donorCandidates.sourceCandidates={
+   {{"assets/character/chest.asset","MeshChest",0}},
+   {{"assets/character/foot.asset","MeshFoot",0}}};
+ void *donorOut=nullptr;
+ // v6 uses only original Mesh/slot donors.  The authored names are
+ // deliberately unrelated to the native hierarchy.
+ assert(EiemResolveMeshBonesFromNativeInstance(
+     donorCandidates,&other,&donorOut,v5Error,sizeof(v5Error)));
+ assert(((Array *)donorOut)->count==2 &&
+        ((Array *)donorOut)->items[0]==&otherChest &&
+        ((Array *)donorOut)->items[1]==&otherFoot);
+ EiemSkinIdentity missingDonor=donorCandidates;
+ missingDonor.sourceCandidates[1]={{"assets/missing.asset","MeshMissing",0}};
+ donorOut=nullptr;
+ // A missing donor is a hard failure; v6 must never fall back to a guessed
+ // name or hierarchy index.
+ assert(!EiemResolveMeshBonesFromNativeInstance(
+     missingDonor,&other,&donorOut,v5Error,sizeof(v5Error)) && !donorOut);
  EiemSkinIdentity merged;
  merged.paths={"AuthorRoot/Chest","AuthorRoot/Foot"};
  merged.hashes={1,2};
@@ -124,7 +160,50 @@ int main() {
         ((Array *)mergedOut)->items[1]==&otherFoot); // same numeric slot, different source Mesh
  assert(EiemResolveMeshBones(identity,&other,&out,error,sizeof(error)) && ((Array *)out)->items[1]==&otherFoot);
  assert(((Array *)out)->items[1]!=expanded->items[1]); // never borrow actor A's transforms
+ // Two native renderers may expose the same source Mesh/slot while belonging
+ // to different PFB instances. The donor with the wrong rootBone/skinningRoot
+ // must be ignored even when it appears first in the live-source snapshot.
+ Node contextRootA{"ContextRootA"}, contextRootB{"ContextRootB"},
+     contextSkinA{"ContextSkinA"}, contextSkinB{"ContextSkinB"},
+     contextBoneWrong{"ContextWrongBone"}, contextBoneRight{"ContextRightBone"};
+ Array contextTargetSource; contextTargetSource.count=1;
+ contextTargetSource.items[0]=&contextBoneRight;
+ Renderer contextTarget{&contextTargetSource,&contextRootA,&contextSkinA};
+ Array contextWrongSource; contextWrongSource.count=1;
+ contextWrongSource.items[0]=&contextBoneWrong;
+ Renderer contextWrong{&contextWrongSource,&contextRootB,&contextSkinB};
+ Array contextRightSource; contextRightSource.count=1;
+ contextRightSource.items[0]=&contextBoneRight;
+ Renderer contextRight{&contextRightSource,&contextRootA,&contextSkinA};
+ std::vector<EiemLiveSkinSource> contextLive={
+   {"assets/character/chest.asset","MeshChest",&contextWrong,&contextWrongSource},
+   {"assets/character/chest.asset","MeshChest",&contextRight,&contextRightSource}};
+ s_eiemLiveSkinSources=&contextLive;
+ void *contextOut=nullptr;
+ assert(EiemResolveMeshBonesFromNativeInstance(
+     v5,&contextTarget,&contextOut,v5Error,sizeof(v5Error)));
+ assert(((Array *)contextOut)->count==1 &&
+        ((Array *)contextOut)->items[0]==&contextBoneRight);
  Node extra{"Extra",&otherPelvis}; otherPelvis.children={&otherFoot,&extra};
+ EiemSkinIdentity hybrid;
+ // The source Renderer exposes only slot 0 at this assembly boundary. Slot 1
+ // is authored against the same full palette but is not present in its local
+ // bones[]. A missing late source slot must not discard the exact mapping for
+ // slot 0 and remap that slot by its (deliberately misleading) name path.
+ hybrid.paths={"Root/Pelvis/Foot","Root/Pelvis/Extra"};
+ hybrid.hashes={1,2};
+ hybrid.indexPaths={"0","1/1"};
+ hybrid.sources={{"assets/character/chest.asset","MeshChest",0},
+                 {"assets/character/chest.asset","MeshChest",1}};
+ Array hybridNative; hybridNative.count=2;
+ hybridNative.items[0]=&otherChest; hybridNative.items[1]=&otherFoot;
+ Renderer hybridRenderer{&hybridNative,nullptr,&otherRoot};
+ s_eiemLiveSkinSources=&liveB;
+ void *hybridOut=nullptr;
+ // A complete source table is authoritative. If a source Mesh/slot is not
+ // present in this model instance, do not guess by a hierarchy index/name.
+ assert(!EiemResolveMeshBonesFromNativeInstance(
+     hybrid,&hybridRenderer,&hybridOut,v5Error,sizeof(v5Error)) && !hybridOut);
  Array addedSource; addedSource.count=2; addedSource.items[0]=&otherChest; addedSource.items[1]=&otherFoot;
  Renderer addedRenderer{&addedSource};
  EiemSkinIdentity renamedWithAddition;

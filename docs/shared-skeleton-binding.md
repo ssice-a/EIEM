@@ -1,6 +1,6 @@
 # 共享骨架与 Mesh 局部骨骼槽
 
-本文定义当前静态 Mesh 替换的蒙皮契约。现行格式为 EIEMESH v5；世界、角色 UI 和 NPC 使用同一套规则，但每个模型实例分别绑定自己的 Transform。
+本文定义当前静态 Mesh 替换的蒙皮契约。现行格式为 EIEMESH v6；世界、角色 UI 和 NPC 使用同一套规则，但每个模型实例分别绑定自己的 Transform。
 
 ## 1. 基本模型
 
@@ -14,40 +14,41 @@ Unity 蒙皮不在运行时用 Blender 顶点组名称寻找骨骼。一个 Skin
 
 骨骼显示名和 Transform 路径不是既有槽位的权威身份。不同 PFB 可以把同一语义骨骼改名，只要游戏给原 Mesh 装配的槽位仍正确，EIEM 应复用游戏已经选好的 Transform。
 
-## 2. EIEMESH v5 槽来源
+## 2. EIEMESH v6 槽来源
 
-v5 为每个局部骨骼槽保存以下数据：
+v6 为每个局部骨骼槽保存以下数据：
 
 | 数据 | 用途 |
 |---|---|
 | bind pose | 保持该 Mesh 的绑定空间 |
 | 作者骨骼路径与哈希 | Blender 编辑、诊断和旧格式回退 |
-| 层级索引路径 | v4 回退信息，不是 v5 的首选身份 |
+| 层级索引路径 | v4 回退信息，不是 v6 的首选身份 |
 | 源 Mesh 逻辑路径 | 定位当前模型实例内的原生 Renderer |
 | 源 Mesh asset 名 | 路径不可用时的资源身份 |
 | 源 Mesh 原始槽号 | 从该原生 Renderer 的 `bones[]` 取 Transform |
+| 源 Mesh/槽候选列表 | 当前模型只存在某些 LOD 或 PFB 时，逐候选寻找仍存在的原生供体 |
 
-权威映射是“源 Mesh 身份 + 原始槽号”，不是角色名、PFB 名、Renderer 名、骨骼名或目标 LOD 的同序号槽。
+权威映射是“源 Mesh 身份 + 原始槽号”的候选列表，不是角色名、PFB 名、Renderer 名、骨骼名或目标 LOD 的同序号槽。
 
-例如作者 Mesh 的某个槽来自源 Mesh A 的槽 17。NPC PFB 即使把该 Transform 改名，DLL 仍从当前 NPC 实例的 Mesh A Renderer 读取 `bones[17]`。世界实例和 UI 实例分别执行同样的解析，不会借用 NPC 的 Transform。
+例如作者 Mesh 的某个槽来自源 Mesh A 的槽 17，也可以同时记录源 Mesh B 的槽 4。NPC PFB 即使缺少 A，DLL 仍会在当前 NPC 实例内尝试 B；当前实例中存在的候选必须解析到同一个 Transform，否则绑定失败。世界实例和 UI 实例分别执行同样的解析，不会借用 NPC 的 Transform。
 
 ## 3. Blender 导入与导出
 
-导入 v5 Mesh 时，插件把每槽来源保存在 `eiem_bone_sources_json`。重新导出必须保持以下数组逐槽对齐：
+导入 v6 Mesh 时，插件把每槽候选保存在 `eiem_bone_source_candidates_json`，同时保留 v5 的第一候选兼容字段。重新导出必须保持以下数组逐槽对齐：
 
 ```text
 weights index
   <-> bind pose
   <-> bone path/hash
   <-> hierarchy index path
-  <-> source Mesh/path/slot
+  <-> source Mesh/path/slot candidates
 ```
 
 删除几何或零权重槽不能压缩原槽表。合并多个作者部件时，导出器建立一个联合局部表，并把每个部件的顶点权重重映射到联合槽；同一个联合槽若声明了互相冲突的源记录，导出必须报错，不能任选一条继续。
 
-当前静态阶段只保证复用游戏原骨架中已有的槽。新增骨骼没有原生源 Mesh 槽，必须等 Skeleton/Physics 原生装配方案完成后再定义来源，不能伪造一个现有 Mesh 槽号。
+当前静态阶段只保证复用游戏原骨架中已有的槽。导出器扫描同一 Blender Armature 下所有原生 Mesh 供体；新增骨骼若没有任何供体槽会直接报错，不能伪造一个现有 Mesh 槽号。
 
-旧 EIEMESH v2-v4 可以读取，但没有完整的逐槽源记录。它们可使用名称路径或层级索引回退，不具备 v5 的跨 PFB 改名保证；当前 Blender 插件应重新导出为 v5。
+旧 EIEMESH v2-v5 可以读取。v2-v4 没有完整逐槽来源，v5 只有单一来源；这些旧格式保留兼容回退，不具备 v6 的候选供体保证。当前 Blender 插件应重新导出为 v6。
 
 ## 4. DLL 解析流程
 
@@ -56,14 +57,14 @@ weights index
 1. 枚举该模型根下的原生 SkinnedMeshRenderer，包括未激活 LOD。
 2. 记录每个原生 Mesh 的逻辑路径、asset 名和原始 `bones[]`。
 3. F10 或重复生命周期调用若已替换 Renderer，则从 override 记录读取 `originalBonesHandle`，不会把 replacement palette 当作源表。
-4. 对 v5 replacement 的每个槽，按源 Mesh 身份找到当前模型实例内的候选，再读取记录的原始槽号。
+4. 对 v6 replacement 的每个槽，按候选源 Mesh 身份找到当前模型实例内的供体，再读取记录的原始槽号；只有候选都缺失才失败。
 5. 全部槽准备完成后，一次性提交 replacement Mesh 和新的 `bones[]`。
 
-完整 v5 来源表可以在不读取任何骨骼名称和层级的情况下完成绑定。只有来源记录缺失时才进入名称路径和层级索引回退。
+完整 v6 候选表可以在不读取任何骨骼名称和层级的情况下完成绑定。v6 不进入名称路径或层级索引回退；只有旧 v2-v5 资源才使用兼容回退。
 
 以下情况明确失败并保留源 Mesh：
 
-- 当前模型实例内不存在声明的源 Mesh；
+- 当前模型实例内不存在任何声明的源 Mesh 候选；
 - 原始槽号越界；
 - 同一源身份在模型内命中不同 Transform，结果有歧义；
 - Transform 已失效；
@@ -76,7 +77,7 @@ weights index
 
 该方案没有 Typhoea、裙骨或特定 Renderer 的功能性硬编码。换成其他角色时，只要满足以下条件，PFB 中的骨骼改名不会改变结果：
 
-- Blender 从当前插件导入并重新导出 EIEMESH v5；
+- Blender 从当前插件导入并重新导出 EIEMESH v6；
 - 目标实例仍装配导出记录所引用的源 Mesh；
 - 源 Mesh 的局部槽语义未被游戏资源版本改写；
 - 同一模型根内的源 Mesh 身份足以唯一确定 Transform；
@@ -88,7 +89,7 @@ weights index
 
 合同测试必须覆盖：
 
-- 全部骨骼名称均不匹配时，完整 v5 来源表仍能解析；
+- 全部骨骼名称均不匹配时，v6 候选来源表仍能解析；
 - 两个模型实例使用同一 Mesh 资源时，各自得到自己的 Transform；
 - 两个源 Mesh 都使用槽 0 时，合并 Mesh 仍按源 Mesh 身份得到不同骨骼；
 - 歧义、缺失和越界均失败，不退回目标 Renderer 的同序号槽；

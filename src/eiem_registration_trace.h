@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstring>
 #include <cstdio>
+#include "eiem_runtime_features.h"
 
 void Log(const char *fmt, ...);
 
@@ -28,6 +29,8 @@ struct EiemRegistrationTraceSlot {
 static SRWLOCK s_eiemRegistrationTraceLock = SRWLOCK_INIT;
 static EiemRegistrationTraceSlot s_eiemRegistrationTraceSlots[4096] = {};
 static uint32_t s_eiemRegistrationTraceNext = 0;
+static EiemRegistrationTraceSlot s_eiemNativeStackSlots[1024] = {};
+static uint32_t s_eiemNativeStackNext = 0;
 
 static uint64_t EiemRegistrationTraceHash(const char *text) {
   // FNV-1a is sufficient here; this is a log de-duplication key, not an ID.
@@ -44,6 +47,7 @@ static uint64_t EiemRegistrationTraceHash(const char *text) {
 static bool EiemRegistrationTraceFirst(const char *event, const char *stage,
                                         void *first, void *second,
                                         void *third, LONG generation) {
+  if (!kEiemEnableLifecycleDiagnostics) return false;
   const uint64_t eventHash = EiemRegistrationTraceHash(event);
   const uint64_t stageHash = EiemRegistrationTraceHash(stage);
   AcquireSRWLockExclusive(&s_eiemRegistrationTraceLock);
@@ -57,6 +61,37 @@ static bool EiemRegistrationTraceFirst(const char *event, const char *stage,
   }
   auto &slot = s_eiemRegistrationTraceSlots[
       s_eiemRegistrationTraceNext++ % _countof(s_eiemRegistrationTraceSlots)];
+  slot.event = eventHash;
+  slot.stage = stageHash;
+  slot.first = first;
+  slot.second = second;
+  slot.third = third;
+  slot.generation = generation;
+  slot.used = true;
+  ReleaseSRWLockExclusive(&s_eiemRegistrationTraceLock);
+  return true;
+}
+
+// Separate de-duplication for the native-stack-only build. The ordinary
+// lifecycle census is intentionally disabled in production, but a stack-only
+// evidence run must still be able to record one chain per concrete boundary.
+static bool EiemRegistrationTraceNativeStackFirst(
+    const char *boundary, void *first, void *second, void *third,
+    LONG generation) {
+  if (!kEiemEnableNativeBoundaryStacks) return false;
+  const uint64_t eventHash = EiemRegistrationTraceHash("native-stack");
+  const uint64_t stageHash = EiemRegistrationTraceHash(boundary);
+  AcquireSRWLockExclusive(&s_eiemRegistrationTraceLock);
+  for (const auto &slot : s_eiemNativeStackSlots) {
+    if (slot.used && slot.event == eventHash && slot.stage == stageHash &&
+        slot.first == first && slot.second == second && slot.third == third &&
+        slot.generation == generation) {
+      ReleaseSRWLockExclusive(&s_eiemRegistrationTraceLock);
+      return false;
+    }
+  }
+  auto &slot = s_eiemNativeStackSlots[
+      s_eiemNativeStackNext++ % _countof(s_eiemNativeStackSlots)];
   slot.event = eventHash;
   slot.stage = stageHash;
   slot.first = first;
@@ -136,17 +171,58 @@ static void EiemRegistrationTraceRendererOwner(
       stage && stage[0] ? stage : "unknown");
 }
 
+// Capture the native caller chain at the lifecycle boundary itself.  The
+// previous evidence only recorded managed object identities, so a later
+// native cache/write path could not be distinguished from a normal return.
+// This is deliberately fixed-size and allocation-free; it runs only after the
+// existing per-object de-duplication gate has accepted a boundary event.
+static void EiemRegistrationTraceNativeStack(const char *boundary) {
+  if (!kEiemEnableNativeBoundaryStacks || !boundary || !boundary[0]) return;
+  void *frames[12] = {};
+  const USHORT frameCount = CaptureStackBackTrace(
+      1, static_cast<DWORD>(_countof(frames)), frames, nullptr);
+  char stack[512] = {};
+  size_t used = 0;
+  for (USHORT index = 0; index < frameCount; ++index) {
+    const int written = _snprintf_s(
+        stack + used, sizeof(stack) - used, _TRUNCATE, "%s%p",
+        index ? "," : "", frames[index]);
+    if (written <= 0) break;
+    used += static_cast<size_t>(written);
+    if (used + 24 >= sizeof(stack)) break;
+  }
+  Log("%s event=native-stack boundary=%s tid=%lu frameCount=%u stack=%s",
+      EiemRegistrationTraceTag, boundary,
+      static_cast<unsigned long>(GetCurrentThreadId()),
+      static_cast<unsigned>(frameCount), stack[0] ? stack : "<empty>");
+}
+
+static void EiemRegistrationTraceNativeStackContext(
+    const char *boundary, void *first, void *second, void *third,
+    LONG generation) {
+  if (!EiemRegistrationTraceNativeStackFirst(boundary, first, second, third,
+                                             generation))
+    return;
+  Log("%s event=native-stack-context boundary=%s first=%p second=%p "
+      "third=%p generation=%ld",
+      EiemRegistrationTraceTag, boundary ? boundary : "unknown", first,
+      second, third, generation);
+  EiemRegistrationTraceNativeStack(boundary);
+}
+
 static void EiemRegistrationTraceArrayBoundary(
     const char *boundary, void *owner, void *array, size_t count,
     LONG generation, int32_t lod) {
-  if (!kEiemValidationIdentityProbe) return;
-  if (!EiemRegistrationTraceFirst("array-boundary", boundary, owner, array,
-                                  nullptr, generation))
-    return;
-  Log("%s event=array-boundary boundary=%s owner=%p array=%p count=%zu "
-      "lod=%d generation=%ld",
-      EiemRegistrationTraceTag, boundary ? boundary : "unknown", owner, array,
-      count, lod, generation);
+  if (kEiemValidationIdentityProbe &&
+      EiemRegistrationTraceFirst("array-boundary", boundary, owner, array,
+                                 nullptr, generation)) {
+    Log("%s event=array-boundary boundary=%s owner=%p array=%p count=%zu "
+        "lod=%d generation=%ld",
+        EiemRegistrationTraceTag, boundary ? boundary : "unknown", owner,
+        array, count, lod, generation);
+  }
+  EiemRegistrationTraceNativeStackContext(boundary, owner, array, nullptr,
+                                          generation);
 }
 
 // The game passes a Renderer array together with a second, index-related

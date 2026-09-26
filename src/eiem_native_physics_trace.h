@@ -12,6 +12,17 @@ using EiemPhysicsVoidInt=void (*)(void *,int32_t,void *);
 using EiemPhysicsVoidIntObject=void (*)(void *,int32_t,void *,void *);
 using EiemPhysicsIcallCreate=void (*)(void *,void *,void *);
 using EiemPhysicsIcallVoid0=void (*)(void *);
+// Unity.Jobs.JobHandle is two 32-bit fields in this build.  Keep it as a
+// value type so the detour preserves the original ABI and only records the
+// dependency/result token returned by the game's scheduler.
+struct EiemPhysicsJobHandle { uint32_t handle=0, version=0; };
+static uint64_t EiemPhysicsPackJobHandle(EiemPhysicsJobHandle value) {
+  return (uint64_t)value.handle | ((uint64_t)value.version<<32);
+}
+using EiemPhysicsJobBuffer4=EiemPhysicsJobHandle (*)(
+    void *,EiemPhysicsJobHandle,void *,void *,void *,void *);
+using EiemPhysicsJobBuffer1=EiemPhysicsJobHandle (*)(
+    void *,EiemPhysicsJobHandle,void *);
 static void *s_eiemPhysicsTraceOriginal[(size_t)EiemPhysicsOperation::Count]={};
 
 template<EiemPhysicsOperation Op>
@@ -88,7 +99,13 @@ static void EiemPhysicsTraceIcallCreate(void *animator,void *values,void *handle
   bool returned=false; int32_t count=-1,invalidCount=-1;
   __try {
     ((EiemPhysicsIcallCreate)s_eiemPhysicsTraceOriginal[(size_t)Op])(animator,values,handle);
-    returned=true; EiemPhysicsReadBindingCounts(handle,count,invalidCount);
+    returned=true;
+    // Descriptor dereferences and snapshot locking are bounded by the manual
+    // capture.  Outside it this detour only forwards to the original icall.
+    if (ticket.session) {
+      EiemPhysicsReadBindingCounts(handle,count,invalidCount);
+      EiemPhysicsRecordBindingSnapshot(Op,animator,handle);
+    }
   } __finally { EiemPhysicsTraceLeave(ticket,Op,animator,values,returned,-1,count,invalidCount); }
 }
 template<EiemPhysicsOperation Op>
@@ -98,24 +115,50 @@ static void EiemPhysicsTraceIcallVoid(void *animator) {
   __try { ((EiemPhysicsIcallVoid0)s_eiemPhysicsTraceOriginal[(size_t)Op])(animator); returned=true; }
   __finally { EiemPhysicsTraceLeave(ticket,Op,animator,nullptr,returned); }
 }
+template<EiemPhysicsOperation Op>
+static EiemPhysicsJobHandle EiemPhysicsTraceJobBuffer4(
+    void *manager,EiemPhysicsJobHandle dependency,void *teamMap,
+    void *animatorMap,void *transformMap,void *method) {
+  const auto ticket=EiemPhysicsTraceEnter(Op,manager,animatorMap);
+  EiemPhysicsJobHandle result{}; bool returned=false;
+  __try {
+    result=((EiemPhysicsJobBuffer4)s_eiemPhysicsTraceOriginal[(size_t)Op])(
+      manager,dependency,teamMap,animatorMap,transformMap,method);
+    returned=true;
+  } __finally {
+    EiemPhysicsTraceLeave(ticket,Op,manager,animatorMap,returned,-1,-1,-1,-1,
+      EiemPhysicsPackJobHandle(dependency),EiemPhysicsPackJobHandle(result));
+  }
+  return result;
+}
+template<EiemPhysicsOperation Op>
+static EiemPhysicsJobHandle EiemPhysicsTraceJobBuffer1(
+    void *manager,EiemPhysicsJobHandle dependency,void *method) {
+  const auto ticket=EiemPhysicsTraceEnter(Op,manager);
+  EiemPhysicsJobHandle result{}; bool returned=false;
+  __try {
+    result=((EiemPhysicsJobBuffer1)s_eiemPhysicsTraceOriginal[(size_t)Op])(
+      manager,dependency,method);
+    returned=true;
+  } __finally {
+    EiemPhysicsTraceLeave(ticket,Op,manager,nullptr,returned,-1,-1,-1,-1,
+      EiemPhysicsPackJobHandle(dependency),EiemPhysicsPackJobHandle(result));
+  }
+  return result;
+}
 struct EiemPhysicsTraceHook {
   const char *klass,*name,*returns,*parameter0,*parameter1;
+  EiemPhysicsOperation operation;
   void *detour,*target=nullptr;
   bool created=false,enabled=false;
 };
 static EiemPhysicsTraceHook s_eiemPhysicsTraceHooks[]={
-  {"BeyondBoneCloth","BuildAndRun","System.Boolean",nullptr,nullptr,(void *)EiemPhysicsTraceBool<EiemPhysicsOperation::BuildAndRun>},
-  {"ClothProcess","StartRuntimeBuild","System.Boolean",nullptr,nullptr,(void *)EiemPhysicsTraceBool<EiemPhysicsOperation::StartRuntimeBuild>},
-  {"ClothProcess","Init","System.Void",nullptr,nullptr,(void *)EiemPhysicsTraceVoid<EiemPhysicsOperation::Init>},
-  {"ClothProcess","Dispose","System.Void",nullptr,nullptr,(void *)EiemPhysicsTraceVoid<EiemPhysicsOperation::Dispose>},
-  {"ClothProcess","DisposeInternal","System.Void",nullptr,nullptr,(void *)EiemPhysicsTraceVoid<EiemPhysicsOperation::DisposeInternal>},
-  {"TeamManager","RemoveMonitoringProcess","System.Void","BeyondDynamicBone.ClothProcess",nullptr,(void *)EiemPhysicsTraceRemoveMonitoring},
-  {"ClothManager","CompleteMasterJob","System.Void",nullptr,nullptr,(void *)EiemPhysicsTraceVoid<EiemPhysicsOperation::CompleteMasterJob>},
-  {"TeamManager","UpdateTeamAnimatorData","System.Void","BeyondDynamicBone.ExNativeArray<System.Int16>","UnityEngine.Jobs.TransformAccessArray",(void *)EiemPhysicsTraceUpdateAnimatorData},
-  {"TeamManager","ClearTeamAnimatorData","System.Void","System.Int32",nullptr,(void *)EiemPhysicsTraceTeamId<EiemPhysicsOperation::TeamClearAnimatorData>},
-  {"TeamManager","AddTeamAnimatorData","System.Void","System.Int32","BeyondDynamicBone.ClothProcess",(void *)EiemPhysicsTraceTeamObject<EiemPhysicsOperation::TeamAddAnimatorData>},
-  {"TeamManager","AddAnimatorTransform","System.Void","System.Int32","UnityEngine.Transform",(void *)EiemPhysicsTraceTeamObject<EiemPhysicsOperation::TeamAddAnimatorTransform>},
-  {"TeamManager","MarkAnimatorTransformDirty","System.Void","System.Int32","UnityEngine.Transform",(void *)EiemPhysicsTraceTeamObject<EiemPhysicsOperation::TeamMarkAnimatorTransformDirty>}
+  {"ClothManager","CompleteMasterJob","System.Void",nullptr,nullptr,
+   EiemPhysicsOperation::CompleteMasterJob,(void *)EiemPhysicsTraceVoid<EiemPhysicsOperation::CompleteMasterJob>},
+  {"TeamManager","AddTeamAnimatorData","System.Void","System.Int32","BeyondDynamicBone.ClothProcess",
+   EiemPhysicsOperation::TeamAddAnimatorData,(void *)EiemPhysicsTraceTeamObject<EiemPhysicsOperation::TeamAddAnimatorData>},
+  {"TeamManager","AddAnimatorTransform","System.Void","System.Int32","UnityEngine.Transform",
+   EiemPhysicsOperation::TeamAddAnimatorTransform,(void *)EiemPhysicsTraceTeamObject<EiemPhysicsOperation::TeamAddAnimatorTransform>}
 };
 struct EiemPhysicsIcallTraceHook {
   const char *name,*parameter0,*parameter1;
@@ -127,16 +170,42 @@ static EiemPhysicsIcallTraceHook s_eiemPhysicsIcallTraceHooks[]={
   {"CreateClothBindings_Injected","UnityEngine.Transform[]","UnityEngine.AnimationTransformRWBufferHandle&",
    EiemPhysicsOperation::AnimatorCreateClothBindings,(void *)EiemPhysicsTraceIcallCreate<EiemPhysicsOperation::AnimatorCreateClothBindings>},
   {"CreateClothBindingsByNameLst_Injected","System.String[]","UnityEngine.AnimationTransformRWBufferHandle&",
-   EiemPhysicsOperation::AnimatorCreateClothBindingsByName,(void *)EiemPhysicsTraceIcallCreate<EiemPhysicsOperation::AnimatorCreateClothBindingsByName>},
-  {"EnableClothBindings",nullptr,nullptr,EiemPhysicsOperation::AnimatorEnableClothBindings,
-   (void *)EiemPhysicsTraceIcallVoid<EiemPhysicsOperation::AnimatorEnableClothBindings>},
-  {"DisableClothBindings",nullptr,nullptr,EiemPhysicsOperation::AnimatorDisableClothBindings,
-   (void *)EiemPhysicsTraceIcallVoid<EiemPhysicsOperation::AnimatorDisableClothBindings>},
-  {"DestroyClothBindings",nullptr,nullptr,EiemPhysicsOperation::AnimatorDestroyClothBindings,
-   (void *)EiemPhysicsTraceIcallVoid<EiemPhysicsOperation::AnimatorDestroyClothBindings>}
+   EiemPhysicsOperation::AnimatorCreateClothBindingsByName,(void *)EiemPhysicsTraceIcallCreate<EiemPhysicsOperation::AnimatorCreateClothBindingsByName>}
 };
-static_assert(_countof(s_eiemPhysicsTraceHooks)+_countof(s_eiemPhysicsIcallTraceHooks)==
-              (size_t)EiemPhysicsOperation::Count,"Trace operation mismatch");
+struct EiemPhysicsJobTraceHook {
+  const char *name,*returns;
+  bool hasMaps;
+  const char *parameter0,*parameter1,*parameter2,*parameter3;
+  EiemPhysicsOperation operation;
+  void *detour,*target=nullptr;
+  bool created=false,enabled=false;
+};
+static EiemPhysicsJobTraceHook s_eiemPhysicsJobTraceHooks[]={
+  {"WriteAnimatorBufferData","Unity.Jobs.JobHandle",true,
+   "Unity.Jobs.JobHandle",
+   "Unity.Collections.NativeParallelHashMap<System.Int32,System.Int32>&",
+   "Unity.Collections.NativeParallelHashMap<System.Int32,UnityEngine.AnimationTransformRWBufferHandle>&",
+   "Unity.Collections.NativeParallelHashMap<System.Int32,System.Int32>&",
+   EiemPhysicsOperation::DynamicBoneWriteAnimatorBufferData,
+   (void *)EiemPhysicsTraceJobBuffer4<EiemPhysicsOperation::DynamicBoneWriteAnimatorBufferData>},
+  {"ReadAnimatorBufferData","Unity.Jobs.JobHandle",true,
+   "Unity.Jobs.JobHandle",
+   "Unity.Collections.NativeParallelHashMap<System.Int32,System.Int32>&",
+   "Unity.Collections.NativeParallelHashMap<System.Int32,UnityEngine.AnimationTransformRWBufferHandle>&",
+   "Unity.Collections.NativeParallelHashMap<System.Int32,System.Int32>&",
+   EiemPhysicsOperation::DynamicBoneReadAnimatorBufferData,
+   (void *)EiemPhysicsTraceJobBuffer4<EiemPhysicsOperation::DynamicBoneReadAnimatorBufferData>},
+  {"CopyDoubleBuffer","Unity.Jobs.JobHandle",false,
+   "Unity.Jobs.JobHandle",nullptr,nullptr,nullptr,
+   EiemPhysicsOperation::DynamicBoneCopyDoubleBuffer,
+   (void *)EiemPhysicsTraceJobBuffer1<EiemPhysicsOperation::DynamicBoneCopyDoubleBuffer>},
+  {"WriteDoubleBufferTransform","Unity.Jobs.JobHandle",false,
+   "Unity.Jobs.JobHandle",nullptr,nullptr,nullptr,
+   EiemPhysicsOperation::DynamicBoneWriteDoubleBufferTransform,
+   (void *)EiemPhysicsTraceJobBuffer1<EiemPhysicsOperation::DynamicBoneWriteDoubleBufferTransform>}
+};
+// The operation enum remains a stable JSON schema, while the installed arrays
+// intentionally contain only the nine boundaries needed by the focused run.
 
 static void *EiemPhysicsTraceAddress(void *method) {
   if (!method) return nullptr;
@@ -207,6 +276,37 @@ static bool EiemInstallPhysicsTrace(void **assemblies,size_t count,std::string &
       error="Physics managed method and Animator icall share a target"; return false;
     }
   }
+  void *jobMethods[_countof(s_eiemPhysicsJobTraceHooks)]={};
+  void *jobTargets[_countof(s_eiemPhysicsJobTraceHooks)]={};
+  void *transformManager=EiemPhysicsClass(assemblies,count,"BeyondDynamicBone.dll",
+                                          "BeyondDynamicBone","DynamicBoneTransformManager");
+  if (!transformManager) {
+    error="DynamicBoneTransformManager class unavailable"; return false;
+  }
+  for (size_t i=0;i<_countof(s_eiemPhysicsJobTraceHooks);++i) {
+    auto &hook=s_eiemPhysicsJobTraceHooks[i];
+    jobMethods[i]=hook.hasMaps ?
+      EiemPhysicsMethod(transformManager,hook.name,hook.returns,false,
+                        hook.parameter0,hook.parameter1,hook.parameter2,hook.parameter3) :
+      EiemPhysicsMethod(transformManager,hook.name,hook.returns,false,hook.parameter0);
+    jobTargets[i]=EiemPhysicsTraceAddress(jobMethods[i]);
+    if (!jobTargets[i]) {
+      error=std::string("DynamicBone buffer signature/address unavailable: ")+hook.name;
+      return false;
+    }
+    if (hook.created && hook.target!=jobTargets[i]) {
+      error="DynamicBone buffer target changed after installation"; return false;
+    }
+    for (size_t j=0;j<i;++j) if (jobTargets[i]==jobTargets[j]) {
+      error="DynamicBone buffer methods share an implementation"; return false;
+    }
+    for (void *target:targets) if (jobTargets[i]==target) {
+      error="DynamicBone buffer method shares a managed target"; return false;
+    }
+    for (void *target:icallTargets) if (jobTargets[i]==target) {
+      error="DynamicBone buffer method shares an Animator icall target"; return false;
+    }
+  }
   // Even a different method outside our list may share folded machine code.
   // Refuse such entries instead of calling it the wrong domain operation.
   for (size_t a=0;a<count;++a) {
@@ -231,7 +331,9 @@ static bool EiemInstallPhysicsTrace(void **assemblies,size_t count,std::string &
   for (size_t i=0;i<_countof(s_eiemPhysicsTraceHooks);++i) {
     auto &hook=s_eiemPhysicsTraceHooks[i];
     if (!hook.created) {
-      const auto status=MH_CreateHook(targets[i],hook.detour,&s_eiemPhysicsTraceOriginal[i]);
+      const auto status=MH_CreateHook(
+        targets[i],hook.detour,
+        &s_eiemPhysicsTraceOriginal[(size_t)hook.operation]);
       if (status!=MH_OK) {
         error=std::string("Cannot create physics trace hook: ")+hook.name+" status="+std::to_string((int)status); return false;
       }
@@ -246,6 +348,18 @@ static bool EiemInstallPhysicsTrace(void **assemblies,size_t count,std::string &
         error=std::string("Cannot create Physics Animator icall hook: ")+hook.name+" status="+std::to_string((int)status); return false;
       }
       hook.target=icallTargets[i]; hook.created=true;
+    }
+  }
+  for (size_t i=0;i<_countof(s_eiemPhysicsJobTraceHooks);++i) {
+    auto &hook=s_eiemPhysicsJobTraceHooks[i];
+    if (!hook.created) {
+      const auto status=MH_CreateHook(jobTargets[i],hook.detour,
+        &s_eiemPhysicsTraceOriginal[(size_t)hook.operation]);
+      if (status!=MH_OK) {
+        error=std::string("Cannot create DynamicBone buffer hook: ")+hook.name+
+          " status="+std::to_string((int)status); return false;
+      }
+      hook.target=jobTargets[i]; hook.created=true;
     }
   }
   for (auto &hook:s_eiemPhysicsTraceHooks) {
@@ -266,13 +380,124 @@ static bool EiemInstallPhysicsTrace(void **assemblies,size_t count,std::string &
       hook.enabled=true;
     }
   }
+  for (auto &hook:s_eiemPhysicsJobTraceHooks) {
+    if (!hook.enabled) {
+      const auto status=MH_EnableHook(hook.target);
+      if (status!=MH_OK) {
+        error=std::string("Cannot enable DynamicBone buffer hook: ")+hook.name+
+          " status="+std::to_string((int)status); return false;
+      }
+      hook.enabled=true;
+    }
+  }
   error.clear(); return true;
 }
-static bool EiemStartPhysicsTrace(std::string &error) {
+// Optional helper retained for dedicated startup-binding experiments.  The
+// normal diagnostic path no longer calls it: F12 installs the focused hook set
+// on demand so ordinary gameplay has no native detours at all.
+static bool EiemInstallPhysicsBindingHooksEarly(void **assemblies,size_t count,
+                                                std::string &error) {
+  if (!assemblies || !count || !il2cpp_method_get_flags || !il2cpp_resolve_icall) {
+    error="Early Animator binding hooks require complete metadata APIs"; return false;
+  }
+  void *animator=EiemPhysicsClass(assemblies,count,EiemPhysicsAnimatorImage,"UnityEngine","Animator");
+  if (!animator) { error="Animator class unavailable for early binding hooks"; return false; }
+  void *targets[_countof(s_eiemPhysicsIcallTraceHooks)]={};
+  for (size_t i=0;i<_countof(s_eiemPhysicsIcallTraceHooks);++i) {
+    auto &hook=s_eiemPhysicsIcallTraceHooks[i];
+    void *method=hook.parameter0 ?
+      EiemPhysicsMethod(animator,hook.name,"System.Void",false,hook.parameter0,hook.parameter1) :
+      EiemPhysicsMethod(animator,hook.name,"System.Void",false);
+    uint32_t implementation=0;
+    if (!method || !(il2cpp_method_get_flags(method,&implementation),implementation&0x1000)) {
+      error=std::string("Early Animator binding signature unavailable: ")+hook.name; return false;
+    }
+    targets[i]=EiemPhysicsTraceResolveIcall(hook.name);
+    if (!EiemPhysicsTraceExecutable(targets[i])) {
+      error=std::string("Early Animator binding target unavailable: ")+hook.name; return false;
+    }
+    if (hook.created && hook.target!=targets[i]) {
+      error="Early Animator binding target changed after installation"; return false;
+    }
+    for (size_t j=0;j<i;++j) if (targets[i]==targets[j]) {
+      error="Early Animator binding icalls share a target"; return false;
+    }
+  }
+  for (size_t i=0;i<_countof(s_eiemPhysicsIcallTraceHooks);++i) {
+    auto &hook=s_eiemPhysicsIcallTraceHooks[i];
+    if (!hook.created) {
+      const auto status=MH_CreateHook(targets[i],hook.detour,
+        &s_eiemPhysicsTraceOriginal[(size_t)hook.operation]);
+      if (status!=MH_OK) {
+        error=std::string("Cannot create early Animator binding hook: ")+hook.name+
+          " status="+std::to_string((int)status); return false;
+      }
+      hook.target=targets[i]; hook.created=true;
+    }
+    if (!hook.enabled) {
+      const auto status=MH_EnableHook(hook.target);
+      if (status!=MH_OK) {
+        error=std::string("Cannot enable early Animator binding hook: ")+hook.name+
+          " status="+std::to_string((int)status); return false;
+      }
+      hook.enabled=true;
+    }
+  }
+  // Install the DynamicBone scheduler boundaries in the same early pass. The
+  // normal trace may start from the first window message, which can be after
+  // the first animation/physics jobs have already been scheduled.
+  void *transformManager=EiemPhysicsClass(assemblies,count,"BeyondDynamicBone.dll",
+                                          "BeyondDynamicBone","DynamicBoneTransformManager");
+  if (!transformManager) {
+    error="DynamicBoneTransformManager class unavailable for early hooks"; return false;
+  }
+  void *jobTargets[_countof(s_eiemPhysicsJobTraceHooks)]={};
+  for (size_t i=0;i<_countof(s_eiemPhysicsJobTraceHooks);++i) {
+    auto &hook=s_eiemPhysicsJobTraceHooks[i];
+    void *method=hook.hasMaps ?
+      EiemPhysicsMethod(transformManager,hook.name,hook.returns,false,
+                        hook.parameter0,hook.parameter1,hook.parameter2,hook.parameter3) :
+      EiemPhysicsMethod(transformManager,hook.name,hook.returns,false,hook.parameter0);
+    jobTargets[i]=EiemPhysicsTraceAddress(method);
+    if (!jobTargets[i]) {
+      error=std::string("Early DynamicBone buffer signature unavailable: ")+hook.name;
+      return false;
+    }
+    if (hook.created && hook.target!=jobTargets[i]) {
+      error="Early DynamicBone buffer target changed after installation"; return false;
+    }
+    for (size_t j=0;j<i;++j) if (jobTargets[i]==jobTargets[j]) {
+      error="Early DynamicBone buffer methods share a target"; return false;
+    }
+  }
+  for (size_t i=0;i<_countof(s_eiemPhysicsJobTraceHooks);++i) {
+    auto &hook=s_eiemPhysicsJobTraceHooks[i];
+    if (!hook.created) {
+      const auto status=MH_CreateHook(jobTargets[i],hook.detour,
+        &s_eiemPhysicsTraceOriginal[(size_t)hook.operation]);
+      if (status!=MH_OK) {
+        error=std::string("Cannot create early DynamicBone buffer hook: ")+hook.name+
+          " status="+std::to_string((int)status); return false;
+      }
+      hook.target=jobTargets[i]; hook.created=true;
+    }
+    if (!hook.enabled) {
+      const auto status=MH_EnableHook(hook.target);
+      if (status!=MH_OK) {
+        error=std::string("Cannot enable early DynamicBone buffer hook: ")+hook.name+
+          " status="+std::to_string((int)status); return false;
+      }
+      hook.enabled=true;
+    }
+  }
+  error.clear(); return true;
+}
+static bool EiemStartPhysicsTrace(std::string &error,uint32_t durationMs=0) {
   if (!EiemOnUnityThread() || !il2cpp_domain_get || !il2cpp_domain_get_assemblies) {
     error="Physics trace requires Unity thread and an initialized domain"; return false;
   }
   void *domain=il2cpp_domain_get(); size_t count=0;
   void **assemblies=domain?il2cpp_domain_get_assemblies(domain,&count):nullptr;
-  return EiemInstallPhysicsTrace(assemblies,count,error) && EiemPhysicsBeginTrace(error);
+  return EiemInstallPhysicsTrace(assemblies,count,error) &&
+         EiemPhysicsBeginTrace(error,durationMs);
 }

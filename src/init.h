@@ -514,6 +514,11 @@ static DWORD WINAPI InitThread(LPVOID) {
   EiemReloadMods();
 
   Log("[RES-TRACE] Installing startup resource hooks before metadata dump");
+  // Resolve the Mesh managed methods before installing any diagnostic
+  // detours.  The setter-trace build consumes these addresses directly;
+  // installing the trace first silently skipped every entry because the
+  // backend resolver had not populated the method pointers yet.
+  EiemResolveResourceBackend(asms, ac);
   InitIl2CppResourceTrace(asms, ac);
   if (!kEiemStaticReplacementBaseline)
     DumpIl2CppMetadata(asms, ac);
@@ -991,10 +996,6 @@ static DWORD WINAPI InitThread(LPVOID) {
     g_texture_get_height = FindMethod(g_textureClass, "get_height", 0);
   }
 
-  // Resolve the EIEM writer side only after the game has exposed all Unity
-  // value types. This does not allocate resources; it only records methods.
-  EiemResolveResourceBackend(asms, ac);
-
   void *meshClass = FindClass("UnityEngine", "Mesh", asms, ac);
   if (meshClass) {
     g_mesh_get_vertices = FindMethod(meshClass, "get_vertices", 0);
@@ -1356,7 +1357,6 @@ static DWORD WINAPI InitThread(LPVOID) {
     g_animationThread =
         CreateThread(NULL, 0, AnimationWorkerThread, NULL, 0, NULL);
     g_guiThread = CreateThread(NULL, 0, GuiThread, NULL, 0, NULL);
-    g_updateThread = CreateThread(NULL, 0, UpdateCheckThread, NULL, 0, NULL);
   } else {
     Log("[VALIDATION] Mod hotkey/reload/manager workers enabled; "
         "animation/legacy-GUI/update workers disabled");

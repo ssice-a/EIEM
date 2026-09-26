@@ -2180,8 +2180,6 @@ static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
   // the first message, before a later character load reaches the resource
   // proxy hooks.
   if (!s_eiemUnityThreadId) s_eiemUnityThreadId = GetCurrentThreadId();
-  EiemStartPhysicsAutoTraceOnUnityThread();
-
   // Capture the original procedure before signalling worker threads. The
   // hotkey thread restores the subclass asynchronously during shutdown.
   WNDPROC originalWndProc = g_origWndProc;
@@ -2191,14 +2189,15 @@ static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     if (!g_shutdownRequested) {
       Log("[WNDPROC] Game window closing (msg=0x%X), signaling threads to exit",
           msg);
-      EiemFinishPhysicsAutoTraceOnUnityThread();
+      EiemFinishPhysicsManualCaptureOnUnityThread(hwnd,"shutdown");
     }
     g_shutdownRequested = true;
     g_guiRunning = false;
     g_trojanActive = false;
     KillTimer(hwnd, kEiemShapeTransitionTimer);
     KillTimer(hwnd, kEiemModRetryTimer);
-    KillTimer(hwnd, kEiemModReplayTimer);
+    KillTimer(hwnd, kEiemSkinTimingProbeTimer);
+    KillTimer(hwnd, kEiemPhysicsCaptureTimer);
     s_eiemShapeTransitionTick = 0;
 
     // Wake the GUI message loop. It will observe g_guiRunning=false and tear
@@ -2272,13 +2271,21 @@ static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     EiemRunModReconcile();
     return 0;
   }
-  if (msg == WM_TIMER && wParam == kEiemModReplayTimer) {
-    KillTimer(hwnd, kEiemModReplayTimer);
-    EiemRunModReconcile();
-    return 0;
-  }
   if (msg == WM_TIMER && wParam == kEiemShapeTransitionTimer) {
     EiemRunShapeTransitions();
+    return 0;
+  }
+  if (msg == WM_EIEM_PHYSICS_CAPTURE) {
+    EiemStartPhysicsManualCaptureOnUnityThread(hwnd);
+    return 0;
+  }
+  if (msg == WM_TIMER && wParam == kEiemSkinTimingProbeTimer) {
+    KillTimer(hwnd, kEiemSkinTimingProbeTimer);
+    EiemRunSkinTimingProbe();
+    return 0;
+  }
+  if (msg == WM_TIMER && wParam == kEiemPhysicsCaptureTimer) {
+    EiemFinishPhysicsManualCaptureOnUnityThread(hwnd,"bounded-window-complete");
     return 0;
   }
   if (msg == WM_EIEM_MOD_KEY) {

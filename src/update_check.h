@@ -1,6 +1,9 @@
 #pragma once
 
 #include <winhttp.h>
+#include <string>
+#include <fstream>
+#include <filesystem>
 #pragma comment(lib, "winhttp.lib")
 
 
@@ -11,8 +14,11 @@ static int CompareVersions(const char *a, const char *b) {
 
   int a1 = 0, a2 = 0, a3 = 0;
   int b1 = 0, b2 = 0, b3 = 0;
-  sscanf(a, "%d.%d.%d", &a1, &a2, &a3);
-  sscanf(b, "%d.%d.%d", &b1, &b2, &b3);
+  char trailing = 0;
+  if (sscanf(a, "%d.%d.%d%c", &a1, &a2, &a3, &trailing) != 3 ||
+      sscanf(b, "%d.%d.%d%c", &b1, &b2, &b3, &trailing) != 3 ||
+      a1 < 0 || a2 < 0 || a3 < 0 || b1 < 0 || b2 < 0 || b3 < 0)
+    return 0;
 
   if (a1 != b1) return a1 < b1 ? -1 : 1;
   if (a2 != b2) return a2 < b2 ? -1 : 1;
@@ -98,7 +104,7 @@ static std::string HttpGet(const wchar_t *host, const wchar_t *path,
     if (WinHttpReadData(hRequest, buf, toRead, &bytesRead) && bytesRead > 0) {
       result.append(buf, bytesRead);
     }
-    if (result.size() > 65536) break;
+    if (result.size() > 65536) { result.clear(); break; }
   }
 
   WinHttpCloseHandle(hRequest);
@@ -140,108 +146,116 @@ static std::string JsonExtractString(const std::string &json, const char *key) {
   return value;
 }
 
-static void CheckForUpdates() {
-  g_updateChecking = true;
-  g_updateCheckFailed = false;
-  g_updateIsLatest = false;
-  g_updateAvailable = false;
-  g_updateResultTime = 0;
-  Log("[UPDATE] Checking for updates... (current: v%s)", EIEM_VERSION);
+struct EiemUpdateSnapshot {
+  bool checking = false, available = false, latest = false, failed = false;
+  std::string version, url;
+};
 
-  bool found = false;
-  std::string version, url, changelog;
+static SRWLOCK s_eiemUpdateLock = SRWLOCK_INIT;
+static volatile LONG s_eiemUpdateRunning = 0;
+static constexpr const wchar_t *kEiemIgnoredReleasePath =
+    L"plugin\\eiem-update-state.txt";
 
-  {
-    std::string body = HttpGet(
-        L"api.github.com",
-        L"/repos/Sasye/EIEM/releases/latest",
-        3000,
-        L"Accept: application/vnd.github+json\r\nUser-Agent: EIEM-UpdateCheck/1.0\r\n");
-
-    if (!body.empty()) {
-      version = JsonExtractString(body, "tag_name");
-      url = JsonExtractString(body, "html_url");
-      changelog = JsonExtractString(body, "body");
-
-      if (!version.empty()) {
-        Log("[UPDATE] GitHub API: latest=%s", version.c_str());
-        found = true;
-      }
-    }
-    if (!found) {
-      Log("[UPDATE] GitHub API unreachable, trying jsDelivr fallback...");
-    }
-  }
-
-  if (!found) {
-    std::string body = HttpGet(
-        L"cdn.jsdelivr.net",
-        L"/gh/Sasye/EIEM@main/VERSION",
-        3000);
-
-    if (!body.empty()) {
-      size_t nl = body.find('\n');
-      if (nl != std::string::npos) {
-        version = body.substr(0, nl);
-        while (!version.empty() && (version.back() == '\r' || version.back() == ' '))
-          version.pop_back();
-
-        url = body.substr(nl + 1);
-        while (!url.empty() && (url.back() == '\r' || url.back() == '\n' || url.back() == ' '))
-          url.pop_back();
-
-        if (!version.empty()) {
-          Log("[UPDATE] jsDelivr: latest=%s", version.c_str());
-          found = true;
-        }
-      }
-    }
-    if (!found) {
-      Log("[UPDATE] jsDelivr also unreachable, skipping update check.");
-    }
-  }
-
-  if (found && CompareVersions(EIEM_VERSION, version.c_str()) < 0) {
-    const char *verStr = version.c_str();
-    if (*verStr == 'v' || *verStr == 'V') verStr++;
-    strncpy(g_latestVersion, verStr, sizeof(g_latestVersion) - 1);
-    g_latestVersion[sizeof(g_latestVersion) - 1] = '\0';
-
-    strncpy(g_updateUrl, url.c_str(), sizeof(g_updateUrl) - 1);
-    g_updateUrl[sizeof(g_updateUrl) - 1] = '\0';
-
-    if (!changelog.empty()) {
-      strncpy(g_updateChangelog, changelog.c_str(), sizeof(g_updateChangelog) - 1);
-      g_updateChangelog[sizeof(g_updateChangelog) - 1] = '\0';
-    } else {
-      g_updateChangelog[0] = '\0';
-    }
-
-    MemoryBarrier();
-    g_updateAvailable = true;
-    g_updateDismissed = false; 
-
-    Log("[UPDATE] New version available: v%s -> v%s", EIEM_VERSION, g_latestVersion);
-    Log("[UPDATE] URL: %s", g_updateUrl);
-  } else if (found) {
-    Log("[UPDATE] Already up to date (v%s)", EIEM_VERSION);
-    g_updateIsLatest = true;
-  } else {
-    Log("[UPDATE] Check failed — all endpoints unreachable.");
-    g_updateCheckFailed = true;
-  }
-
-  g_updateResultTime = GetTickCount();
-  g_updateChecking = false;
+static EiemUpdateSnapshot EiemGetUpdateSnapshot() {
+  AcquireSRWLockShared(&s_eiemUpdateLock);
+  EiemUpdateSnapshot result;
+  result.checking = g_updateChecking;
+  result.available = g_updateAvailable;
+  result.latest = g_updateIsLatest;
+  result.failed = g_updateCheckFailed;
+  result.version = g_latestVersion;
+  result.url = g_updateUrl;
+  ReleaseSRWLockShared(&s_eiemUpdateLock);
+  return result;
 }
 
-static DWORD WINAPI UpdateCheckThread(LPVOID) {
-  for (int i = 0; i < 40 && !g_cursorShowAction && !g_shutdownRequested; i++)
-    Sleep(500);  
-  for (int i = 0; i < 100 && !g_shutdownRequested; i++)
-    Sleep(100);
-  if (!g_shutdownRequested)
-    CheckForUpdates();
-  Log("[UPDATE] Update thread exited");
+static std::string EiemReadIgnoredRelease() {
+  std::ifstream input{std::filesystem::path(kEiemIgnoredReleasePath)};
+  std::string tag;
+  std::getline(input, tag);
+  return tag;
+}
+
+static bool EiemIgnoreRelease(const std::string &version) {
+  if (version.empty() || version.size() > 48) return false;
+  for (unsigned char c : version)
+    if (!(c >= '0' && c <= '9') && c != '.') return false;
+  CreateDirectoryW(L"plugin", nullptr);
+  HANDLE file = CreateFileW(kEiemIgnoredReleasePath, GENERIC_WRITE, FILE_SHARE_READ,
+                            nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) return false;
+  DWORD written = 0;
+  bool ok = WriteFile(file, version.data(), (DWORD)version.size(), &written, nullptr) &&
+            written == version.size();
+  CloseHandle(file);
+  if (ok) {
+    AcquireSRWLockExclusive(&s_eiemUpdateLock);
+    g_updateAvailable = false;
+    ReleaseSRWLockExclusive(&s_eiemUpdateLock);
+  }
+  return ok;
+}
+
+static void CheckForUpdates(bool forceIgnored = false) {
+  const std::string body = HttpGet(
+      L"api.github.com", L"/repos/ssice-a/EIEM/releases/latest", 3000,
+      L"Accept: application/vnd.github+json\r\nUser-Agent: EIEM-UpdateCheck/1.0\r\n");
+  std::string tag = JsonExtractString(body, "tag_name");
+  std::string url = JsonExtractString(body, "html_url");
+  const std::string prefix = "https://github.com/ssice-a/EIEM/releases/";
+  int major = 0, minor = 0, patch = 0;
+  char extra = 0;
+  const char *number = tag.c_str();
+  if (*number == 'v' || *number == 'V') ++number;
+  const bool valid = !body.empty() && url.compare(0, prefix.size(), prefix) == 0 &&
+          url.size() <= 511 && sscanf(number, "%d.%d.%d%c",
+                                      &major, &minor, &patch, &extra) == 3 &&
+          major >= 0 && minor >= 0 && patch >= 0;
+  std::string version = valid ? number : "";
+  const bool ignored = valid && !forceIgnored && EiemReadIgnoredRelease() == version;
+
+  AcquireSRWLockExclusive(&s_eiemUpdateLock);
+  g_updateAvailable = valid && !ignored && CompareVersions(EIEM_VERSION, version.c_str()) < 0;
+  g_updateIsLatest = valid && CompareVersions(EIEM_VERSION, version.c_str()) >= 0;
+  g_updateCheckFailed = !valid;
+  g_updateDismissed = false;
+  g_updateChangelog[0] = '\0';
+  strncpy(g_latestVersion, version.c_str(), sizeof(g_latestVersion) - 1);
+  g_latestVersion[sizeof(g_latestVersion) - 1] = '\0';
+  strncpy(g_updateUrl, valid ? url.c_str() : "", sizeof(g_updateUrl) - 1);
+  g_updateUrl[sizeof(g_updateUrl) - 1] = '\0';
+  g_updateResultTime = GetTickCount();
+  g_updateChecking = false;
+  ReleaseSRWLockExclusive(&s_eiemUpdateLock);
+  Log("[UPDATE] check %s latest=%s%s", valid ? "ok" : "failed",
+      version.c_str(), ignored ? " ignored" : "");
+}
+
+static DWORD WINAPI UpdateCheckThread(LPVOID parameter) {
+  if (!g_shutdownRequested) CheckForUpdates(parameter != nullptr);
+  InterlockedExchange(&s_eiemUpdateRunning, 0);
   return 0;
+}
+
+static bool EiemRequestUpdateCheck(bool forceIgnored = false) {
+  if (!forceIgnored) {
+    const auto lastCheck = g_updateResultTime;
+    if (lastCheck && GetTickCount() - lastCheck < 15 * 60 * 1000) return false;
+  }
+  if (InterlockedCompareExchange(&s_eiemUpdateRunning, 1, 0) != 0) return false;
+  AcquireSRWLockExclusive(&s_eiemUpdateLock);
+  g_updateChecking = true;
+  g_updateAvailable = false;
+  g_updateCheckFailed = g_updateIsLatest = false;
+  ReleaseSRWLockExclusive(&s_eiemUpdateLock);
+  if (g_updateThread) { CloseHandle(g_updateThread); g_updateThread = nullptr; }
+  g_updateThread = CreateThread(nullptr, 0, UpdateCheckThread,
+                                forceIgnored ? (LPVOID)1 : nullptr, 0, nullptr);
+  if (g_updateThread) return true;
+  AcquireSRWLockExclusive(&s_eiemUpdateLock);
+  g_updateChecking = false;
+  g_updateCheckFailed = true;
+  ReleaseSRWLockExclusive(&s_eiemUpdateLock);
+  InterlockedExchange(&s_eiemUpdateRunning, 0);
+  return false;
 }

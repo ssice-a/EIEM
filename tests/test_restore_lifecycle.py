@@ -47,7 +47,7 @@ static std::vector<EiemRenderOverrideState> s_eiemOverrides;
 static void Log(const char *,...) {}
 static bool EiemModAffected(const char *,const std::vector<std::string> *) { return true; }
 static void EiemProbeTrackedRenderer(const char *,void *) {}
-static void EiemUpdateRendererShapes(void *,const char *,const EiemModRule &,EiemShapeState &) {}
+static bool EiemUpdateRendererShapes(void *,const char *,const EiemModRule &,EiemShapeState &) {return true;}
 static void *liveMesh=&tokens[1];
 static int writes=0;
 static bool failAssignment=false, failRestore=false;
@@ -68,6 +68,16 @@ static bool EiemBuildMeshResource(const EiemModRule &,void **out,char *,size_t,v
 static bool EiemResolveMeshBones(const EiemSkinIdentity &,void *,void **,char *,size_t) { return true; }
 static bool EiemPreserveSourceSkinning(void *,void *,char *,size_t) { return true; }
 static bool EiemResolveMeshBonesFromNativeInstance(const EiemSkinIdentity &,void *,void **,char *,size_t) { return true; }
+static bool EiemResolveMeshBonesFromAssembly(const EiemSkinIdentity &,void *,void **,char *,size_t) { return true; }
+static unsigned long long EiemSkinTimelineBoneRefs(void *) { return 0; }
+static long long EiemPerfNow() { return 0; }
+static double EiemPerfMilliseconds(long long) { return 0; }
+static void EiemReportNativeMeshDeserializeSource(void *,const char *,const char *,const char *) {}
+static void EiemLogNativeMeshFlagState(const char *,void *,void *) {}
+static uintptr_t s_eiemActivePrefabInstance=0;
+static constexpr bool kEiemEnableNativeMeshFlagProbe=false;
+static constexpr bool kEiemEnableLifecycleDiagnostics=false;
+static constexpr bool kEiemEnableSkinBindingDiagnostics=false;
 static bool EiemSetRendererEnabled(void *,bool) { return true; }
 struct EiemBounds { float value[6]{}; };
 static void *g_smr_get_localBounds=nullptr;
@@ -102,6 +112,7 @@ static bool EiemManagedObjectArraySame(void *a,void *b) {
 }
 static bool EiemReadRendererEnabled(void *,bool *out) { *out=liveEnabled; return true; }
 static constexpr size_t IL2CPP_ARRAY_DATA=32;
+static constexpr bool kEiemEnableSkinDiagnostics=false;
 static volatile LONG64 s_eiemLastSkinCommitTick=0;
 // FUNCTIONS
 static void Apply() {
@@ -111,6 +122,7 @@ static void Apply() {
   const bool applyMesh=true;
   const bool resourcesReady=true;
   const bool skeletonReady=true;
+  double meshBuildMs=0, boneResolveMs=0, meshCommitMs=0;
   std::shared_ptr<EiemSkeletonInstance> skeleton;
   // WRITE_BLOCK
 }
@@ -196,11 +208,12 @@ class RestoreLifecycle(unittest.TestCase):
         cls.temp=tempfile.TemporaryDirectory(prefix='eiem-restore-test-')
         cls.addClassCleanup(cls.temp.cleanup)
         folder=Path(cls.temp.name)
-        trace=(ROOT/'src/il2cpp_trace.h').read_text(encoding='utf-8')
+        from runtime_source import read_runtime_source
+        trace=read_runtime_source(ROOT)
         start=trace.index('struct EiemRenderOverrideState {')
         state=trace[start:trace.index('\n};',start)+3]
-        signatures=['static size_t EiemFindOverrideLocked(', 'static void EiemBeginMeshWrite(', 'static void EiemRememberReplacement(',
-                    'static void EiemReleaseOverrideHandles(', 'static void EiemRestoreRenderOverrides(',
+        signatures=['static size_t EiemFindOverrideLocked(', 'static void EiemBeginMeshWrite(', 'static bool EiemRememberReplacement(',
+                    'static void EiemReleaseOverrideHandles(', 'static bool EiemRestoreRenderOverrides(',
                     'static void EiemForgetRenderOverrides(']
         funcs='\n'.join(function(trace,s) for s in signatures)
         start=trace.index('  bool meshApplied = false;', trace.index('static bool EiemApplyResolvedRenderRule('))

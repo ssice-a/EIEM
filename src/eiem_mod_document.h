@@ -20,6 +20,7 @@
 #include "eiem_expression.h"
 #include "eiem_keys.h"
 #include "eiem_physics_asset.h"
+#include "eiem_file_io.h"
 
 // Authoring syntax -> typed resource declarations and Render actions. No
 // published configuration, Unity objects, hotkeys or lifecycle state live here.
@@ -175,12 +176,17 @@ struct EiemModKey {
 struct EiemModUi {
   std::string section, path;
 };
+struct EiemModShapeControl {
+  std::string section, variable, label;
+  double minimum = NAN, maximum = NAN;
+};
 struct EiemModState {
   std::string path;
   EiemVariables defaults, variables;
   std::unordered_set<std::string> persistent;
   std::vector<EiemModKey> keys;
   std::vector<EiemModUi> uis;
+  std::vector<EiemModShapeControl> shapeControls;
 };
 struct EiemModProgram {
   std::vector<EiemModPrefab> prefabs;
@@ -356,6 +362,36 @@ static void EiemCompileModProgram(EiemModProgram &program) {
     if (rule.path[0] || rule.asset[0])
       program.standaloneRules.push_back(i);
   }
+  // Derive default 0..1 sliders once per parsed generation. Explicit
+  // ShapeControl sections carry the author's label and range; key-free Mesh
+  // shapes still become selectable without asking the Blender exporter to
+  // create a Lua UI or a shortcut.
+  for (const auto &definition : program.definitions) {
+    auto &state = program.states[definition.stateIndex];
+    EiemVisitStatements(definition.statements, [&](const EiemModStatement &statement) {
+      if (statement.key.compare(0, 6, "shape.") != 0 || !statement.number ||
+          statement.number->op != EiemExpression::Variable) return;
+      const std::string &variable = statement.number->variable;
+      if (!state.defaults.count(variable) ||
+          std::any_of(state.shapeControls.begin(), state.shapeControls.end(),
+                      [&](const auto &control) {
+                        return control.variable == variable;
+                      })) return;
+      EiemModShapeControl control;
+      control.variable = variable;
+      control.label = statement.key.substr(6);
+      control.minimum = (std::min)(0.0, state.defaults.at(variable));
+      control.maximum = (std::max)(1.0, state.defaults.at(variable));
+      for (const auto &key : state.keys)
+        for (const auto &assignment : key.assignments)
+          if (assignment.variable == variable)
+            for (double value : assignment.values) {
+              control.minimum = (std::min)(control.minimum, value);
+              control.maximum = (std::max)(control.maximum, value);
+            }
+      state.shapeControls.push_back(std::move(control));
+    });
+  }
   EiemEvaluateModProgram(program);
 }
 
@@ -402,8 +438,8 @@ static bool EiemApplyUiValues(EiemModProgram &program, size_t stateIndex,
   program.states[stateIndex].variables = std::move(proposed); return true;
 }
 
-static bool EiemUiRelativePath(const std::string &value) {
-  if (value.empty() || value.size() > 768 || value.front() == '/' || value.front() == '\\' ||
+static bool EiemModRelativeFilePath(const std::string &value) {
+  if (value.empty() || value.size() >= 768 || value.front() == '/' || value.front() == '\\' ||
       value.find(':') != std::string::npos || value.find('\0') != std::string::npos) return false;
   std::string normalized = value;
   std::replace(normalized.begin(), normalized.end(), '\\', '/');
@@ -414,6 +450,12 @@ static bool EiemUiRelativePath(const std::string &value) {
 
 static bool EiemValidateModDocument(EiemModProgram &doc, std::string &error) {
   auto &state = doc.states.front();
+  for (const auto &resource : doc.resources) {
+    if (!EiemModRelativeFilePath(resource.path)) {
+      error = "Resource needs a relative file path: " + std::string(resource.section);
+      return false;
+    }
+  }
   std::unordered_map<std::string, std::string> resources;
   std::unordered_map<std::string, size_t> renders;
   for (const auto &r : doc.resources) resources[EiemModIdentifier("", r.section)] = r.kind;
@@ -482,8 +524,29 @@ static bool EiemValidateModDocument(EiemModProgram &doc, std::string &error) {
     }
   }
   for (const auto &ui : state.uis) {
-    if (!EiemUiRelativePath(ui.path)) {
+    if (!EiemModRelativeFilePath(ui.path)) {
       error = "UI needs a relative script path: " + ui.section; return false;
+    }
+  }
+  std::unordered_set<std::string> shapeVariables;
+  for (const auto &definition : doc.definitions)
+    EiemVisitStatements(definition.statements, [&](const EiemModStatement &statement) {
+      if (statement.key.compare(0, 6, "shape.") == 0 && statement.number &&
+          statement.number->op == EiemExpression::Variable)
+        shapeVariables.insert(statement.number->variable);
+    });
+  std::unordered_set<std::string> declaredControls;
+  for (const auto &control : state.shapeControls) {
+    if (!state.defaults.count(control.variable) ||
+        !shapeVariables.count(control.variable) || control.label.empty() ||
+        !std::isfinite((float)control.minimum) ||
+        !std::isfinite((float)control.maximum) ||
+        control.minimum >= control.maximum ||
+        state.defaults.at(control.variable) < control.minimum ||
+        state.defaults.at(control.variable) > control.maximum ||
+        !declaredControls.insert(control.variable).second) {
+      error = "Invalid ShapeControl declaration: " + control.section;
+      return false;
     }
   }
   state.variables = state.defaults;
@@ -512,8 +575,11 @@ static bool EiemModParseStream(std::istream &input, const char *path,
     if (error) *error = std::to_string(lineNumber) + ": " + message;
     return false;
   };
-  enum Section { None, Constants, Key, UI, Render, Prefab, Resource } section = None;
+  if (strlen(path) >= sizeof(EiemModRule::modPath))
+    return fail("Mod INI path exceeds UTF-8 byte limit");
+  enum Section { None, Constants, Key, UI, ShapeControl, Render, Prefab, Resource } section = None;
   std::unordered_set<std::string> uiFields;
+  std::unordered_set<std::string> shapeControlFields;
   std::unordered_set<std::string> sections;
   struct Frame {
     std::vector<EiemModStatement> *parent;
@@ -551,6 +617,11 @@ static bool EiemModParseStream(std::istream &input, const char *path,
       else if (_strnicmp(name.c_str(), "UI", 2) == 0) {
         section = UI; uiFields.clear(); state.uis.push_back({});
         state.uis.back().section = name;
+      }
+      else if (_strnicmp(name.c_str(), "ShapeControl", 12) == 0) {
+        section = ShapeControl; shapeControlFields.clear();
+        state.shapeControls.push_back({});
+        state.shapeControls.back().section = name;
       }
       else if (_strnicmp(name.c_str(), "Key", 3) == 0) {
         section = Key; keyTypeSeen = keySpeedSeen = keyScopeSeen = false;
@@ -660,8 +731,20 @@ static bool EiemModParseStream(std::istream &input, const char *path,
     if (section == UI) {
       if (!uiFields.insert(key).second) return fail("Duplicate UI field: " + key);
       auto &ui = state.uis.back();
-      if (key == "path" && EiemUiRelativePath(value)) ui.path = value;
+      if (key == "path" && EiemModRelativeFilePath(value)) ui.path = value;
       else return fail("Invalid UI field: " + key);
+      continue;
+    }
+    if (section == ShapeControl) {
+      if (!shapeControlFields.insert(key).second)
+        return fail("Duplicate ShapeControl field: " + key);
+      auto &control = state.shapeControls.back();
+      if (key == "variable" && EiemVariableName(value)) control.variable = value;
+      else if (key == "label" && !value.empty() && value.size() <= 192)
+        control.label = value;
+      else if (key == "min" && EiemNumber(value, &control.minimum)) {}
+      else if (key == "max" && EiemNumber(value, &control.maximum)) {}
+      else return fail("Invalid ShapeControl field: " + key);
       continue;
     }
     if (section == Key) {
@@ -807,8 +890,23 @@ static bool EiemPrepareModPhysics(EiemModProgram &doc,std::string &error) {
 
 static bool EiemModParseFile(const char *path, EiemModProgram &output, std::string *error = nullptr) {
   if (error) error->clear();
-  std::ifstream input(path, std::ios::binary);
-  if (!input) return false;
+  auto input = EiemOpenUtf8Input(path);
+  if (!input) {
+    // Missing mod.ini is optional. A present but unreadable path must reject
+    // the candidate; otherwise F10 silently unloads that Mod.
+    try {
+      std::error_code diskError;
+      const auto status = path && path[0]
+          ? std::filesystem::status(std::filesystem::u8path(path), diskError)
+          : std::filesystem::file_status{};
+      if (error && ((diskError && diskError != std::errc::no_such_file_or_directory) ||
+                    (!diskError && std::filesystem::exists(status))))
+        *error = "mod.ini exists but cannot be read";
+    } catch (const std::exception &) {
+      if (error) *error = "mod.ini path cannot be inspected";
+    }
+    return false;
+  }
   EiemModProgram doc; std::string detail;
   if (!EiemModParseStream(input,path,doc,error)) return false;
   if (!EiemPrepareModPhysics(doc,detail)) { if (error) *error=detail; return false; }

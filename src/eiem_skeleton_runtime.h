@@ -469,7 +469,7 @@ static bool EiemAcquireSkeleton(const EiemModRule &rule, void *renderer,
                                  std::shared_ptr<EiemSkeletonInstance> &out,
                                  char *message, size_t messageSize) {
   out.reset();
-  EiemModResource resource={}; char path[MAX_PATH]={};
+  EiemModResource resource={}; char path[kEiemResourceDiskPathCapacity]={};
   if (!EiemFindModResource(rule.modPath,rule.skeleton,"Skeleton",&resource) ||
       !EiemResolveResourceDiskPath(resource,path,sizeof(path))) {
     if (message) strncpy_s(message,messageSize,

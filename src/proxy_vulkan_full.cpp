@@ -187,7 +187,9 @@
 #pragma comment(linker, "/export:vkGetDeviceImageSubresourceLayout=C:\\Windows\\System32\\vulkan-1.vkGetDeviceImageSubresourceLayout")
 #pragma comment(linker, "/export:vkGetDeviceMemoryCommitment=C:\\Windows\\System32\\vulkan-1.vkGetDeviceMemoryCommitment")
 #pragma comment(linker, "/export:vkGetDeviceMemoryOpaqueCaptureAddress=C:\\Windows\\System32\\vulkan-1.vkGetDeviceMemoryOpaqueCaptureAddress")
+#if !defined(EIEM_VK_INSTANCE_PROBE)
 #pragma comment(linker, "/export:vkGetDeviceProcAddr=C:\\Windows\\System32\\vulkan-1.vkGetDeviceProcAddr")
+#endif
 #pragma comment(linker, "/export:vkGetDeviceQueue=C:\\Windows\\System32\\vulkan-1.vkGetDeviceQueue")
 #pragma comment(linker, "/export:vkGetDeviceQueue2=C:\\Windows\\System32\\vulkan-1.vkGetDeviceQueue2")
 #pragma comment(linker, "/export:vkGetDisplayModeProperties2KHR=C:\\Windows\\System32\\vulkan-1.vkGetDisplayModeProperties2KHR")
@@ -203,7 +205,9 @@
 #pragma comment(linker, "/export:vkGetImageSparseMemoryRequirements2=C:\\Windows\\System32\\vulkan-1.vkGetImageSparseMemoryRequirements2")
 #pragma comment(linker, "/export:vkGetImageSubresourceLayout=C:\\Windows\\System32\\vulkan-1.vkGetImageSubresourceLayout")
 #pragma comment(linker, "/export:vkGetImageSubresourceLayout2=C:\\Windows\\System32\\vulkan-1.vkGetImageSubresourceLayout2")
+#if !defined(EIEM_VK_INSTANCE_PROBE)
 #pragma comment(linker, "/export:vkGetInstanceProcAddr=C:\\Windows\\System32\\vulkan-1.vkGetInstanceProcAddr")
+#endif
 #pragma comment(linker, "/export:vkGetPhysicalDeviceDisplayPlaneProperties2KHR=C:\\Windows\\System32\\vulkan-1.vkGetPhysicalDeviceDisplayPlaneProperties2KHR")
 #pragma comment(linker, "/export:vkGetPhysicalDeviceDisplayPlanePropertiesKHR=C:\\Windows\\System32\\vulkan-1.vkGetPhysicalDeviceDisplayPlanePropertiesKHR")
 #pragma comment(linker, "/export:vkGetPhysicalDeviceDisplayProperties2KHR=C:\\Windows\\System32\\vulkan-1.vkGetPhysicalDeviceDisplayProperties2KHR")

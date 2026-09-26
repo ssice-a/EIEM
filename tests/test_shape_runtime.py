@@ -1,5 +1,6 @@
 """Execute the production IL2CPP shape adapter with a simulated native API."""
 from pathlib import Path
+from runtime_source import read_runtime_source
 import shutil
 import subprocess
 import tempfile
@@ -94,7 +95,7 @@ class ShapeRuntimeTests(unittest.TestCase):
     def test_native_adapter_readback_thread_and_failures(self):
         if not shutil.which("cl"):
             self.skipTest("Requires MSVC")
-        trace = (ROOT / "src/il2cpp_trace.h").read_text(encoding="utf-8")
+        trace = read_runtime_source(ROOT)
         api = (ROOT / "src/il2cpp_api.h").read_text(encoding="utf-8")
         invoke = api[api.index("static bool InvokeChecked"):api.index("static void DumpClassMethods")]
         start = trace.index("struct EiemUnityShapes")

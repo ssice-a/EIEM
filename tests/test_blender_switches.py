@@ -38,10 +38,14 @@ int main(int argc, char **argv) {
   CHECK(EiemParseKeyChord("F7", &accessory));
   CHECK(EiemParseKeyChord("F8", &increase) && EiemParseKeyChord("F9", &decrease));
   CHECK(shape(p) > .79f && shape(p) < .81f);
-  EiemCycleModKey(p, increase); CHECK(shape(p) == 1);
-  EiemCycleModKey(p, increase); CHECK(shape(p) == 1); // direction never reverses
-  EiemCycleModKey(p, decrease); CHECK(shape(p) == 0);
-  EiemCycleModKey(p, decrease); CHECK(shape(p) == 0);
+  for (int i = 0; i < 2; ++i) EiemApplyModKey(p, increase, false, nullptr, nullptr, true, .25);
+  CHECK(shape(p) == 1);
+  EiemApplyModKey(p, increase, false, nullptr, nullptr, true, .25);
+  CHECK(shape(p) == 1); // direction never reverses
+  for (int i = 0; i < 8; ++i) EiemApplyModKey(p, decrease, false, nullptr, nullptr, true, .25);
+  CHECK(shape(p) == 0);
+  EiemApplyModKey(p, decrease, false, nullptr, nullptr, true, .25);
+  CHECK(shape(p) == 0);
   EiemCycleModKey(p, top); CHECK(mask(p) == 0); // variant submesh becomes visible
   EiemCycleModKey(p, accessory); CHECK(mask(p) == 1);
   EiemCycleModKey(p, top); CHECK(mask(p) == 13); // empty top style

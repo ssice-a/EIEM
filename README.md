@@ -1,48 +1,79 @@
-# EIEM Importing Endfield MMD
-
-Mod 制作工具、现行契约与工作区状态：[文档索引](docs/README.md)。
+# EIEM：终末地资源替换
 
 [English](README_EN.md) | 中文
 
-为《明日方舟：终末地》提供 MMD 动画播放能力。支持肌肉动作、面部表情、手指动画、相机运动和背景音乐同步，通过游戏内 GUI 面板控制。
+EIEM 是《明日方舟：终末地》的游戏内资源替换插件。它按原资源身份替换模型、材质和贴图；Mod 作者可用 [AnimeStudio](https://github.com/ssice-a/AnimeStudio) 导出源资源，再用 [EIEM Blender 插件](https://github.com/ssice-a/EIEM-blender) 编辑并导出 Mod。只使用现成 Mod 时，无需安装这两个制作工具。
 
-演示动画: [bilibili](https://www.bilibili.com/video/BV1YdEC6bEfP/)
-交流群：1036919766
+当前开发版与已发布版可能不同。使用已发布版本时，以对应的 Release 说明为准。
 
-## v1.0.0 资源级替换
+## 功能
 
-v1.0.0 是资源替换第一阶段的发布版本。它把 Mesh、材质和贴图替换接入游戏已有的 Renderer 装配路径，保留游戏自己的动画、蒙皮、LOD 和实例生命周期。
+- 替换 Mesh、材质、贴图及声明的材质参数；一个 Mesh 可包含多个 submesh 和材质槽。
+- 相同资源规则应用于大世界角色、角色 UI 和 NPC，并支持作者导出的 LOD 规则。
+- 每个 Mod 有独立的款式按键和形态键状态；内置管理页提供按键按钮与形态键滑块。
+- 按 F10 重新读取 Mod 配置与资源，更新已登记的实例；配置解析失败时保留上一份有效配置。
+- 可在全局配置中修改管理页和刷新快捷键，也可配置反虚化。
+- 打开 Mod 管理页时检查本仓库的新 Release；可稍后再说或忽略指定版本。
 
-### 当前可以做到
+## 下载与安装
 
-- 按资源身份替换 Mesh、材质、贴图和已声明的材质参数。
-- 一个目标 Renderer 装配合并 Mesh，支持多个 submesh 和多个材质槽。
-- 世界角色、角色 UI 和 NPC 使用同一套资源规则，不创建独立 Partner。
-- F10 热重载更新已存在实例；解析失败时保留上一代有效配置。
-- `cycle` 一按一切换，`hold` 按住连续改变形态值；Mod 之间的状态彼此隔离。
-- Blender 0.32.0 插件支持 LOD0-4 选择与模板复制、选中 Mesh-only 导出，包含材质和贴图，跳过骨架与物理导出。
-- LOD 导出只针对当前工程实际发现的级别；一份选中 Mesh 资源由各 LOD 的精确 Render 规则共同引用，并复用同一切换状态。
+从 **[EIEM Releases](https://github.com/ssice-a/EIEM/releases)** 下载 DLL 发布包。关闭游戏后，将 ZIP 解压到 `Endfield.exe` 所在目录：
 
-### TODO
+```text
+游戏目录/
+├─ d3dcompiler_47.dll      # DirectX 代理加载器
+├─ vulkan-1.dll            # Vulkan 代理加载器
+└─ plugin/
+   ├─ eiem.dll
+   ├─ eiem.ini             # 全局设置；缺失时插件会生成默认文件
+   └─ mods/
+      └─ 某个Mod/
+         ├─ mod.ini
+         └─ ...            # 保持 Mod 包内的资源目录结构
+```
 
-- 骨架新增与跨世界/UI/NPC 实例的统一注册。
-- 物理骨骼、碰撞体和物理参数接入游戏原生工厂与生命周期。
-- 更多游戏版本的资源契约回归和发布包自动化验证。
+可按实际图形环境放置一个或两个代理加载器。已有其他插件提供兼容的同名加载器时，先核对加载方式，不要直接覆盖。`plugin`、`mods` 目录不存在时可自行创建。[Applepie Manager](https://github.com/Sasye/ApplepieManager) 是可选的插件管理工具。
 
-### 上游鸣谢
+安装现成 Mod 时，将**包含 `mod.ini` 的文件夹**放入 `plugin/mods/`；确认没有多解压一层目录。更新 EIEM 时先退出游戏，替换 DLL 和需要更新的加载器，保留自己的 `plugin/eiem.ini` 与 `plugin/mods/`。
 
-- [AnimeStudio](https://github.com/Escartem/AnimeStudio) 及其历史贡献者：提供 Unity 资源浏览、VFS 读取、依赖解析和导出基础；EIEM 的 Endfield 适配与 Blender/DLL 集成在此基础上维护。上游使用 MIT 许可证，随解包包附带其许可证文件。
+## 游戏内使用
+
+1. 启动游戏并进入包含目标角色的场景。符合资源规则的 Mod 会自动应用。
+2. 按 **Insert** 打开 Mod 管理页，选择要控制的 Mod，使用页面上的按键按钮或形态键滑块。没有按键和滑块的静态 Mod 仍可自动生效。
+3. 修改或新增 Mod 文件后按 **F10** 热重载。
+
+`plugin/eiem.ini` 中的快捷键可修改，例如：
+
+```ini
+[Hotkeys]
+reload=F10
+gui=INSERT
+
+[Graphics]
+disable_camera_fade=true
+```
+
+修改快捷键后，先按一次**旧的刷新快捷键**加载新设置。更多按键与 Mod 规则见[配置说明](docs/conditional-keys.md)。
+
+## 制作自己的 Mod
+
+1. 使用 AnimeStudio 打开游戏 VFS，选择 Prefab，导出 EIEM 源包。
+2. 在 Blender 中安装并启用 EIEM Blender 插件，导入源包的 `mod.ini`。
+3. 编辑网格、材质、贴图、款式或形态键，选择目标网格，导出 EIEM Mod 包。
+4. 将导出文件夹放入 `plugin/mods/`，进游戏按 F10 检查效果。
+
+具体步骤见 [AnimeStudio 说明](tools/README.md)与 [Blender 插件说明](https://github.com/ssice-a/EIEM-blender#readme)。
+
+## TODO
+
+- 完成大世界、角色 UI、NPC 的冷启动与连续热重载验收。
+- 完善新增骨骼、物理骨骼和碰撞体的游戏原生装配。
+- 扩充游戏版本兼容验证和三端发布包检查。
+
+## 鸣谢
+
+- [AnimeStudio](https://github.com/Escartem/AnimeStudio) 及其贡献者提供资源浏览、解包与导出基础；EIEM 使用其独立维护的 fork。
 - [MinHook](https://github.com/TsudaKageyu/minhook)、[Dear ImGui](https://github.com/ocornut/imgui) 及其他依赖的版权与许可证见 [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES)。
-
-发布包：
-
-- `EIEM_v1.0.0_dll.zip`：DLL、代理加载器和配置模板。
-- [EIEM-blender](https://github.com/ssice-a/EIEM-blender)：Blender 导入、编辑与 Mod 导出插件，独立版本和发布。
-- [AnimeStudio fork](https://github.com/ssice-a/AnimeStudio)：Endfield VFS 浏览、解包与 EIEM 源包导出，独立版本和发布。
-
-三个仓库通过版本化的 EIEM 文件格式连接。本仓库负责 DLL 运行时、格式规范和跨端集成测试；
-两个工具仓库以 submodule 固定到已验证提交，源码与发布不再重复维护。详见
-[仓库边界](docs/repository-architecture.md)。
 
 ## 用户协议与免责声明
 
@@ -64,79 +95,3 @@ v1.0.0 是资源替换第一阶段的发布版本。它把 Mesh、材质和贴�
 - 本项目仅供学习、技术研究和交流目的。本插件中使用的明日方舟游戏数据资产版权均隶属于鹰角网络。使用本工具可能违反游戏服务条款，存在账号封禁的风险。因使用本插件而直接或间接导致的任何损失（包括但不限于账号封禁、游戏数据损坏等），**本项目不承担任何法律或经济责任**。用户需自行承担所有风险，强烈建议您在测试账号上运行。
 
 </details>
-
-## 功能
-
-### 已实装
-- **肌肉驱动动作**：通过 95 个 muscle 值，驱动全身动作
-- **手指动画**：30 根手指骨骼的独立旋转控制
-- **面部表情**：AIUEO、眨眼、笑眼等基础表情
-- **相机运动**：VMD 相机关键帧（含角色朝向对齐）
-- **音频同步**：MCI 后端播放 WAV/MP3 BGM
-- **地形与台阶跟随**：实时地面碰撞探测，支持上下坡与台阶楼梯自适应吸附
-- **游戏原生 IK**：支持使用 VMD 足部 IK 数据驱动游戏原生 BipedIK 解算器
-
-### 实现中
-- **VMD直接播放模式**
-
-### 已计划
-- 多角色同屏播放
-- ...
-
-## 下载
-
-您可以在 [Releases](https://github.com/ssice-a/EIEM/releases) 下载最新 DLL 发布版或从源代码自行编译。
-
-> 使用 [Applepie Manager](https://github.com/Sasye/ApplepieManager) 来便捷地管理和配置此插件。
-
-## 安装
-
-将以下文件复制到游戏目录（`Endfield.exe` 所在文件夹）：
-
-```
-bin/eiem.dll             → 游戏目录/plugin/eiem.dll
-bin/vulkan-1.dll         → 游戏目录/vulkan-1.dll
-bin/d3dcompiler_47.dll   → 游戏目录/d3dcompiler_47.dll
-```
-
-> **注意**：`d3dcompiler_47.dll`（DX环境）和 `vulkan-1.dll`（Vulkan环境）为代理加载器，二者放其一或全放均可。如果你同时在使用其他共用的代理加载器插件（如 [AntiKick](https://github.com/Sasye/EndFieldAntiKick) [SynchroFocus](https://github.com/Sasye/EndfieldSynchroFocus) 或 [EndfieldCombatHUD](https://github.com/Sasye/EndfieldCombatHUD)等），无需重复放置代理加载器。
-
-> 如果您**没有安装过此类型的插件**，您可能需要自行创建plugin文件夹。
-
-## 资源文件准备
-
-自动扫描 `游戏目录/plugin/` 或手动指定以下文件：
-
-| 文件 | 说明 | 必要性 |
-|------|------|--------|
-| `muscle_anim.bin` | MUS4 格式动作数据（由ExportMuscleAnimation.cs导出） | **必须** |
-| `*.vmd` | VMD 文件（面部表情 morph 数据） | 可选（自动扫描 plugin 目录下的 .vmd） |
-| `camera.vmd` | 相机运动数据 | 可选 |
-| `bgm.wav` 或 `bgm.mp3` | 背景音乐 | 可选 |
-
-## 使用方法
-
-1. 按上述方式安装后启动游戏，进入游戏。
-2. 按 **Insert** 键打开 GUI 面板。
-3. 加载指定文件后在「控制」页点击 **播放** 按钮开始播放动画。
-
-## 动作导出（VMD → MUS4）
-
-需要先通过 Unity 编辑器将 VMD 动画转换为 MUS4 格式的 `muscle_anim.bin`。
-
-### 前置条件
-
-- Unity 编辑器
-- [MMD4Mecanim](https://stereoarts.jp/#:~:text=MMD4Mecanim_Beta_20200105.zip) — 用于将 VMD 转换为 Unity AnimationClip
-- 任意 Humanoid MMD 模型
-
-### 步骤
-
-1. 将 `ExportMuscleAnimation.cs` 放入 Unity 项目的 `Assets/Editor/` 文件夹
-2. 导入 MMD 模型（设为 Humanoid Rig），使用 MMD4Mecanim 将 VMD 转换为 AnimationClip
-3. 创建 Animator Controller，将转换好的 AnimationClip 添加为默认状态
-4. 将 Animator Controller 挂载到场景中的模型上
-5. **选中模型**，点击菜单栏 `Tools > Export Muscle Animation`
-6. 导出文件 `Assets/muscle_anim.bin`，将其复制到游戏的 `plugin/` 目录即可
-
-> 面部表情不走此导出流程 — 直接将原始 `.vmd` 文件放到 `plugin/` 目录下即可，本插件将自动解析 morph 数据。

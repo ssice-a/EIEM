@@ -3,7 +3,7 @@
 #include "eiem_runtime_features.h"
 
 #define EIEM_VERSION_MAJOR 1
-#define EIEM_VERSION_MINOR 0
+#define EIEM_VERSION_MINOR 1
 #define EIEM_VERSION_PATCH 0
 
 // Stable static-replacement profile. Legacy animation, camera, face and MMD
@@ -20,6 +20,13 @@ static constexpr bool kEiemEnableLegacyWorkers =
 static constexpr bool kEiemEnableMaterialLifecycle = true;
 // Enable the identity probe only for a dedicated evidence run. It is
 // intentionally separate from the production baseline.
+// Evidence build: enable the bounded owner/assembly identity records. This
+// remains observation-only; the experimental resource and physics writers are
+// still disabled.
+// Broad identity census is disabled during the CPU-only skin evidence run.
+// The previous census emitted thousands of INSTANCE-REG records during cold
+// start and made the game's startup path visibly stall. Targeted lifecycle,
+// native-physics, descriptor and skin-binding probes remain enabled below.
 static constexpr bool kEiemValidationIdentityProbe = false;
 static constexpr bool kEiemValidationVfsCapture = false;
 
@@ -32,11 +39,22 @@ static constexpr bool kEiemValidationVfsCapture = false;
 #define WM_EIEM_MOD_RECONCILE (WM_APP + 0x316)
 #define WM_EIEM_MOD_KEY (WM_APP + 0x317)
 #define WM_EIEM_MOD_HOLD (WM_APP + 0x318)
+#define WM_EIEM_PHYSICS_CAPTURE (WM_APP + 0x319)
 static constexpr UINT_PTR kEiemModRetryTimer = 0xE13A;
-static constexpr UINT_PTR kEiemModReplayTimer = 0xE13B;
+// Observation-only skin timing sample scheduled after an F10 transaction.
+static constexpr UINT_PTR kEiemSkinTimingProbeTimer = 0xE154;
+// A manual F12 capture is always auto-stopped by this timer.  Keeping this
+// distinct from the skin sample timer prevents either diagnostic from
+// extending the other's lifetime.
+static constexpr UINT_PTR kEiemPhysicsCaptureTimer = 0xE155;
 
 static HANDLE g_logHandle = INVALID_HANDLE_VALUE;
 static CRITICAL_SECTION g_logLock;
+#if defined(EIEM_NATIVE_MESH_DESERIALIZE_TRACE_BUILD)
+static uint64_t g_meshDeserializeDiagnosticLogBytes = 0;
+static constexpr uint64_t kMeshDeserializeDiagnosticLogLimit =
+    16ull * 1024ull * 1024ull;
+#endif
 
 void Log(const char *fmt, ...) {
   if (g_logHandle == INVALID_HANDLE_VALUE)
@@ -57,8 +75,18 @@ void Log(const char *fmt, ...) {
   // indefinitely on a damaged/stuck callback.
   if (!TryEnterCriticalSection(&g_logLock))
     return;
+#if defined(EIEM_NATIVE_MESH_DESERIALIZE_TRACE_BUILD)
+  if (g_meshDeserializeDiagnosticLogBytes + static_cast<uint64_t>(len) >
+      kMeshDeserializeDiagnosticLogLimit) {
+    LeaveCriticalSection(&g_logLock);
+    return;
+  }
+#endif
   DWORD written;
   WriteFile(g_logHandle, buf, len, &written, NULL);
+#if defined(EIEM_NATIVE_MESH_DESERIALIZE_TRACE_BUILD)
+  g_meshDeserializeDiagnosticLogBytes += written;
+#endif
   LeaveCriticalSection(&g_logLock);
 }
 
@@ -428,6 +456,13 @@ static void *g_smr_get_forceMatrixRecalculationPerRender = nullptr;
 static void *g_smr_set_forceMatrixRecalculationPerRender = nullptr;
 static void *g_smr_get_skinnedMotionVectors = nullptr;
 static void *g_smr_set_skinnedMotionVectors = nullptr;
+// Read-only skin submission probes. These are installed only for the
+// temporary intermittent-pose investigation; they never change Renderer
+// state or request a recalculation.
+static void *g_smr_requestCurrentFrameSkinMatrices = nullptr;
+static void *g_smr_skinMatricesRequestFinished = nullptr;
+static void *g_smr_getVertexBuffer = nullptr;
+static void *g_smr_getPreviousVertexBuffer = nullptr;
 static void *g_smr_get_localBounds = nullptr;
 static void *g_smr_set_localBounds = nullptr;
 

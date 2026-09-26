@@ -29,6 +29,8 @@ extern "C" MH_STATUS WINAPI MH_EnableHook(LPVOID) {
   ++enables;return enables==failEnable?MH_ERROR_MEMORY_PROTECT:MH_OK;
 }
 static constexpr size_t opCount=(size_t)EiemPhysicsOperation::Count;
+static constexpr size_t hookCount=_countof(s_eiemPhysicsTraceHooks)+
+  _countof(s_eiemPhysicsIcallTraceHooks)+_countof(s_eiemPhysicsJobTraceHooks);
 static std::atomic<int> forwarded[opCount],badArguments{0};
 static std::atomic<bool> blocked{false},entered{false},releaseCall{false};
 static bool throwCall=false,nestedCall=false;
@@ -67,13 +69,11 @@ static void NativeTeamObject(void *o,int32_t teamId,void *related,void *m) {
   Seen(Op,o,m);
   if(teamId!=expectedTeamId||related!=expectedRelated)++badArguments;
 }
-static void *nativeTargets[]={ (void *)NativeBuild,(void *)NativeStart,(void *)NativeInit,
-  (void *)NativeDispose,(void *)NativeDisposeInternal,(void *)NativeRemove,(void *)NativeComplete,
-  (void *)NativeUpdateAnimator,(void *)NativeClearAnimator,
+static void *focusedTargets[]={ (void *)NativeComplete,
   (void *)NativeTeamObject<EiemPhysicsOperation::TeamAddAnimatorData>,
-  (void *)NativeTeamObject<EiemPhysicsOperation::TeamAddAnimatorTransform>,
-  (void *)NativeTeamObject<EiemPhysicsOperation::TeamMarkAnimatorTransformDirty> };
-static Klass teamManager{"TeamManager","BeyondDynamicBone",{},{}},clothManager{"ClothManager","BeyondDynamicBone",{},{}};
+  (void *)NativeTeamObject<EiemPhysicsOperation::TeamAddAnimatorTransform> };
+static Klass teamManager{"TeamManager","BeyondDynamicBone",{},{}},clothManager{"ClothManager","BeyondDynamicBone",{},{}},
+  transformManager{"DynamicBoneTransformManager","BeyondDynamicBone",{},{} };
 static Klass animator{"Animator","UnityEngine",{},{}};
 struct BindingCounts {uint16_t count,invalid;};
 static void SeenIcall(EiemPhysicsOperation op,void *o,void *related=nullptr) {
@@ -93,17 +93,55 @@ static void NativeDisableBindings(void *o) {SeenIcall(EiemPhysicsOperation::Anim
 static void NativeDestroyBindings(void *o) {SeenIcall(EiemPhysicsOperation::AnimatorDestroyClothBindings,o);}
 static void *icallTargets[]={ (void *)NativeCreateTransforms,(void *)NativeCreateNames,
   (void *)NativeEnableBindings,(void *)NativeDisableBindings,(void *)NativeDestroyBindings };
+template<EiemPhysicsOperation Op>
+static EiemPhysicsJobHandle NativeJob4(void *o,EiemPhysicsJobHandle dependency,
+                                      void *teamMap,void *animatorMap,void *transformMap,void *m) {
+  Seen(Op,o,m);
+  if(teamMap!=expectedValues||animatorMap!=expectedRelated||transformMap!=expectedValues)
+    ++badArguments;
+  return {dependency.handle+1,dependency.version+1};
+}
+template<EiemPhysicsOperation Op>
+static EiemPhysicsJobHandle NativeJob1(void *o,EiemPhysicsJobHandle dependency,void *m) {
+  Seen(Op,o,m);return {dependency.handle+1,dependency.version+1};
+}
+static void *jobTargets[]={
+  (void *)NativeJob4<EiemPhysicsOperation::DynamicBoneWriteAnimatorBufferData>,
+  (void *)NativeJob4<EiemPhysicsOperation::DynamicBoneReadAnimatorBufferData>,
+  (void *)NativeJob1<EiemPhysicsOperation::DynamicBoneCopyDoubleBuffer>,
+  (void *)NativeJob1<EiemPhysicsOperation::DynamicBoneWriteDoubleBufferTransform>};
 static void SetupTrace() {
   Setup();cloth.methods.clear();processClass.methods.clear();
   nativeImage.classes.push_back(&teamManager);nativeImage.classes.push_back(&clothManager);
+  nativeImage.classes.push_back(&transformManager);
   for(size_t i=0;i<_countof(s_eiemPhysicsTraceHooks);++i) {
     const auto &h=s_eiemPhysicsTraceHooks[i];
     auto *k=(Klass *)il2cpp_class_from_name(&nativeImage,"BeyondDynamicBone",h.klass);
     Method m(h.name,h.returns,0,h.parameter0?
       (h.parameter1?std::vector<const char *>{h.parameter0,h.parameter1}:
                     std::vector<const char *>{h.parameter0}):std::vector<const char *>{});
-    m.mp=nativeTargets[i];k->methods.push_back(m);
+    m.mp=focusedTargets[i];k->methods.push_back(m);
   }
+  for(size_t i=0;i<_countof(s_eiemPhysicsJobTraceHooks);++i) {
+    const auto &h=s_eiemPhysicsJobTraceHooks[i];
+    Method m(h.name,h.returns,0,h.hasMaps?
+      std::vector<const char *>{h.parameter0,h.parameter1,h.parameter2,h.parameter3}:
+      std::vector<const char *>{h.parameter0});
+    m.mp=jobTargets[i];transformManager.methods.push_back(m);
+  }
+  s_eiemPhysicsTraceOriginal[(size_t)EiemPhysicsOperation::BuildAndRun]=(void *)NativeBuild;
+  s_eiemPhysicsTraceOriginal[(size_t)EiemPhysicsOperation::StartRuntimeBuild]=(void *)NativeStart;
+  s_eiemPhysicsTraceOriginal[(size_t)EiemPhysicsOperation::Init]=(void *)NativeInit;
+  s_eiemPhysicsTraceOriginal[(size_t)EiemPhysicsOperation::Dispose]=(void *)NativeDispose;
+  s_eiemPhysicsTraceOriginal[(size_t)EiemPhysicsOperation::DisposeInternal]=(void *)NativeDisposeInternal;
+  s_eiemPhysicsTraceOriginal[(size_t)EiemPhysicsOperation::RemoveMonitoringProcess]=(void *)NativeRemove;
+  s_eiemPhysicsTraceOriginal[(size_t)EiemPhysicsOperation::TeamUpdateAnimatorData]=(void *)NativeUpdateAnimator;
+  s_eiemPhysicsTraceOriginal[(size_t)EiemPhysicsOperation::TeamClearAnimatorData]=(void *)NativeClearAnimator;
+  s_eiemPhysicsTraceOriginal[(size_t)EiemPhysicsOperation::TeamMarkAnimatorTransformDirty]=
+    (void *)NativeTeamObject<EiemPhysicsOperation::TeamMarkAnimatorTransformDirty>;
+  s_eiemPhysicsTraceOriginal[(size_t)EiemPhysicsOperation::AnimatorEnableClothBindings]=(void *)NativeEnableBindings;
+  s_eiemPhysicsTraceOriginal[(size_t)EiemPhysicsOperation::AnimatorDisableClothBindings]=(void *)NativeDisableBindings;
+  s_eiemPhysicsTraceOriginal[(size_t)EiemPhysicsOperation::AnimatorDestroyClothBindings]=(void *)NativeDestroyBindings;
   unityImage.name=EiemPhysicsAnimatorImage;unityImage.classes.push_back(&animator);
   for(const auto &h:s_eiemPhysicsIcallTraceHooks) {
     Method m(h.name,"System.Void",0,h.parameter0?
@@ -138,16 +176,16 @@ int main(int argc,char **argv) {
      mode=="wrong-icall-signature" || mode=="non-icall") {
     if(mode=="off-thread")onThread=false;
     if(mode=="missing-api")il2cpp_image_get_class=nullptr;
-    if(mode=="static")cloth.methods[0].flags=0x10;
-    if(mode=="wrong-return")cloth.methods[0].ret="System.Int32";
+    if(mode=="static")clothManager.methods[0].flags=0x10;
+    if(mode=="wrong-return")clothManager.methods[0].ret="System.Int32";
     if(mode=="wrong-parameter")teamManager.methods[0].params[0]="System.Object";
-    if(mode=="missing-address")cloth.methods[0].mp=nullptr;
-    if(mode=="shared-target")processClass.methods[0].mp=cloth.methods[0].mp;
+    if(mode=="missing-address")clothManager.methods[0].mp=nullptr;
+    if(mode=="shared-target")teamManager.methods[0].mp=clothManager.methods[0].mp;
     if(mode=="alias" || mode=="external-alias") {
-      Method alias(nullptr,"System.Void",0,{});alias.mp=cloth.methods[0].mp;
+      Method alias(nullptr,"System.Void",0,{});alias.mp=clothManager.methods[0].mp;
       (mode=="alias"?processClass:unityObject).methods.push_back(alias);
     }
-    if(mode=="ambiguous")cloth.methods.push_back(cloth.methods[0]);
+    if(mode=="ambiguous")clothManager.methods.push_back(clothManager.methods[0]);
     if(mode=="missing-icall")il2cpp_resolve_icall=nullptr;
     if(mode=="wrong-icall-signature")animator.methods[0].params[0]="System.Object[]";
     if(mode=="non-icall")animator.methods[0].impl=0;
@@ -163,17 +201,18 @@ int main(int argc,char **argv) {
     CHECK(EiemPhysicsTraceBool<EiemPhysicsOperation::BuildAndRun>(expectedObject,expectedMethod));
     CHECK(s_eiemPhysicsTraceSequence==0);
     failCreate=failEnable=0;CHECK(EiemStartPhysicsTrace(error));
-    CHECK(creates==(mode=="create-failure"?opCount+1:opCount));
-    CHECK(enables==(mode=="enable-failure"?opCount+1:opCount));
+    CHECK(creates==(mode=="create-failure"?hookCount+1:hookCount));
+    CHECK(enables==(mode=="enable-failure"?hookCount+1:hookCount));
     for(const auto &hook:s_eiemPhysicsTraceHooks)CHECK(hook.created&&hook.enabled);
     for(const auto &hook:s_eiemPhysicsIcallTraceHooks)CHECK(hook.created&&hook.enabled);
   } else {
-    CHECK(EiemStartPhysicsTrace(error));CHECK(creates==opCount&&enables==opCount);
+    CHECK(EiemStartPhysicsTrace(error,mode=="deadline"?15:0));
+    CHECK(creates==hookCount&&enables==hookCount);
   }
   CHECK(!EiemPhysicsBeginTrace(error));CHECK(!error.empty());
   if(mode=="stale-target") {
-    EiemPhysicsStopTrace();cloth.methods[0].mp=(void *)Seen;
-    CHECK(!EiemStartPhysicsTrace(error));CHECK(creates==opCount&&enables==opCount);
+    EiemPhysicsStopTrace();clothManager.methods[0].mp=(void *)Seen;
+    CHECK(!EiemStartPhysicsTrace(error));CHECK(creates==hookCount&&enables==hookCount);
   } else if(mode=="normal") {
     CHECK(EiemPhysicsTraceBool<EiemPhysicsOperation::BuildAndRun>(expectedObject,expectedMethod));
     CHECK(!EiemPhysicsTraceBool<EiemPhysicsOperation::StartRuntimeBuild>(expectedObject,expectedMethod));
@@ -193,8 +232,30 @@ int main(int argc,char **argv) {
     EiemPhysicsTraceIcallVoid<EiemPhysicsOperation::AnimatorEnableClothBindings>(expectedObject);
     EiemPhysicsTraceIcallVoid<EiemPhysicsOperation::AnimatorDisableClothBindings>(expectedObject);
     EiemPhysicsTraceIcallVoid<EiemPhysicsOperation::AnimatorDestroyClothBindings>(expectedObject);
+    EiemPhysicsJobHandle dependency{42,7};
+    const auto write=EiemPhysicsTraceJobBuffer4<EiemPhysicsOperation::DynamicBoneWriteAnimatorBufferData>(
+      expectedObject,dependency,expectedValues,expectedRelated,expectedValues,expectedMethod);
+    const auto read=EiemPhysicsTraceJobBuffer4<EiemPhysicsOperation::DynamicBoneReadAnimatorBufferData>(
+      expectedObject,dependency,expectedValues,expectedRelated,expectedValues,expectedMethod);
+    const auto copy=EiemPhysicsTraceJobBuffer1<EiemPhysicsOperation::DynamicBoneCopyDoubleBuffer>(
+      expectedObject,dependency,expectedMethod);
+    const auto writeback=EiemPhysicsTraceJobBuffer1<EiemPhysicsOperation::DynamicBoneWriteDoubleBufferTransform>(
+      expectedObject,dependency,expectedMethod);
+    CHECK(write.handle==43&&read.handle==43&&copy.handle==43&&writeback.handle==43);
     CHECK(a.count==4&&a.invalid==1&&b.count==3&&b.invalid==2);
-    for(auto &n:forwarded)CHECK(n==1);
+    for(auto op:{EiemPhysicsOperation::BuildAndRun,EiemPhysicsOperation::StartRuntimeBuild,
+      EiemPhysicsOperation::Init,EiemPhysicsOperation::Dispose,EiemPhysicsOperation::DisposeInternal,
+      EiemPhysicsOperation::RemoveMonitoringProcess,EiemPhysicsOperation::CompleteMasterJob,
+      EiemPhysicsOperation::TeamUpdateAnimatorData,EiemPhysicsOperation::TeamClearAnimatorData,
+      EiemPhysicsOperation::TeamAddAnimatorData,EiemPhysicsOperation::TeamAddAnimatorTransform,
+      EiemPhysicsOperation::TeamMarkAnimatorTransformDirty,
+      EiemPhysicsOperation::AnimatorCreateClothBindings,EiemPhysicsOperation::AnimatorCreateClothBindingsByName,
+      EiemPhysicsOperation::AnimatorEnableClothBindings,EiemPhysicsOperation::AnimatorDisableClothBindings,
+      EiemPhysicsOperation::AnimatorDestroyClothBindings,
+      EiemPhysicsOperation::DynamicBoneWriteAnimatorBufferData,
+      EiemPhysicsOperation::DynamicBoneReadAnimatorBufferData,
+      EiemPhysicsOperation::DynamicBoneCopyDoubleBuffer,
+      EiemPhysicsOperation::DynamicBoneWriteDoubleBufferTransform})CHECK(forwarded[(size_t)op]==1);
   } else if(mode=="exception") {
     throwCall=true;CHECK(PropagatedException()==0xe1234567);CHECK(forwarded[0]==1);
   } else if(mode=="nested") {
@@ -221,14 +282,25 @@ int main(int argc,char **argv) {
     for(size_t n=0;n<EiemPhysicsTraceCapacity/2+3;++n)
       EiemPhysicsTraceVoid<EiemPhysicsOperation::Init>(expectedObject,expectedMethod);
     CHECK(s_eiemPhysicsTraceDropped==6);
+  } else if(mode=="deadline") {
+    EiemPhysicsTraceVoid<EiemPhysicsOperation::Init>(expectedObject,expectedMethod);
+    Sleep(25);
+    EiemPhysicsTraceVoid<EiemPhysicsOperation::Init>(expectedObject,expectedMethod);
+    CHECK(forwarded[(size_t)EiemPhysicsOperation::Init]==2);
+    CHECK(!EiemPhysicsTraceActive()&&s_eiemPhysicsTraceSequence==2);
   } else if(mode=="unsaved") {
     EiemPhysicsTraceVoid<EiemPhysicsOperation::Init>(expectedObject,expectedMethod);
+    alignas(8) unsigned char bindingHandle[0x80]={};
+    EiemPhysicsTraceIcallCreate<EiemPhysicsOperation::AnimatorCreateClothBindings>(
+      expectedObject,expectedRelated,bindingHandle);
+    CHECK(s_eiemPhysicsBindingSnapshotCount==1);
     EiemPhysicsStopTrace();EiemPhysicsTraceReceipt receipt;
     CHECK(Export((std::string(argv[2])+".unacked").c_str(),&receipt));
     CHECK(!EiemPhysicsBeginTrace(error)); // Writing alone does not acknowledge a successful close.
     EiemPhysicsTraceExported({receipt.session+1,receipt.sequence});CHECK(!EiemPhysicsBeginTrace(error));
     EiemPhysicsTraceExported(receipt);CHECK(EiemPhysicsBeginTrace(error));
     CHECK(s_eiemPhysicsTraceSession==2&&s_eiemPhysicsTraceSequence==0);
+    CHECK(s_eiemPhysicsBindingSnapshotCount==0);
     EiemPhysicsTraceExported(receipt);CHECK(s_eiemPhysicsTraceSaved==0);
     EiemPhysicsTraceVoid<EiemPhysicsOperation::Dispose>(expectedObject,expectedMethod);
   } else if(mode!="create-failure"&&mode!="enable-failure") { CHECK(false); }
@@ -290,7 +362,7 @@ class NativePhysicsTrace(unittest.TestCase):
         data = self.trace('normal')
         self.assert_pairs(data)
         returns = [e for e in data['events'] if e['phase'] == 'return']
-        self.assertEqual(len(returns), 17)
+        self.assertEqual(len(returns), 21)
         self.assertIs(returns[0]['result'], True)
         self.assertIs(returns[1]['result'], False)
         self.assertTrue(all(e['result'] is None for e in returns[2:]))
@@ -300,6 +372,9 @@ class NativePhysicsTrace(unittest.TestCase):
         self.assertTrue(all(e['bindingCount'] is None for e in returns[:12] + returns[14:]))
         self.assertTrue(all(e['teamId'] is None for e in returns[:8] + returns[12:]))
         self.assertTrue(all(e['teamId'] == 77 for e in returns[8:12]))
+        for event in returns[-4:]:
+            self.assertEqual(int(event['jobInput'], 16), (7 << 32) | 42)
+            self.assertEqual(int(event['jobOutput'], 16), (8 << 32) | 43)
 
     def test_native_exception_propagates_and_records_unwind(self):
         data = self.trace('exception')
@@ -333,6 +408,12 @@ class NativePhysicsTrace(unittest.TestCase):
         self.assertEqual(len(data['events']), data['capacity'])
         self.assertEqual(data['dropped'], 6)
         self.assertEqual(data['sequence'], data['capacity'] + 6)
+
+    def test_recording_deadline_survives_a_stalled_window_timer(self):
+        data = self.trace('deadline')
+        self.assert_pairs(data)
+        self.assertFalse(data['recording'])
+        self.assertEqual(len(data['events']), 2)
 
     def test_only_current_successful_export_allows_replacing_session(self):
         data = self.trace('unsaved')
@@ -368,7 +449,7 @@ class NativePhysicsTrace(unittest.TestCase):
         self.assertIn('WM_EIEM_MOD_RECONCILE', messages.values())
         self.assertIn('WM_EIEM_MOD_KEY', messages.values())
 
-    def test_physics_diagnostics_are_automatic_and_absent_from_dump_ui(self):
+    def test_physics_diagnostics_are_manual_bounded_and_absent_from_dump_ui(self):
         gui = (ROOT / 'src/gui.h').read_text(encoding='utf-8')
         scene = (ROOT / 'src/scene_dump.h').read_text(encoding='utf-8')
         diagnostic = (ROOT / 'src/eiem_native_physics_diagnostic.h').read_text(encoding='utf-8')
@@ -377,6 +458,7 @@ class NativePhysicsTrace(unittest.TestCase):
         trace = (ROOT / 'src/eiem_native_physics_trace.h').read_text(encoding='utf-8')
         trojan = (ROOT / 'src/trojan.h').read_text(encoding='utf-8')
         init = (ROOT / 'src/init.h').read_text(encoding='utf-8')
+        skin_timing = (ROOT / 'src/il2cpp_trace.h').read_text(encoding='utf-8')
         for text in ('原生物理诊断', '开始原生物理跟踪', '停止并导出跟踪'):
             self.assertNotIn(text, gui)
         for name in ('WM_EIEM_PHYSICS_PROBE', 'WM_EIEM_PHYSICS_TRACE_START',
@@ -388,8 +470,12 @@ class NativePhysicsTrace(unittest.TestCase):
         self.assertIn('EiemPhysicsAnimatorImage', trace)
         self.assertNotIn('UnityEngine.CoreModule.dll', probe + trace)
         self.assertIn('plugin\\\\physics_diagnostics', diagnostic)
-        self.assertIn('EiemStartPhysicsAutoTraceOnUnityThread();', trojan)
-        self.assertIn('EiemFinishPhysicsAutoTraceOnUnityThread();', trojan)
+        self.assertIn('EiemStartPhysicsManualCaptureOnUnityThread(hwnd);', trojan)
+        self.assertIn('EiemFinishPhysicsManualCaptureOnUnityThread(hwnd,"bounded-window-complete");', trojan)
+        self.assertIn('EiemStartPhysicsTrace(error,kEiemPhysicsManualCaptureMs)', diagnostic)
+        timer = skin_timing[skin_timing.index('static void EiemRunSkinTimingProbe()'):]
+        timer = timer[:timer.index('static void EiemCopySkinnedRendererState(')]
+        self.assertNotIn('EiemPhysicsStopTrace()', timer)
         # The former post-FinalIK chest probe hooked every SolverManager
         # LateUpdate and synchronously traversed Transforms/wrote TSV data on
         # the game thread.  In-game bisection proved that hook alone caused

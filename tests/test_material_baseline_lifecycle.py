@@ -3,6 +3,7 @@
 Replays v41's observed order. This does not simulate GPU drawing or map loading.
 """
 from pathlib import Path
+from runtime_source import read_runtime_source
 import shutil
 import subprocess
 import tempfile
@@ -13,9 +14,9 @@ from test_mod_controls import function
 ROOT = Path(__file__).resolve().parents[1]
 
 EXTRA = r'''
-static uintptr_t s_eiemActivePrefabInstance=0;
 static bool programEnabled=true,unityThread=true;
 static thread_local bool s_eiemEntityRenderHelperInitGuard=false;
+static thread_local std::vector<void *> s_eiemMaterialsToReapplyAfterHelper;
 static constexpr bool kEiemEnableMaterialLifecycle=true;
 static volatile LONG s_eiemModGeneration=1;
 static void EiemRegistrationTraceRenderer(void *,const char *,LONG) {}
@@ -167,7 +168,7 @@ class MaterialBaselineLifecycle(unittest.TestCase):
     def setUpClass(cls):
         if not shutil.which('cl'):
             raise unittest.SkipTest('Requires MSVC')
-        trace=(ROOT/'src/il2cpp_trace.h').read_text(encoding='utf-8')
+        trace=read_runtime_source(ROOT)
         begin=trace.index('struct EiemRenderOverrideState {')
         state=trace[begin:trace.index('\n};',begin)+3]
         fixture=FIXTURE.split('static void Apply()')[0]
@@ -181,9 +182,9 @@ class MaterialBaselineLifecycle(unittest.TestCase):
             'static void EiemRememberRuleBinding(',
             'static bool EiemFindBoundRenderRule(',
             'static void EiemBeginMeshWrite(',
-            'static void EiemRememberReplacement(',
+            'static bool EiemRememberReplacement(',
             'static void EiemReleaseOverrideHandles(',
-            'static void EiemRestoreRenderOverrides(',
+            'static bool EiemRestoreRenderOverrides(',
             'static bool EiemAssignRendererMaterials(',
         ]
         funcs='\n'.join(function(trace,s) for s in signatures)
@@ -191,7 +192,8 @@ class MaterialBaselineLifecycle(unittest.TestCase):
             funcs+='\n'+function(trace,s)
         begin=trace.index('struct EiemMaterialSourceInitScope {')
         funcs+='\n'+trace[begin:trace.index('\n};',begin)+3]
-        funcs+='\n'+function(trace,'static bool EiemReapplyRendererMaterialsAfterCommit(')
+        material_signature='static bool EiemReapplyRendererMaterialsAfterCommit('
+        funcs+='\n'+function(trace[trace.rindex(material_signature):],material_signature)
         fixture=fixture.replace('// STATE',state).replace('// FUNCTIONS',funcs)
         init='TraceMaterialInfoInit'
         hooks='\n'.join(function(trace,s) for s in [f'static void {init}(', 'static bool TraceRendererInfoTrySetSharedMaterials('])

@@ -16,6 +16,20 @@ jobs:
     - name: Checkout Code
       uses: actions/checkout@v4
 
+    - name: Verify release tag matches DLL version
+      shell: pwsh
+      run: |
+        $header = Get-Content src/globals.h -Raw
+        $parts = foreach ($part in 'MAJOR', 'MINOR', 'PATCH') {
+          $match = [regex]::Match($header, "(?m)^#define EIEM_VERSION_$part\s+(\d+)\s*$")
+          if (-not $match.Success) { throw "Missing EIEM_VERSION_$part" }
+          $match.Groups[1].Value
+        }
+        $version = 'v' + ($parts -join '.')
+        if ($version -ne '${{ github.ref_name }}') {
+          throw "Tag ${{ github.ref_name }} does not match DLL $version"
+        }
+
     - name: Build Project
       run: |
         cmd /c build.bat
@@ -25,11 +39,13 @@ jobs:
       run: |
         $tag = "${{ github.ref_name }}"
         $releaseRoot = "release_pkg"
-        $dllRoot = Join-Path $releaseRoot "dll"
-        New-Item -ItemType Directory -Force -Path $dllRoot | Out-Null
+        $gameRoot = Join-Path $releaseRoot "game"
+        $pluginRoot = Join-Path $gameRoot "plugin"
+        New-Item -ItemType Directory -Force -Path $pluginRoot | Out-Null
 
-        Copy-Item bin\eiem.dll, bin\d3dcompiler_47.dll, bin\vulkan-1.dll, bin\eiem.ini, bin\LUA-LICENSE.txt, LICENSE, THIRD_PARTY_NOTICES -Destination $dllRoot
-        Compress-Archive -Path "$dllRoot\*" -DestinationPath "EIEM_${tag}_dll.zip" -Force
+        Copy-Item bin\d3dcompiler_47.dll, bin\vulkan-1.dll, LICENSE, THIRD_PARTY_NOTICES, bin\LUA-LICENSE.txt -Destination $gameRoot
+        Copy-Item bin\eiem.dll, bin\eiem.ini -Destination $pluginRoot
+        Compress-Archive -Path "$gameRoot\*" -DestinationPath "EIEM_${tag}_dll.zip" -Force
 
     - name: Publish to GitHub Releases
       uses: softprops/action-gh-release@v2

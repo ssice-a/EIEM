@@ -112,6 +112,27 @@ static inline Matrix SkinningMatrix(const Matrix &world, const Matrix *bindpose)
   return bindpose ? Multiply(world, *bindpose) : world;
 }
 
+// A raw bone world matrix is not expected to be identity for a character in
+// the world.  The useful identity check is on the matrix after bindpose has
+// been applied.  This is a diagnostic metric only: a near-identity skin
+// matrix is a clue for a rest/T-pose slot, not a replacement for comparing a
+// good and bad sample from the same instance.
+static inline float IdentityError(const Matrix &matrix) {
+  float error = 0.0f;
+  for (int column = 0; column < 4; ++column)
+    for (int row = 0; row < 4; ++row) {
+      const float expected = column == row ? 1.0f : 0.0f;
+      const float delta = std::fabs(matrix.m[column * 4 + row] - expected);
+      if (delta > error) error = delta;
+    }
+  return error;
+}
+
+static inline float TranslationMagnitude(const Matrix &matrix) {
+  const float x = matrix.m[12], y = matrix.m[13], z = matrix.m[14];
+  return std::sqrt(x * x + y * y + z * z);
+}
+
 struct SkinCounters {
   size_t outOfRange = 0;
   size_t unweighted = 0;
