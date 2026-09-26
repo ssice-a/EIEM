@@ -22,7 +22,9 @@
 Blender 使用 `__init__.py` 的 `bl_info.version`，AnimeStudio 使用
 `Directory.Build.props`。各自的 Release workflow 在打包前检查该对应关系。
 AnimeStudio 的 Release workflow 打包 .NET 9 与 .NET 10 两个 GUI/CLI 压缩包。
-当前候选尚未推送或发布；修改 workflow 不会自行触发发布。
+三个产品分别发布到自己的仓库。EIEM Release 仅附带 DLL 安装包，Blender 插件和
+AnimeStudio 工具包不再附加到 EIEM Release。推送版本 tag 会触发各仓库发布工作流；
+修改 workflow 本身不会自行发布。
 
 ## 验证范围
 

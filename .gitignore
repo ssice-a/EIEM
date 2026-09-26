@@ -12,12 +12,30 @@ bin/
 *.py[cod]
 
 # Local game indexes and one-off investigation artifacts
+/analysis/
+/.vscode/
+/_external_*/
 /Maps/
 /tmp_*
 /_tmp-*/
 /%SystemDrive%/
 /tools/_inspect_skel.py
 /tools/_blender_split_cache/
+/tools/analyze_native_*.py
+/tools/build_native_*.bat
+/tools/build_vulkan_*.bat
+/tools/build_pfb_*_trace.bat
+/tools/build_upstream_mesh_boundary.bat
+/tools/build_endfield_native_mesh_payload.py
+/tools/compare_instance_writer_logs.py
+/tools/disasm_*.py
+/tools/gfxtrace_*_probe.cpp
+/tools/ida_*
+/tools/map_windows_process_addresses.py
+/tools/proxy_vulkan_*_probe*.cpp
+/tools/proxy_vulkan_*_sample.cpp
+/tools/scan_gameassembly_mesh_wrappers.py
+/tools/tmp_*.py
 
 # Blender and test runs export real resource packages here. They are local
 # fixtures/probes, not source-controlled assets.

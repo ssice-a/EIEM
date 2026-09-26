@@ -109,5 +109,10 @@ dotnet build tools\AnimeStudio\AnimeStudio.GUI\AnimeStudio.GUI.csproj `
 ```
 
 The three repositories have separate working trees and commit histories. Commit
-tool changes in their submodules first, then update the EIEM gitlinks. Release
-creation is paused while local project organization and verification continue.
+tool changes in their submodules first, then update the EIEM gitlinks. Publish
+each product from its own repository: the EIEM release contains only the DLL
+installation ZIP; Blender and AnimeStudio packages belong to their tool releases.
+
+Local analysis captures, one-off diagnostic scripts and old binary backups are
+ignored by the root repository. Runtime source and reproducible regression-test
+helpers remain tracked; diagnostic output must not be added to release packages.
