@@ -4,6 +4,15 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to build and release
+        required: true
+        type: string
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   build:
@@ -15,6 +24,8 @@ jobs:
     steps:
     - name: Checkout Code
       uses: actions/checkout@v4
+      with:
+        ref: ${{ env.RELEASE_TAG }}
 
     - name: Verify release tag matches DLL version
       shell: pwsh
@@ -26,8 +37,10 @@ jobs:
           $match.Groups[1].Value
         }
         $version = 'v' + ($parts -join '.')
-        if ($version -ne '${{ github.ref_name }}') {
-          throw "Tag ${{ github.ref_name }} does not match DLL $version"
+        git show-ref --verify --quiet "refs/tags/$env:RELEASE_TAG"
+        if ($LASTEXITCODE -ne 0) { throw "Missing tag $env:RELEASE_TAG" }
+        if ($version -ne $env:RELEASE_TAG) {
+          throw "Tag $env:RELEASE_TAG does not match DLL $version"
         }
 
     - name: Build Project
@@ -37,7 +50,7 @@ jobs:
     - name: Package Release
       shell: pwsh
       run: |
-        $tag = "${{ github.ref_name }}"
+        $tag = $env:RELEASE_TAG
         $releaseRoot = "release_pkg"
         $gameRoot = Join-Path $releaseRoot "game"
         $pluginRoot = Join-Path $gameRoot "plugin"
@@ -50,8 +63,9 @@ jobs:
     - name: Publish to GitHub Releases
       uses: softprops/action-gh-release@v2
       with:
+        tag_name: ${{ env.RELEASE_TAG }}
         files: |
-          EIEM_${{ github.ref_name }}_dll.zip
+          EIEM_${{ env.RELEASE_TAG }}_dll.zip
         generate_release_notes: true
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
